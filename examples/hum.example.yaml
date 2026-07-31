@@ -1,0 +1,107 @@
+# Example hum configuration for the Compri project (docs/PRD.md, section 10.2).
+# Copy this to hum.yaml at the root of your compri configuration repository
+# and adjust repository paths for your machine (or override them in
+# hum.local.yaml, which should not be committed).
+version: 1
+
+repositories:
+  applications:
+    path: ~/code/compri/compri-applications
+
+  api:
+    path: ~/code/compri/compri-api
+
+  agents:
+    path: ~/code/compri/compri-agents
+
+services:
+  frontend:
+    repository: applications
+    cwd: apps/procurement-frontend
+    command: pnpm dev
+    port: 5173
+    url: http://localhost:5173
+
+    healthcheck:
+      type: http
+      url: http://localhost:5173
+      interval: 2s
+      timeout: 1s
+      retries: 15
+
+    requires:
+      commands:
+        - node
+        - pnpm
+      files:
+        - .env.local
+      env:
+        - VITE_API_URL
+
+    depends_on:
+      - api
+
+  api:
+    repository: api
+    command: pnpm dev
+    port: 3000
+    url: http://localhost:3000
+
+    healthcheck:
+      type: http
+      url: http://localhost:3000/health
+      interval: 2s
+      timeout: 1s
+      retries: 20
+
+    requires:
+      commands:
+        - node
+        - pnpm
+      files:
+        - .env
+      env:
+        - DATABASE_URL
+        - AUTH_SECRET
+
+  agents:
+    repository: agents
+    command: pnpm dev
+    port: 3001
+
+    healthcheck:
+      type: tcp
+      host: localhost
+      port: 3001
+
+    depends_on:
+      - api
+
+  storybook:
+    repository: applications
+    cwd: packages/ui
+    command: pnpm storybook
+    port: 6006
+    url: http://localhost:6006
+
+profiles:
+  frontend:
+    services:
+      - frontend
+      - api
+
+  backend:
+    services:
+      - api
+      - agents
+
+  ui:
+    services:
+      - storybook
+
+  full:
+    services:
+      - frontend
+      - api
+      - agents
+      - storybook

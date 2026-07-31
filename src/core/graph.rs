@@ -1,0 +1,68 @@
+use std::collections::HashSet;
+
+use anyhow::{bail, Result};
+
+use crate::config::Config;
+
+/// Resolve the full set of services to start for a profile: the profile's
+/// own services plus all transitive dependencies.
+pub fn services_for_profile(config: &Config, profile: &str) -> Result<Vec<String>> {
+    let profile_cfg = config
+        .profiles
+        .get(profile)
+        .ok_or_else(|| anyhow::anyhow!("unknown profile '{profile}'"))?;
+    resolve_start_order(config, &profile_cfg.services)
+}
+
+/// RF-04/RF-05: given a set of requested services, return them plus their
+/// transitive dependencies in a valid startup order (dependencies first).
+/// Assumes the config has already passed `config::validate` (no cycles, no
+/// dangling references) — this will still error defensively if not.
+pub fn resolve_start_order(config: &Config, requested: &[String]) -> Result<Vec<String>> {
+    let mut order = Vec::new();
+    let mut done: HashSet<String> = HashSet::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+
+    fn visit(
+        name: &str,
+        config: &Config,
+        order: &mut Vec<String>,
+        done: &mut HashSet<String>,
+        visiting: &mut HashSet<String>,
+    ) -> Result<()> {
+        if done.contains(name) {
+            return Ok(());
+        }
+        if visiting.contains(name) {
+            bail!("circular dependency detected while resolving '{name}'");
+        }
+        let service = config
+            .services
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown service '{name}'"))?;
+
+        visiting.insert(name.to_string());
+        for dep in &service.depends_on {
+            visit(dep, config, order, done, visiting)?;
+        }
+        visiting.remove(name);
+
+        done.insert(name.to_string());
+        order.push(name.to_string());
+        Ok(())
+    }
+
+    for name in requested {
+        visit(name, config, &mut order, &mut done, &mut visiting)?;
+    }
+
+    Ok(order)
+}
+
+/// The reverse of the start order — used to stop a set of services without
+/// stopping a service before its dependents.
+pub fn stop_order(start_order: &[String]) -> Vec<String> {
+    let mut v = start_order.to_vec();
+    v.reverse();
+    v
+}
