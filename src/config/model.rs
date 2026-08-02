@@ -50,6 +50,7 @@ pub struct ServiceConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ReadyMode {
     Started,
+    Listening,
     Healthy,
 }
 

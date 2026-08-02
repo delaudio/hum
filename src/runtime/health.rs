@@ -65,18 +65,3 @@ pub fn retries(hc: &HealthcheckConfig) -> u32 {
         HealthcheckConfig::Tcp { retries, .. } => *retries,
     }
 }
-
-/// Poll until the check succeeds or `retries` attempts are exhausted.
-/// Used both for RF-06 (waiting for a dependency to become healthy) and for
-/// the initial readiness probe after starting a service.
-pub async fn wait_until_healthy(hc: &HealthcheckConfig) -> bool {
-    let attempts = retries(hc).max(1);
-    let wait = interval(hc);
-    for _ in 0..attempts {
-        if check_once(hc).await.is_ok() {
-            return true;
-        }
-        tokio::time::sleep(wait).await;
-    }
-    false
-}

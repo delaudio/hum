@@ -80,6 +80,26 @@ pub fn validate(config: &Config, file: &Path) -> Result<(), ConfigError> {
             validate_healthcheck(file, name, healthcheck)?;
         }
 
+        match service.depends_on_ready {
+            Some(super::model::ReadyMode::Listening) if service.port.is_none() => {
+                return Err(ConfigError::validation(
+                    file,
+                    format!("services.{name}.depends_on_ready"),
+                    "listening readiness requires a configured service port",
+                    format!("add `port:` to services.{name} or use `started` readiness"),
+                ));
+            }
+            Some(super::model::ReadyMode::Healthy) if service.healthcheck.is_none() => {
+                return Err(ConfigError::validation(
+                    file,
+                    format!("services.{name}.depends_on_ready"),
+                    "healthy readiness requires a configured healthcheck",
+                    format!("add `healthcheck:` to services.{name} or use `started` readiness"),
+                ));
+            }
+            _ => {}
+        }
+
         if let Some(repo) = &service.repository {
             if !config.repositories.contains_key(repo) {
                 return Err(ConfigError::validation(
@@ -406,6 +426,19 @@ mod tests {
                 ..ServiceConfig::default()
             },
         );
+        assert!(validate(&config, Path::new("hum.yaml")).is_err());
+    }
+
+    #[test]
+    fn readiness_requires_its_underlying_signal() {
+        let mut config = valid_config();
+        config.services.get_mut("api").unwrap().depends_on_ready =
+            Some(crate::config::ReadyMode::Listening);
+        assert!(validate(&config, Path::new("hum.yaml")).is_err());
+
+        let mut config = valid_config();
+        config.services.get_mut("api").unwrap().depends_on_ready =
+            Some(crate::config::ReadyMode::Healthy);
         assert!(validate(&config, Path::new("hum.yaml")).is_err());
     }
 }

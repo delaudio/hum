@@ -348,21 +348,22 @@ async fn wait_for_ctrl_c_and_shutdown(manager: &Arc<Manager>) {
 }
 
 fn print_status(manager: &Manager) {
-    println!("{:<22} {:<10} {:<7} DETAIL", "SERVICE", "STATUS", "PORT");
+    println!(
+        "{:<22} {:<10} {:<22} {:<10} DETAIL",
+        "SERVICE", "PROCESS", "PORT", "HEALTH"
+    );
     for view in manager.all_views() {
         let port = view
             .port
-            .map(|port| port.to_string())
-            .unwrap_or_else(|| "—".into());
-        let detail = view
-            .blocked_reason
-            .or(view.health_detail)
-            .unwrap_or_default();
+            .map(|port| format!("{port}/{}", view.port_state.label()))
+            .unwrap_or_else(|| view.port_state.label().to_string());
+        let detail = view.last_error.or(view.health_detail).unwrap_or_default();
         println!(
-            "{:<22} {:<10} {:<7} {}",
+            "{:<22} {:<10} {:<22} {:<10} {}",
             view.name,
-            view.status.label(),
+            view.process.label(),
             port,
+            view.health.label(),
             detail
         );
     }

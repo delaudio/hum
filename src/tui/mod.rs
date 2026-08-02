@@ -188,7 +188,7 @@ async fn handle_key(app: &mut App, code: KeyCode) {
                     let manager = app.manager.clone();
                     let running = manager
                         .view(&name)
-                        .map(|v| v.status.is_started())
+                        .map(|v| v.process.is_running())
                         .unwrap_or(false);
                     if running {
                         let _ = manager.stop_service(&name).await;

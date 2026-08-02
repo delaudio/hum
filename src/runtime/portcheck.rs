@@ -1,4 +1,24 @@
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortProbe {
+    Listening,
+    Closed,
+    Unknown,
+}
+
+/// Lightweight port polling: one bounded TCP connection, with no process
+/// enumeration and no `lsof` subprocess.
+pub fn probe_port(port: u16) -> PortProbe {
+    let address: SocketAddr = ([127, 0, 0, 1], port).into();
+    match TcpStream::connect_timeout(&address, Duration::from_millis(50)) {
+        Ok(_) => PortProbe::Listening,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => PortProbe::Closed,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => PortProbe::Unknown,
+        Err(_) => PortProbe::Closed,
+    }
+}
 
 /// Information about whatever is occupying a port, when we can determine it
 /// (RF-15). Best-effort: process inspection differs across platforms.
@@ -17,10 +37,10 @@ pub fn check_port(port: u16) -> Option<PortOccupant> {
     if TcpListener::bind(addr).is_ok() {
         return None;
     }
-    Some(find_occupant(port))
+    Some(identify_occupant(port))
 }
 
-fn find_occupant(port: u16) -> PortOccupant {
+pub fn identify_occupant(port: u16) -> PortOccupant {
     use sysinfo::System;
 
     let mut system = System::new_all();
@@ -63,5 +83,43 @@ fn find_occupant(port: u16) -> PortOccupant {
         pid: None,
         process_name: None,
         command: None,
+    }
+}
+
+pub fn belongs_to_process_tree(pid: u32, root_pid: u32) -> bool {
+    use sysinfo::System;
+
+    let system = System::new_all();
+    let root = sysinfo::Pid::from_u32(root_pid);
+    let mut current = Some(sysinfo::Pid::from_u32(pid));
+    while let Some(pid) = current {
+        if pid == root {
+            return true;
+        }
+        current = system.process(pid).and_then(sysinfo::Process::parent);
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lightweight_probe_distinguishes_listener_from_closed_port() {
+        let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)) else {
+            // Some CI sandboxes deny even loopback sockets.
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(probe_port(port), PortProbe::Listening);
+        drop(listener);
+        assert_eq!(probe_port(port), PortProbe::Closed);
+    }
+
+    #[test]
+    fn process_tree_identity_accepts_the_root_process() {
+        let pid = std::process::id();
+        assert!(belongs_to_process_tree(pid, pid));
     }
 }

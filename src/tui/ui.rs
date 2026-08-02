@@ -39,19 +39,28 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(text).block(block), area);
 }
 
-fn status_color(status: crate::core::ServiceStatus) -> Color {
-    use crate::core::ServiceStatus::*;
+fn process_color(status: crate::core::ProcessState) -> Color {
+    use crate::core::ProcessState::*;
     match status {
-        Healthy | Running => Color::Green,
+        Running => Color::Green,
         Starting | Stopping => Color::Yellow,
-        Unhealthy | Blocked => Color::Rgb(255, 165, 0),
-        Failed => Color::Red,
-        Stopped => Color::DarkGray,
+        Exited => Color::Red,
+        Missing => Color::DarkGray,
+    }
+}
+
+fn health_color(status: crate::core::HealthState) -> Color {
+    use crate::core::HealthState::*;
+    match status {
+        Healthy => Color::Green,
+        Checking => Color::Yellow,
+        Unhealthy => Color::Red,
+        Unchecked => Color::DarkGray,
     }
 }
 
 fn draw_table(f: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec!["Service", "Status", "Port", "Health / Detail"])
+    let header = Row::new(vec!["Service", "Process", "Port", "Health", "Detail"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app
@@ -61,7 +70,7 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         .filter_map(|(i, name)| {
             let view = app.manager.view(name)?;
             let detail = view
-                .blocked_reason
+                .last_error
                 .clone()
                 .or(view.health_detail.clone())
                 .unwrap_or_default();
@@ -70,18 +79,23 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default()
             };
-            let status_cell =
-                Cell::from(format!("{} {}", view.status.symbol(), view.status.label()))
-                    .style(Style::default().fg(status_color(view.status)));
+            let process_cell = Cell::from(format!(
+                "{} {}",
+                view.process.symbol(),
+                view.process.label()
+            ))
+            .style(Style::default().fg(process_color(view.process)));
+            let health_cell = Cell::from(view.health.label())
+                .style(Style::default().fg(health_color(view.health)));
             Some(
                 Row::new(vec![
                     Cell::from(name.clone()),
-                    status_cell,
-                    Cell::from(
-                        view.port
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "—".into()),
-                    ),
+                    process_cell,
+                    Cell::from(match view.port {
+                        Some(port) => format!("{port}/{}", view.port_state.label()),
+                        None => view.port_state.label().to_string(),
+                    }),
+                    health_cell,
                     Cell::from(detail),
                 ])
                 .style(style),
@@ -92,10 +106,11 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(30),
+            Constraint::Percentage(22),
             Constraint::Percentage(20),
-            Constraint::Percentage(10),
-            Constraint::Percentage(40),
+            Constraint::Percentage(22),
+            Constraint::Percentage(14),
+            Constraint::Percentage(22),
         ],
     )
     .header(header)
@@ -169,7 +184,8 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_else(|| "—".to_string());
     let text = vec![
-        Line::from(format!("Status        {}", view.status.label())),
+        Line::from(format!("State         {}", view.presentation.label())),
+        Line::from(format!("Process       {}", view.process.label())),
         Line::from(format!(
             "PID           {}",
             view.pid
@@ -178,22 +194,34 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(format!("Uptime        {uptime}")),
         Line::from(format!(
-            "Port          {}",
+            "Port          {} ({})",
             view.port
                 .map(|p| p.to_string())
-                .unwrap_or_else(|| "—".into())
+                .unwrap_or_else(|| "—".into()),
+            view.port_state.label()
         )),
         Line::from(format!(
             "URL           {}",
             view.url.clone().unwrap_or_else(|| "—".into())
         )),
         Line::from(format!(
-            "Health        {}",
+            "Health        {} ({})",
+            view.health.label(),
             view.health_detail.clone().unwrap_or_else(|| "—".into())
         )),
         Line::from(format!(
-            "Blocked       {}",
-            view.blocked_reason.clone().unwrap_or_else(|| "—".into())
+            "Exit code     {}",
+            view.exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "—".into())
+        )),
+        Line::from(format!(
+            "Last change   {}",
+            view.changed_at.with_timezone(&chrono::Local).to_rfc3339()
+        )),
+        Line::from(format!(
+            "Last error    {}",
+            view.last_error.clone().unwrap_or_else(|| "—".into())
         )),
         Line::from(""),
         Line::from("[esc] back"),

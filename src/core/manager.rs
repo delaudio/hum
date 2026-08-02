@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,51 +12,38 @@ use crate::runtime::portcheck;
 use crate::runtime::process::RunningProcess;
 
 use super::graph;
-use super::state::ServiceStatus;
+use super::state::{HealthState, PortState, PresentationState, ProcessState, ServiceState};
 
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const PORT_OWNER_TTL: Duration = Duration::from_secs(5);
 
 /// Everything `hum` tracks about one service while it's part of the running
 /// session.
 pub struct ServiceRuntime {
-    pub status: Mutex<ServiceStatus>,
+    pub state: Mutex<ServiceState>,
     pub process: Mutex<Option<Arc<RunningProcess>>>,
     pub logs: Arc<LogBuffer>,
     pub started_at: Mutex<Option<Instant>>,
-    pub last_health: Mutex<Option<HealthResult>>,
-    pub blocked_reason: Mutex<Option<String>>,
     health_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    stop_health: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct HealthResult {
-    pub ok: bool,
-    pub detail: String,
-    pub checked_at: Instant,
+    operation: tokio::sync::Mutex<()>,
+    port_owner_checked_at: Mutex<Option<Instant>>,
 }
 
 impl ServiceRuntime {
     fn new() -> Self {
         ServiceRuntime {
-            status: Mutex::new(ServiceStatus::Stopped),
+            state: Mutex::new(ServiceState::default()),
             process: Mutex::new(None),
             logs: LogBuffer::new(crate::runtime::logs::DEFAULT_CAPACITY),
             started_at: Mutex::new(None),
-            last_health: Mutex::new(None),
-            blocked_reason: Mutex::new(None),
             health_task: Mutex::new(None),
-            stop_health: Arc::new(AtomicBool::new(false)),
+            operation: tokio::sync::Mutex::new(()),
+            port_owner_checked_at: Mutex::new(None),
         }
     }
 
-    pub fn status(&self) -> ServiceStatus {
-        *self.status.lock().unwrap()
-    }
-
-    fn set_status(&self, s: ServiceStatus) {
-        *self.status.lock().unwrap() = s;
+    pub fn state(&self) -> ServiceState {
+        self.state.lock().unwrap().clone()
     }
 }
 
@@ -66,13 +52,18 @@ impl ServiceRuntime {
 #[derive(Debug, Clone)]
 pub struct ServiceView {
     pub name: String,
-    pub status: ServiceStatus,
+    pub process: ProcessState,
+    pub port_state: PortState,
+    pub health: HealthState,
+    pub presentation: PresentationState,
     pub port: Option<u16>,
     pub url: Option<String>,
     pub pid: Option<i32>,
     pub uptime: Option<Duration>,
+    pub exit_code: Option<i32>,
+    pub changed_at: chrono::DateTime<chrono::Utc>,
     pub health_detail: Option<String>,
-    pub blocked_reason: Option<String>,
+    pub last_error: Option<String>,
 }
 
 pub struct Manager {
@@ -117,21 +108,22 @@ impl Manager {
         let svc_cfg = self.config.services.get(name)?;
         let pid = rt.process.lock().unwrap().as_ref().map(|p| p.pid);
         let uptime = rt.started_at.lock().unwrap().map(|t| t.elapsed());
-        let health_detail = rt
-            .last_health
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|h| h.detail.clone());
+        let state = rt.state();
+        let presentation = state.presentation();
         Some(ServiceView {
             name: name.to_string(),
-            status: rt.status(),
+            process: state.process,
+            port_state: state.port,
+            health: state.health,
+            presentation,
             port: svc_cfg.port,
             url: svc_cfg.url.clone(),
             pid,
             uptime,
-            health_detail,
-            blocked_reason: rt.blocked_reason.lock().unwrap().clone(),
+            exit_code: state.exit_code,
+            changed_at: state.changed_at,
+            health_detail: state.health_detail,
+            last_error: state.last_error,
         })
     }
 
@@ -172,9 +164,9 @@ impl Manager {
     }
 
     /// Start a template: resolve dependencies and start everything in order,
-    /// everything in order, waiting for each service's readiness (healthy
-    /// when it has a health check, otherwise just started) before starting
-    /// dependents.
+    /// everything in order, waiting for each service's explicit readiness:
+    /// health when configured, otherwise its port when configured, otherwise
+    /// the running process.
     pub async fn start_template(&self, template: &str) -> Result<Vec<String>> {
         let order = graph::services_for_template(&self.config, template)?;
         self.start_ordered(&order).await
@@ -225,8 +217,10 @@ impl Manager {
 
     fn mark_blocked(&self, name: &str, reason: &str) {
         if let Some(rt) = self.services.get(name) {
-            rt.set_status(ServiceStatus::Blocked);
-            *rt.blocked_reason.lock().unwrap() = Some(reason.to_string());
+            rt.state
+                .lock()
+                .unwrap()
+                .mark_start_failed(reason.to_string());
         }
     }
 
@@ -240,9 +234,19 @@ impl Manager {
             .get(name)
             .ok_or_else(|| anyhow!("unknown service '{name}'"))?
             .clone();
+        let _operation = rt.operation.lock().await;
 
-        if rt.status().is_started() {
-            return Ok(()); // already running
+        self.reconcile_process(name);
+        if let Some(process) = rt.process.lock().unwrap().as_ref() {
+            if process.is_alive() && rt.state().process.is_running() {
+                return Ok(()); // already running
+            }
+            if process.is_alive() {
+                return Err(anyhow!(
+                    "service '{name}' still has an active process while {}",
+                    rt.state().process.label()
+                ));
+            }
         }
 
         let svc = self
@@ -257,8 +261,14 @@ impl Manager {
             self.wait_for_dependency_ready(dep).await?;
         }
 
+        let generation = rt.state.lock().unwrap().begin_start();
+
         if let Some(port) = svc.port {
             if let Some(occupant) = portcheck::check_port(port) {
+                rt.state.lock().unwrap().port = PortState::OccupiedByOther {
+                    pid: occupant.pid,
+                    process_name: occupant.process_name.clone(),
+                };
                 let who = occupant
                     .pid
                     .map(|pid| {
@@ -273,6 +283,10 @@ impl Manager {
                     .unwrap_or_else(|| "another process".to_string());
                 return Err(anyhow!("port {port} is already in use by {who}"));
             }
+            rt.state.lock().unwrap().port = PortState::Closed;
+            *rt.port_owner_checked_at.lock().unwrap() = None;
+        } else {
+            rt.state.lock().unwrap().port = PortState::Unknown;
         }
 
         let command = svc
@@ -282,8 +296,6 @@ impl Manager {
         let cwd = self.service_cwd(name)?;
         let env = crate::config::environment::resolve_service_env(&svc, &cwd, &self.env_overrides)?;
 
-        rt.set_status(ServiceStatus::Starting);
-        *rt.blocked_reason.lock().unwrap() = None;
         rt.logs.push(LogLine {
             timestamp: chrono::Local::now(),
             service: name.to_string(),
@@ -294,10 +306,13 @@ impl Manager {
         let process = RunningProcess::spawn(name, &command, &cwd, &env, rt.logs.clone())?;
         *rt.process.lock().unwrap() = Some(process.clone());
         *rt.started_at.lock().unwrap() = Some(Instant::now());
-        rt.set_status(ServiceStatus::Running);
+        rt.state
+            .lock()
+            .unwrap()
+            .mark_running(generation, svc.healthcheck.is_some());
 
         if let Some(hc) = svc.healthcheck.clone() {
-            self.spawn_health_loop(name.to_string(), rt.clone(), hc);
+            self.spawn_health_loop(rt.clone(), process, hc, generation);
         }
 
         Ok(())
@@ -314,6 +329,8 @@ impl Manager {
             .depends_on_ready
             .unwrap_or(if dep_svc.healthcheck.is_some() {
                 ReadyMode::Healthy
+            } else if dep_svc.port.is_some() {
+                ReadyMode::Listening
             } else {
                 ReadyMode::Started
             });
@@ -323,7 +340,7 @@ impl Manager {
             .get(dep)
             .ok_or_else(|| anyhow!("unknown dependency '{dep}'"))?;
 
-        if !rt.status().is_started() {
+        if !rt.state().process.is_running() {
             self.start_service(dep).await?;
         }
 
@@ -331,68 +348,86 @@ impl Manager {
             return Ok(());
         }
 
-        // ReadyMode::Healthy: poll using the dependency's own healthcheck
-        // config, bounded by its configured retries.
-        if let Some(hc) = dep_svc.healthcheck.clone() {
-            let attempts = health::retries(&hc).max(1);
-            let wait = health::interval(&hc);
-            for _ in 0..attempts {
-                if rt.status() == ServiceStatus::Healthy {
-                    return Ok(());
-                }
-                tokio::time::sleep(wait).await;
+        let (attempts, wait) = match (&mode, &dep_svc.healthcheck) {
+            (ReadyMode::Healthy, Some(hc)) => (health::retries(hc).max(1), health::interval(hc)),
+            (ReadyMode::Healthy, None) => {
+                return Err(anyhow!(
+                    "dependency '{dep}' requires healthy readiness but has no healthcheck"
+                ));
             }
-            if rt.status() != ServiceStatus::Healthy {
-                return Err(anyhow!("dependency '{dep}' did not become healthy"));
+            (ReadyMode::Listening, _) => (50, Duration::from_millis(200)),
+            (ReadyMode::Started, _) => unreachable!(),
+        };
+        for _ in 0..attempts {
+            if !self.reconcile_process(dep) {
+                return Err(anyhow!(
+                    "dependency '{dep}' process exited before readiness"
+                ));
             }
+            self.update_port_state(dep, true);
+            let state = rt.state();
+            if !state.process.is_running() {
+                return Err(anyhow!("dependency '{dep}' process is not running"));
+            }
+            let ready = match mode {
+                ReadyMode::Started => true,
+                ReadyMode::Listening => state.port == PortState::Listening,
+                ReadyMode::Healthy => state.health == HealthState::Healthy,
+            };
+            if ready {
+                return Ok(());
+            }
+            tokio::time::sleep(wait).await;
         }
-        Ok(())
+        Err(anyhow!(
+            "dependency '{dep}' did not become {}",
+            match mode {
+                ReadyMode::Started => "started",
+                ReadyMode::Listening => "listening",
+                ReadyMode::Healthy => "healthy",
+            }
+        ))
     }
 
-    fn spawn_health_loop(&self, _name: String, rt: Arc<ServiceRuntime>, hc: HealthcheckConfig) {
-        rt.stop_health.store(false, Ordering::SeqCst);
-        let stop_flag = rt.stop_health.clone();
-        let task_rt = rt.clone();
+    fn spawn_health_loop(
+        &self,
+        rt: Arc<ServiceRuntime>,
+        process: Arc<RunningProcess>,
+        hc: HealthcheckConfig,
+        generation: u64,
+    ) {
+        let task_runtime = rt.clone();
         let handle = tokio::spawn(async move {
-            let rt = task_rt;
-            // initial readiness probe
-            let initial = health::wait_until_healthy(&hc).await;
-            if stop_flag.load(Ordering::SeqCst) {
-                return;
-            }
-            if initial {
-                rt.set_status(ServiceStatus::Healthy);
-            } else if rt.status() != ServiceStatus::Failed {
-                rt.set_status(ServiceStatus::Unhealthy);
-            }
-
             let interval = health::interval(&hc);
             loop {
-                tokio::time::sleep(interval).await;
-                if stop_flag.load(Ordering::SeqCst) {
+                let result = health::check_once(&hc).await;
+                if !process.is_alive() {
+                    let code = process.exit_code();
+                    task_runtime
+                        .state
+                        .lock()
+                        .unwrap()
+                        .mark_exited_for_generation(
+                            generation,
+                            code,
+                            code.map(|code| format!("process exited with code {code}"))
+                                .unwrap_or_else(|| "process exited".to_string()),
+                        );
                     return;
                 }
-                if !rt.status().is_started() {
-                    return; // process stopped/crashed, health loop no longer relevant
-                }
-                let result = health::check_once(&hc).await;
-                let ok = result.is_ok();
-                let detail = match result {
-                    Ok(()) => "ok".to_string(),
-                    Err(e) => e,
+                let (health, detail) = match result {
+                    Ok(()) => (HealthState::Healthy, "ok".to_string()),
+                    Err(error) => (HealthState::Unhealthy, error),
                 };
-                *rt.last_health.lock().unwrap() = Some(HealthResult {
-                    ok,
-                    detail,
-                    checked_at: Instant::now(),
-                });
-                if rt.status().is_started() {
-                    rt.set_status(if ok {
-                        ServiceStatus::Healthy
-                    } else {
-                        ServiceStatus::Unhealthy
-                    });
+                if !task_runtime
+                    .state
+                    .lock()
+                    .unwrap()
+                    .apply_health(generation, health, detail)
+                {
+                    return;
                 }
+                tokio::time::sleep(interval).await;
             }
         });
         *rt.health_task.lock().unwrap() = Some(handle);
@@ -406,19 +441,22 @@ impl Manager {
             .get(name)
             .ok_or_else(|| anyhow!("unknown service '{name}'"))?
             .clone();
+        let _operation = rt.operation.lock().await;
 
-        rt.stop_health.store(true, Ordering::SeqCst);
+        rt.state.lock().unwrap().begin_stop();
         if let Some(handle) = rt.health_task.lock().unwrap().take() {
             handle.abort();
         }
 
-        let process = rt.process.lock().unwrap().take();
+        let process = rt.process.lock().unwrap().clone();
         if let Some(process) = process {
-            rt.set_status(ServiceStatus::Stopping);
             process.stop(GRACEFUL_STOP_TIMEOUT).await?;
+            rt.state.lock().unwrap().exit_code = process.exit_code();
+            *rt.process.lock().unwrap() = None;
         }
-        rt.set_status(ServiceStatus::Stopped);
+        rt.state.lock().unwrap().mark_missing();
         *rt.started_at.lock().unwrap() = None;
+        self.update_port_state(name, false);
         Ok(())
     }
 
@@ -435,7 +473,7 @@ impl Manager {
             .filter(|n| {
                 self.services
                     .get(n)
-                    .map(|rt| rt.status() != ServiceStatus::Stopped)
+                    .map(|rt| rt.state().process.is_active())
                     .unwrap_or(false)
             })
             .collect();
@@ -451,14 +489,14 @@ impl Manager {
     pub fn any_running(&self) -> bool {
         self.services
             .values()
-            .any(|rt| rt.status() != ServiceStatus::Stopped)
+            .any(|rt| rt.state().process.is_active())
     }
 
     #[allow(dead_code)]
     pub fn crashed_services(&self) -> Vec<String> {
         self.services
             .iter()
-            .filter(|(_, rt)| rt.status() == ServiceStatus::Failed)
+            .filter(|(_, rt)| rt.state().process == ProcessState::Exited)
             .map(|(n, _)| n.clone())
             .collect()
     }
@@ -466,29 +504,113 @@ impl Manager {
     /// Poll running processes for unexpected exits and flip their status to
     /// `Failed` (RNF-04: a crash must not bring down `hum` itself).
     pub fn reap_exited(&self) {
-        for (name, rt) in &self.services {
-            let mut proc_guard = rt.process.lock().unwrap();
-            if let Some(process) = proc_guard.as_ref() {
-                if !process.is_alive() && rt.status().is_started() {
-                    let code = process.exit_code().unwrap_or(-1);
-                    rt.set_status(ServiceStatus::Failed);
-                    *rt.blocked_reason.lock().unwrap() =
-                        Some(format!("process exited with code {code}"));
-                    rt.logs.push(LogLine {
-                        timestamp: chrono::Local::now(),
-                        service: name.clone(),
-                        stream: LogStream::System,
-                        content: format!("crashed with exit code {code}"),
-                    });
-                    *proc_guard = None;
+        for name in self.services.keys() {
+            self.reconcile_process(name);
+            self.update_port_state(name, false);
+        }
+    }
+
+    fn reconcile_process(&self, name: &str) -> bool {
+        let Some(rt) = self.services.get(name) else {
+            return false;
+        };
+        let mut process_guard = rt.process.lock().unwrap();
+        let Some(process) = process_guard.as_ref() else {
+            return false;
+        };
+        if process.is_alive() {
+            return true;
+        }
+
+        let code = process.exit_code();
+        let detail = code
+            .map(|code| format!("process exited with code {code}"))
+            .unwrap_or_else(|| "process exited".to_string());
+        rt.state.lock().unwrap().mark_exited(code, detail.clone());
+        if let Some(handle) = rt.health_task.lock().unwrap().take() {
+            handle.abort();
+        }
+        rt.logs.push(LogLine {
+            timestamp: chrono::Local::now(),
+            service: name.to_string(),
+            stream: LogStream::System,
+            content: detail,
+        });
+        *process_guard = None;
+        false
+    }
+
+    fn update_port_state(&self, name: &str, force_owner_check: bool) {
+        let Some(rt) = self.services.get(name) else {
+            return;
+        };
+        let Some(port) = self
+            .config
+            .services
+            .get(name)
+            .and_then(|service| service.port)
+        else {
+            rt.state.lock().unwrap().port = PortState::Unknown;
+            return;
+        };
+        let snapshot = rt.state();
+        let expected_pid = rt
+            .process
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|process| process.pid);
+        let owner_check_is_fresh = rt
+            .port_owner_checked_at
+            .lock()
+            .unwrap()
+            .is_some_and(|checked| checked.elapsed() < PORT_OWNER_TTL);
+        let state = match portcheck::probe_port(port) {
+            portcheck::PortProbe::Listening
+                if snapshot.process.is_running() && !force_owner_check && owner_check_is_fresh =>
+            {
+                snapshot.port
+            }
+            portcheck::PortProbe::Listening if snapshot.process.is_running() => {
+                let occupant = portcheck::identify_occupant(port);
+                *rt.port_owner_checked_at.lock().unwrap() = Some(Instant::now());
+                match (occupant.pid, expected_pid) {
+                    (Some(pid), Some(expected))
+                        if portcheck::belongs_to_process_tree(pid, expected as u32) =>
+                    {
+                        PortState::Listening
+                    }
+                    (Some(pid), _) => PortState::OccupiedByOther {
+                        pid: Some(pid),
+                        process_name: occupant.process_name,
+                    },
+                    (None, _) => PortState::Unknown,
                 }
             }
-        }
+            portcheck::PortProbe::Listening => {
+                *rt.port_owner_checked_at.lock().unwrap() = None;
+                PortState::OccupiedByOther {
+                    pid: None,
+                    process_name: None,
+                }
+            }
+            portcheck::PortProbe::Closed => {
+                *rt.port_owner_checked_at.lock().unwrap() = None;
+                PortState::Closed
+            }
+            portcheck::PortProbe::Unknown => {
+                *rt.port_owner_checked_at.lock().unwrap() = None;
+                PortState::Unknown
+            }
+        };
+        rt.state.lock().unwrap().port = state;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::config::{RepositoryConfig, ServiceConfig};
 
@@ -524,5 +646,77 @@ mod tests {
             manager.service_cwd("server").unwrap(),
             root.join("../api/src")
         );
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_in_flight_health_task_and_invalidates_generation() {
+        let root = PathBuf::from("/tmp/hum-project");
+        let loaded = Loaded {
+            config: Config {
+                services: HashMap::from([(
+                    "server".to_string(),
+                    ServiceConfig {
+                        command: Some("true".to_string()),
+                        ..ServiceConfig::default()
+                    },
+                )]),
+                ..Config::default()
+            },
+            base_path: root.join("hum.yaml"),
+            local_path: None,
+            root_dir: root,
+        };
+        let manager = Manager::with_env(loaded, HashMap::new());
+        let runtime = manager.services.get("server").unwrap();
+        let generation = runtime.state.lock().unwrap().begin_start();
+        runtime.state.lock().unwrap().mark_running(generation, true);
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_completed = completed.clone();
+        *runtime.health_task.lock().unwrap() = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            task_completed.store(true, Ordering::SeqCst);
+        }));
+
+        manager.stop_service("server").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let state = runtime.state();
+        assert!(!completed.load(Ordering::SeqCst));
+        assert!(state.generation > generation);
+        assert_eq!(state.process, ProcessState::Missing);
+        assert_eq!(state.health, HealthState::Unchecked);
+    }
+
+    #[tokio::test]
+    async fn concurrent_starts_create_only_one_generation() {
+        let root = std::env::temp_dir();
+        let loaded = Loaded {
+            config: Config {
+                services: HashMap::from([(
+                    "server".to_string(),
+                    ServiceConfig {
+                        command: Some("sleep 5".to_string()),
+                        ..ServiceConfig::default()
+                    },
+                )]),
+                ..Config::default()
+            },
+            base_path: root.join("hum.yaml"),
+            local_path: None,
+            root_dir: root,
+        };
+        let manager = Arc::new(Manager::with_env(loaded, HashMap::new()));
+        let first = manager.clone();
+        let second = manager.clone();
+        let (first_result, second_result) = tokio::join!(
+            first.start_service("server"),
+            second.start_service("server")
+        );
+
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert_eq!(manager.services["server"].state().generation, 1);
+        assert!(manager.view("server").unwrap().pid.is_some());
+        manager.stop_service("server").await.unwrap();
     }
 }
