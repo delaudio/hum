@@ -1,7 +1,16 @@
-# Runnable hum v1 configuration for Compri.
-# Copy this to hum.yaml and adjust repository paths for your machine, or
-# override them in an untracked hum.local.yaml.
-version: 1
+# Target hum v2 project configuration for Compri.
+# This documents the migration target and is not accepted by the v1 binary.
+#
+# Once v2 registry support lands, register it in ~/.config/hum/config.yaml:
+#
+#   version: 1
+#   projects:
+#     compri:
+#       config: ~/code/compri/hum.yaml
+#
+# Machine-specific values belong in hum.local.yaml next to this file.
+version: 2
+project: compri
 
 repositories:
   applications:
@@ -83,7 +92,7 @@ services:
     port: 6006
     url: http://localhost:6006
 
-profiles:
+templates:
   frontend:
     services:
       - frontend
@@ -98,7 +107,7 @@ profiles:
     services:
       - storybook
 
-  full:
+  all-services:
     services:
       - frontend
       - api
