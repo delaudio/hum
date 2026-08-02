@@ -1,0 +1,7 @@
+# Target hum project registry. Copy to ~/.config/hum/config.yaml once the v2
+# CLI is installed, then point each project at its versioned hum.yaml.
+version: 1
+
+projects:
+  compri:
+    config: hum.v2.example.yaml

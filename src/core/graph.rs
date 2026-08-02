@@ -4,14 +4,14 @@ use anyhow::{bail, Result};
 
 use crate::config::Config;
 
-/// Resolve the full set of services to start for a profile: the profile's
+/// Resolve the full set of services to start for a template: the template's
 /// own services plus all transitive dependencies.
-pub fn services_for_profile(config: &Config, profile: &str) -> Result<Vec<String>> {
-    let profile_cfg = config
-        .profiles
-        .get(profile)
-        .ok_or_else(|| anyhow::anyhow!("unknown profile '{profile}'"))?;
-    resolve_start_order(config, &profile_cfg.services)
+pub fn services_for_template(config: &Config, template: &str) -> Result<Vec<String>> {
+    let template_cfg = config
+        .templates
+        .get(template)
+        .ok_or_else(|| anyhow::anyhow!("unknown template '{template}'"))?;
+    resolve_start_order(config, &template_cfg.services)
 }
 
 /// RF-04/RF-05: given a set of requested services, return them plus their

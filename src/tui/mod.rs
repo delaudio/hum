@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -19,7 +21,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 #[derive(PartialEq)]
 enum Mode {
     Normal,
-    ProfileSelect,
+    TemplateSelect,
     Logs,
     Details,
     Doctor,
@@ -31,24 +33,24 @@ pub struct App {
     pub manager: Arc<Manager>,
     pub services: Vec<String>,
     pub selected: usize,
-    pub profile: Option<String>,
+    pub template: Option<String>,
     mode: Mode,
-    profile_cursor: usize,
+    template_cursor: usize,
     doctor_results: Vec<doctor::DoctorCheck>,
     status_line: String,
     should_quit: bool,
 }
 
 impl App {
-    fn new(manager: Arc<Manager>) -> Self {
+    fn new(manager: Arc<Manager>, template: Option<String>) -> Self {
         let services = manager.service_names();
         App {
             manager,
             services,
             selected: 0,
-            profile: None,
+            template,
             mode: Mode::Normal,
-            profile_cursor: 0,
+            template_cursor: 0,
             doctor_results: Vec::new(),
             status_line: String::new(),
             should_quit: false,
@@ -59,8 +61,8 @@ impl App {
         self.services.get(self.selected).cloned()
     }
 
-    pub(crate) fn profile_cursor(&self) -> usize {
-        self.profile_cursor
+    pub(crate) fn template_cursor(&self) -> usize {
+        self.template_cursor
     }
 
     fn next(&mut self) {
@@ -81,14 +83,14 @@ impl App {
 }
 
 /// Launch the interactive TUI (section 8, RF-19 for refresh).
-pub async fn run(manager: Arc<Manager>) -> Result<()> {
+pub async fn run(manager: Arc<Manager>, template: Option<String>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = event_loop(&mut terminal, manager.clone()).await;
+    let result = event_loop(&mut terminal, manager.clone(), template).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -100,8 +102,9 @@ pub async fn run(manager: Arc<Manager>) -> Result<()> {
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     manager: Arc<Manager>,
+    template: Option<String>,
 ) -> Result<()> {
-    let mut app = App::new(manager.clone());
+    let mut app = App::new(manager.clone(), template);
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
 
@@ -135,29 +138,29 @@ async fn handle_key(app: &mut App, code: KeyCode) {
             }
             _ => app.should_quit = true, // n or anything else: quit without stopping
         },
-        Mode::ProfileSelect => {
-            let mut profiles: Vec<String> = app.manager.config.profiles.keys().cloned().collect();
-            profiles.sort();
+        Mode::TemplateSelect => {
+            let mut templates: Vec<String> = app.manager.config.templates.keys().cloned().collect();
+            templates.sort();
             match code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if app.profile_cursor == 0 {
-                        app.profile_cursor = profiles.len().saturating_sub(1);
+                    if app.template_cursor == 0 {
+                        app.template_cursor = templates.len().saturating_sub(1);
                     } else {
-                        app.profile_cursor -= 1;
+                        app.template_cursor -= 1;
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if !profiles.is_empty() {
-                        app.profile_cursor = (app.profile_cursor + 1) % profiles.len();
+                    if !templates.is_empty() {
+                        app.template_cursor = (app.template_cursor + 1) % templates.len();
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(p) = profiles.get(app.profile_cursor) {
-                        app.profile = Some(p.clone());
+                    if let Some(p) = templates.get(app.template_cursor) {
+                        app.template = Some(p.clone());
                         let manager = app.manager.clone();
                         let p = p.clone();
-                        app.status_line = format!("starting profile '{p}'...");
-                        let _ = manager.start_profile(&p).await;
+                        app.status_line = format!("starting template '{p}'...");
+                        let _ = manager.start_template(&p).await;
                     }
                     app.mode = Mode::Normal;
                 }
@@ -203,8 +206,8 @@ async fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Enter => app.mode = Mode::Details,
             KeyCode::Char('l') => app.mode = Mode::Logs,
             KeyCode::Char('p') => {
-                app.mode = Mode::ProfileSelect;
-                app.profile_cursor = 0;
+                app.mode = Mode::TemplateSelect;
+                app.template_cursor = 0;
             }
             KeyCode::Char('d') => {
                 app.doctor_results = doctor::run(&app.manager.config, &app.manager.root_dir);

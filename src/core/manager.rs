@@ -111,7 +111,12 @@ impl Manager {
         let svc_cfg = self.config.services.get(name)?;
         let pid = rt.process.lock().unwrap().as_ref().map(|p| p.pid);
         let uptime = rt.started_at.lock().unwrap().map(|t| t.elapsed());
-        let health_detail = rt.last_health.lock().unwrap().as_ref().map(|h| h.detail.clone());
+        let health_detail = rt
+            .last_health
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|h| h.detail.clone());
         Some(ServiceView {
             name: name.to_string(),
             status: rt.status(),
@@ -145,9 +150,9 @@ impl Manager {
             .get(name)
             .ok_or_else(|| anyhow!("unknown service '{name}'"))?;
         let base = match &svc.repository {
-            Some(repo) => self
-                .repo_root(repo)
-                .ok_or_else(|| anyhow!("service '{name}' references unknown repository '{repo}'"))?,
+            Some(repo) => self.repo_root(repo).ok_or_else(|| {
+                anyhow!("service '{name}' references unknown repository '{repo}'")
+            })?,
             None => self.root_dir.clone(),
         };
         Ok(match &svc.cwd {
@@ -156,12 +161,12 @@ impl Manager {
         })
     }
 
-    /// RF-04/RF-05/RF-06: start a profile — resolves dependencies and starts
+    /// Start a template: resolve dependencies and start everything in order,
     /// everything in order, waiting for each service's readiness (healthy
     /// when it has a health check, otherwise just started) before starting
     /// dependents.
-    pub async fn start_profile(&self, profile: &str) -> Result<Vec<String>> {
-        let order = graph::services_for_profile(&self.config, profile)?;
+    pub async fn start_template(&self, template: &str) -> Result<Vec<String>> {
+        let order = graph::services_for_template(&self.config, template)?;
         self.start_ordered(&order).await
     }
 

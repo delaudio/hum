@@ -43,7 +43,10 @@ pub fn run(config: &Config, root_dir: &std::path::Path) -> Vec<DoctorCheck> {
     for (name, repo) in &config.repositories {
         let path = expand_home(&repo.path);
         if path.is_dir() {
-            results.push(DoctorCheck::ok(None, format!("Repository '{name}' found ({})", path.display())));
+            results.push(DoctorCheck::ok(
+                None,
+                format!("Repository '{name}' found ({})", path.display()),
+            ));
         } else {
             results.push(DoctorCheck::fail(
                 None,
@@ -92,9 +95,16 @@ pub fn run(config: &Config, root_dir: &std::path::Path) -> Vec<DoctorCheck> {
         }
 
         for file in &svc.requires.files {
-            let path: PathBuf = if file.is_absolute() { file.clone() } else { cwd.join(file) };
+            let path: PathBuf = if file.is_absolute() {
+                file.clone()
+            } else {
+                cwd.join(file)
+            };
             if path.is_file() {
-                results.push(DoctorCheck::ok(Some(name), format!("{} found", file.display())));
+                results.push(DoctorCheck::ok(
+                    Some(name),
+                    format!("{} found", file.display()),
+                ));
             } else {
                 results.push(DoctorCheck::fail(
                     Some(name),
@@ -118,7 +128,10 @@ pub fn run(config: &Config, root_dir: &std::path::Path) -> Vec<DoctorCheck> {
 
         if let Some(port) = svc.port {
             match portcheck::check_port(port) {
-                None => results.push(DoctorCheck::ok(Some(name), format!("port {port} available"))),
+                None => results.push(DoctorCheck::ok(
+                    Some(name),
+                    format!("port {port} available"),
+                )),
                 Some(occupant) => {
                     let who = occupant
                         .pid

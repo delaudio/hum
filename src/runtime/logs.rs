@@ -33,11 +33,7 @@ pub struct LogLine {
 impl LogLine {
     #[allow(dead_code)]
     pub fn format(&self) -> String {
-        format!(
-            "{}  {}",
-            self.timestamp.format("%H:%M:%S"),
-            self.content
-        )
+        format!("{}  {}", self.timestamp.format("%H:%M:%S"), self.content)
     }
 }
 

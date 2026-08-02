@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub version: u32,
+    /// Stable project identifier required by the v2 project/template model.
+    /// It remains optional while loading v1 files for migration diagnostics.
+    pub project: Option<String>,
     #[serde(default)]
     pub repositories: HashMap<String, RepositoryConfig>,
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
-    #[serde(default)]
-    pub profiles: HashMap<String, ProfileConfig>,
+    #[serde(default, alias = "profiles")]
+    pub templates: HashMap<String, TemplateConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -100,7 +103,7 @@ fn default_status_codes() -> Vec<u16> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProfileConfig {
+pub struct TemplateConfig {
     #[serde(default)]
     pub services: Vec<String>,
 }

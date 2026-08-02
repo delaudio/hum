@@ -8,18 +8,14 @@ pub enum ConfigError {
     #[error("configuration file not found (searched from current directory upward)")]
     NotFound,
 
-    #[error(
-        "failed to read {file}: {source}\n  → check that the file exists and is readable"
-    )]
+    #[error("failed to read {file}: {source}\n  → check that the file exists and is readable")]
     Io {
         file: PathBuf,
         #[source]
         source: std::io::Error,
     },
 
-    #[error(
-        "invalid YAML in {file}{location}\n  {description}\n  → {hint}"
-    )]
+    #[error("invalid YAML in {file}{location}\n  {description}\n  → {hint}")]
     Parse {
         file: PathBuf,
         location: String,

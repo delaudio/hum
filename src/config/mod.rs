@@ -1,7 +1,9 @@
 pub mod error;
 pub mod loader;
 pub mod model;
+pub mod registry;
 pub mod validate;
 
-pub use loader::{load, Loaded};
+pub use loader::Loaded;
 pub use model::*;
+pub use registry::{resolve_project, RegistryError};

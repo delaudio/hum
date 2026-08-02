@@ -1,68 +1,79 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use crate::config;
+use crate::config::{self, RegistryError};
 use crate::core::Manager;
-use crate::doctor;
+use crate::{doctor, tui};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_GENERIC: i32 = 1;
 pub const EXIT_INVALID_CONFIG: i32 = 2;
-pub const EXIT_SERVICE_NOT_FOUND: i32 = 3;
-pub const EXIT_START_FAILED: i32 = 4;
+pub const EXIT_PROJECT_NOT_FOUND: i32 = 3;
+pub const EXIT_TEMPLATE_NOT_FOUND: i32 = 4;
+pub const EXIT_SERVICE_NOT_FOUND: i32 = 5;
+pub const EXIT_START_FAILED: i32 = 6;
+pub const EXIT_STOP_FAILED: i32 = 7;
 #[allow(dead_code)]
-pub const EXIT_HEALTHCHECK_FAILED: i32 = 5;
-pub const EXIT_DOCTOR_FAILED: i32 = 6;
+pub const EXIT_HEALTHCHECK_FAILED: i32 = 8;
+pub const EXIT_DOCTOR_FAILED: i32 = 9;
+pub const EXIT_RUNTIME_INCOHERENT: i32 = 10;
 
-#[derive(Parser)]
-#[command(name = "hum", version, about = "Keep your local stack humming.")]
+#[derive(Debug, Parser)]
+#[command(
+    name = "hum",
+    version,
+    about = "Keep your local stack humming.",
+    override_usage = "hum [OPTIONS] <PROJECT> <TEMPLATE> [COMMAND]"
+)]
 pub struct Cli {
-    /// Path to hum.yaml (default: discovered from the current directory upward)
+    /// Path to the global project registry (default: ~/.config/hum/config.yaml)
+    #[arg(long, global = true)]
+    pub registry: Option<PathBuf>,
+
+    /// Explicit project hum.yaml; bypasses the global registry
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
+
+    /// Registered project name, for example `compri`
+    pub project: Option<String>,
+
+    /// Template name, for example `all-services`
+    pub template: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Start a profile or one or more services.
-    ///
-    /// Runs in the foreground and keeps services alive until Ctrl+C —
-    /// `hum` has no daemon in the MVP (section 5/20 of the PRD), so
-    /// services only stay supervised as long as this process is alive.
-    Up {
-        targets: Vec<String>,
-        /// Start services and exit immediately instead of staying attached.
-        /// The services become unsupervised: nothing will restart them on
-        /// crash and no other `hum` invocation can stop them for you.
+    /// Start the selected template or listed services
+    Start {
+        services: Vec<String>,
+        /// Transitional v1 behavior; removed when persistent runtime lands
         #[arg(long)]
         detach: bool,
     },
-    /// Stop every running service
-    Down,
-    /// Stop one or more services
+    /// Stop the selected template or listed services
     Stop { services: Vec<String> },
-    /// Restart a service
-    Restart { service: String },
-    /// Show the status of every service
+    /// Restart the selected template or listed services
+    Restart { services: Vec<String> },
+    /// Show status for services in the selected template
     Status,
     /// Show captured logs for a service
     Logs {
         service: String,
-        /// Keep streaming new log lines
         #[arg(short, long)]
         follow: bool,
-        /// Number of lines to show
         #[arg(short = 'n', long, default_value_t = 100)]
         lines: usize,
     },
-    /// Check the local environment for common problems
+    /// Check the selected local environment for common problems
     Doctor,
+    /// Open the TUI in the selected project/template context
+    Tui,
     /// Configuration-related utilities
     Config {
         #[command(subcommand)]
@@ -70,56 +81,50 @@ pub enum Command {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum ConfigAction {
-    /// Validate hum.yaml (and hum.local.yaml, if present)
+    /// Validate registry, project configuration, and template selection
     Validate,
 }
 
-/// Load config or print a readable error and return the right exit code.
-fn load_or_exit(explicit: Option<&std::path::Path>) -> Result<config::Loaded, i32> {
-    match config::load(explicit) {
-        Ok(loaded) => Ok(loaded),
-        Err(e) => {
-            eprintln!("✗ {e}");
-            Err(EXIT_INVALID_CONFIG)
-        }
-    }
-}
-
 pub async fn run(cli: Cli) -> i32 {
-    let command = match cli.command {
-        Some(c) => c,
-        None => return EXIT_OK, // handled by caller (launches TUI)
+    let (project, template) = match required_selection(&cli) {
+        Ok(selection) => (selection.0.to_string(), selection.1.to_string()),
+        Err(code) => return code,
     };
 
-    let explicit = cli.config.as_deref();
+    let loaded = match resolve_or_exit(&project, cli.config.as_deref(), cli.registry.as_deref()) {
+        Ok(loaded) => loaded,
+        Err(code) => return code,
+    };
+
+    if !loaded.config.templates.contains_key(&template) {
+        eprintln!("✗ unknown template '{template}' in project '{project}'");
+        return EXIT_TEMPLATE_NOT_FOUND;
+    }
+
+    let command = cli.command.unwrap_or(Command::Tui);
 
     match command {
         Command::Config {
             action: ConfigAction::Validate,
-        } => match load_or_exit(explicit) {
-            Ok(loaded) => {
-                println!("✓ configuration is valid");
-                println!("  base:  {}", loaded.base_path.display());
-                if let Some(local) = &loaded.local_path {
-                    println!("  local: {} (override applied)", local.display());
-                }
-                println!(
-                    "  {} service(s), {} profile(s)",
-                    loaded.config.services.len(),
-                    loaded.config.profiles.len()
-                );
-                EXIT_OK
+        } => {
+            println!("✓ configuration is valid");
+            println!("  project:  {project}");
+            println!("  template: {template}");
+            println!("  base:     {}", loaded.base_path.display());
+            if let Some(local) = &loaded.local_path {
+                println!("  local:    {} (override applied)", local.display());
             }
-            Err(code) => code,
-        },
+            println!(
+                "  {} service(s), {} template(s)",
+                loaded.config.services.len(),
+                loaded.config.templates.len()
+            );
+            EXIT_OK
+        }
 
         Command::Doctor => {
-            let loaded = match load_or_exit(explicit) {
-                Ok(l) => l,
-                Err(code) => return code,
-            };
             let results = doctor::run(&loaded.config, &loaded.root_dir);
             print_doctor(&results);
             if doctor::all_passed(&results) {
@@ -129,26 +134,30 @@ pub async fn run(cli: Cli) -> i32 {
             }
         }
 
-        Command::Up { targets, detach } => {
-            let loaded = match load_or_exit(explicit) {
-                Ok(l) => l,
-                Err(code) => return code,
-            };
+        Command::Tui => {
             let manager = Arc::new(Manager::new(loaded));
-            let result = if targets.len() == 1 && manager.config.profiles.contains_key(&targets[0])
-            {
-                manager.start_profile(&targets[0]).await
-            } else if targets.is_empty() {
-                eprintln!("✗ specify a profile or one or more service names");
-                return EXIT_GENERIC;
-            } else {
-                for t in &targets {
-                    if !manager.config.services.contains_key(t) {
-                        eprintln!("✗ unknown service or profile '{t}'");
-                        return EXIT_SERVICE_NOT_FOUND;
-                    }
+            match tui::run(manager, Some(template)).await {
+                Ok(()) => EXIT_OK,
+                Err(error) => {
+                    eprintln!("✗ TUI error: {error}");
+                    EXIT_GENERIC
                 }
-                manager.start_services(&targets).await
+            }
+        }
+
+        Command::Start { services, detach } => {
+            let manager = Arc::new(Manager::new(loaded));
+            for service in &services {
+                if !manager.config.services.contains_key(service) {
+                    eprintln!("✗ unknown service '{service}'");
+                    return EXIT_SERVICE_NOT_FOUND;
+                }
+            }
+
+            let result = if services.is_empty() {
+                manager.start_template(&template).await
+            } else {
+                manager.start_services(&services).await
             };
 
             let start_ok = match &result {
@@ -156,8 +165,8 @@ pub async fn run(cli: Cli) -> i32 {
                     println!("✓ started: {}", started.join(", "));
                     true
                 }
-                Err(e) => {
-                    eprintln!("✗ {e}");
+                Err(error) => {
+                    eprintln!("✗ {error}");
                     false
                 }
             };
@@ -165,12 +174,10 @@ pub async fn run(cli: Cli) -> i32 {
 
             if detach {
                 eprintln!(
-                    "⚠ --detach: services are now unsupervised — `hum` will not restart them \
-                     on crash, and no other `hum` invocation can stop them (no daemon in the MVP)."
+                    "⚠ transitional --detach mode is unsupervised until runtime registry support lands"
                 );
                 return if start_ok { EXIT_OK } else { EXIT_START_FAILED };
             }
-
             if !start_ok {
                 let _ = manager.stop_all().await;
                 return EXIT_START_FAILED;
@@ -181,73 +188,39 @@ pub async fn run(cli: Cli) -> i32 {
             EXIT_OK
         }
 
-        Command::Down => {
-            let loaded = match load_or_exit(explicit) {
-                Ok(l) => l,
-                Err(code) => return code,
-            };
-            let manager = Manager::new(loaded);
-            match manager.stop_all().await {
-                Ok(()) => {
-                    println!("✓ all services stopped");
-                    EXIT_OK
-                }
-                Err(e) => {
-                    eprintln!("✗ {e}");
-                    EXIT_GENERIC
-                }
-            }
-        }
-
         Command::Stop { services } => {
-            let loaded = match load_or_exit(explicit) {
-                Ok(l) => l,
+            let manager = Manager::new(loaded);
+            let targets = match selected_services(&manager, &template, services) {
+                Ok(targets) => targets,
                 Err(code) => return code,
             };
-            let manager = Manager::new(loaded);
-            for name in &services {
-                if !manager.config.services.contains_key(name) {
-                    eprintln!("✗ unknown service '{name}'");
-                    return EXIT_SERVICE_NOT_FOUND;
+            for name in &targets {
+                if let Err(error) = manager.stop_service(name).await {
+                    eprintln!("✗ failed to stop '{name}': {error}");
+                    return EXIT_STOP_FAILED;
                 }
             }
-            for name in &services {
-                if let Err(e) = manager.stop_service(name).await {
-                    eprintln!("✗ failed to stop '{name}': {e}");
-                    return EXIT_GENERIC;
-                }
-            }
-            println!("✓ stopped: {}", services.join(", "));
+            println!("✓ stopped: {}", targets.join(", "));
             EXIT_OK
         }
 
-        Command::Restart { service } => {
-            let loaded = match load_or_exit(explicit) {
-                Ok(l) => l,
+        Command::Restart { services } => {
+            let manager = Manager::new(loaded);
+            let targets = match selected_services(&manager, &template, services) {
+                Ok(targets) => targets,
                 Err(code) => return code,
             };
-            let manager = Manager::new(loaded);
-            if !manager.config.services.contains_key(&service) {
-                eprintln!("✗ unknown service '{service}'");
-                return EXIT_SERVICE_NOT_FOUND;
-            }
-            match manager.restart_service(&service).await {
-                Ok(()) => {
-                    println!("✓ restarted '{service}'");
-                    EXIT_OK
-                }
-                Err(e) => {
-                    eprintln!("✗ {e}");
-                    EXIT_START_FAILED
+            for name in &targets {
+                if let Err(error) = manager.restart_service(name).await {
+                    eprintln!("✗ failed to restart '{name}': {error}");
+                    return EXIT_START_FAILED;
                 }
             }
+            println!("✓ restarted: {}", targets.join(", "));
+            EXIT_OK
         }
 
         Command::Status => {
-            let loaded = match load_or_exit(explicit) {
-                Ok(l) => l,
-                Err(code) => return code,
-            };
             let manager = Manager::new(loaded);
             print_status(&manager);
             EXIT_OK
@@ -258,32 +231,93 @@ pub async fn run(cli: Cli) -> i32 {
             follow,
             lines,
         } => {
-            let loaded = match load_or_exit(explicit) {
-                Ok(l) => l,
-                Err(code) => return code,
-            };
             if !loaded.config.services.contains_key(&service) {
                 eprintln!("✗ unknown service '{service}'");
                 return EXIT_SERVICE_NOT_FOUND;
             }
-            // Note: without a running `hum` session to attach to, non-interactive
-            // `logs` on a fresh process has nothing captured yet in the MVP
-            // (log buffers live in the running session's memory, section 11.2/RF-12).
             println!(
-                "(no running hum session found for '{service}' — start it with `hum up` first; \
-                 use the TUI's log view, or `hum up` in the foreground, to see live output)"
+                "(no persistent log store yet for '{service}'; runtime persistence is tracked separately)"
             );
             let _ = (follow, lines);
-            EXIT_OK
+            EXIT_RUNTIME_INCOHERENT
         }
     }
 }
 
-/// RF-07/RF-08 for the non-interactive path: keep the CLI process alive
-/// (reaping crashed children — RNF-04) until Ctrl+C, then stop everything
-/// gracefully before returning. Without this, services would keep running
-/// unsupervised the moment the `up` command returned (violating section 5's
-/// "must not stay alive after the main process exits").
+fn required_selection(cli: &Cli) -> Result<(&str, &str), i32> {
+    let Some(project) = cli.project.as_deref() else {
+        if cli.command.is_some() {
+            eprintln!(
+                "✗ command is missing project/template selection\n  → use: hum <PROJECT> <TEMPLATE> <COMMAND>"
+            );
+            return Err(EXIT_INVALID_CONFIG);
+        }
+        eprintln!("✗ missing project\n  → usage: hum <PROJECT> <TEMPLATE> <COMMAND>");
+        return Err(EXIT_PROJECT_NOT_FOUND);
+    };
+    if cli.command.is_none()
+        && matches!(
+            project,
+            "up" | "down" | "status" | "logs" | "restart" | "doctor" | "config"
+        )
+    {
+        eprintln!(
+            "✗ legacy v1 command syntax is not implicit in the project/template CLI\n  → use: hum <PROJECT> <TEMPLATE> <COMMAND>"
+        );
+        return Err(EXIT_INVALID_CONFIG);
+    }
+    let Some(template) = cli.template.as_deref() else {
+        eprintln!("✗ missing template for project '{project}'\n  → usage: hum <PROJECT> <TEMPLATE> <COMMAND>");
+        return Err(EXIT_TEMPLATE_NOT_FOUND);
+    };
+    Ok((project, template))
+}
+
+fn resolve_or_exit(
+    project: &str,
+    config: Option<&Path>,
+    registry: Option<&Path>,
+) -> Result<config::Loaded, i32> {
+    match config::resolve_project(project, config, registry) {
+        Ok(loaded) => Ok(loaded),
+        Err(error @ RegistryError::UnknownProject(_))
+        | Err(error @ RegistryError::ProjectMismatch { .. }) => {
+            eprintln!("✗ {error}");
+            Err(EXIT_PROJECT_NOT_FOUND)
+        }
+        Err(error @ RegistryError::ReservedProject(_)) => {
+            eprintln!("✗ {error}");
+            Err(EXIT_INVALID_CONFIG)
+        }
+        Err(error) => {
+            eprintln!("✗ {error}");
+            Err(EXIT_INVALID_CONFIG)
+        }
+    }
+}
+
+fn selected_services(
+    manager: &Manager,
+    template: &str,
+    requested: Vec<String>,
+) -> Result<Vec<String>, i32> {
+    if requested.is_empty() {
+        return crate::core::graph::services_for_template(&manager.config, template).map_err(
+            |error| {
+                eprintln!("✗ {error}");
+                EXIT_TEMPLATE_NOT_FOUND
+            },
+        );
+    }
+    for service in &requested {
+        if !manager.config.services.contains_key(service) {
+            eprintln!("✗ unknown service '{service}'");
+            return Err(EXIT_SERVICE_NOT_FOUND);
+        }
+    }
+    Ok(requested)
+}
+
 async fn wait_for_ctrl_c_and_shutdown(manager: &Arc<Manager>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -298,12 +332,12 @@ async fn wait_for_ctrl_c_and_shutdown(manager: &Arc<Manager>) {
 }
 
 fn print_status(manager: &Manager) {
-    println!(
-        "{:<22} {:<10} {:<7} DETAIL",
-        "SERVICE", "STATUS", "PORT"
-    );
+    println!("{:<22} {:<10} {:<7} DETAIL", "SERVICE", "STATUS", "PORT");
     for view in manager.all_views() {
-        let port = view.port.map(|p| p.to_string()).unwrap_or_else(|| "—".into());
+        let port = view
+            .port
+            .map(|port| port.to_string())
+            .unwrap_or_else(|| "—".into());
         let detail = view
             .blocked_reason
             .or(view.health_detail)
@@ -320,27 +354,113 @@ fn print_status(manager: &Manager) {
 
 fn print_doctor(results: &[doctor::DoctorCheck]) {
     let mut current_scope: Option<&str> = None;
-    for r in results {
-        let scope = r.scope.as_deref();
+    for result in results {
+        let scope = result.scope.as_deref();
         if scope != current_scope {
-            if let Some(s) = scope {
-                println!("\n{s}\n");
+            if let Some(scope) = scope {
+                println!("\n{scope}\n");
             } else if current_scope.is_some() {
                 println!();
             }
             current_scope = scope;
         }
-        if r.ok {
-            println!("✓ {}", r.label);
+        if result.ok {
+            println!("✓ {}", result.label);
         } else {
-            println!("✗ {}: {}", r.label, r.detail.as_deref().unwrap_or(""));
+            println!(
+                "✗ {}: {}",
+                result.label,
+                result.detail.as_deref().unwrap_or("")
+            );
         }
     }
     println!();
     if doctor::all_passed(results) {
         println!("All checks passed.");
     } else {
-        let failed = results.iter().filter(|r| !r.ok).count();
+        let failed = results.iter().filter(|result| !result.ok).count();
         println!("{failed} check(s) failed.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn parses_project_template_command_contract() {
+        let cli = Cli::try_parse_from(["hum", "compri", "all-services", "start"]).unwrap();
+        assert_eq!(cli.project.as_deref(), Some("compri"));
+        assert_eq!(cli.template.as_deref(), Some("all-services"));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Start {
+                services,
+                detach: false
+            }) if services.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parses_service_scoped_logs() {
+        let cli = Cli::try_parse_from([
+            "hum",
+            "compri",
+            "all-services",
+            "logs",
+            "api",
+            "--follow",
+            "--lines",
+            "25",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Logs {
+                service,
+                follow: true,
+                lines: 25
+            }) if service == "api"
+        ));
+    }
+
+    #[test]
+    fn reports_missing_selection_parts_with_distinct_exit_codes() {
+        let missing_project = Cli::try_parse_from(["hum"]).unwrap();
+        assert_eq!(
+            required_selection(&missing_project),
+            Err(EXIT_PROJECT_NOT_FOUND)
+        );
+
+        let missing_template = Cli::try_parse_from(["hum", "compri"]).unwrap();
+        assert_eq!(
+            required_selection(&missing_template),
+            Err(EXIT_TEMPLATE_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn help_shows_project_template_contract() {
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("<PROJECT> <TEMPLATE> [COMMAND]"));
+        assert!(help.contains("start"));
+        assert!(help.contains("status"));
+    }
+
+    #[test]
+    fn rejects_legacy_v1_command_shape_with_migration_exit_code() {
+        for args in [vec!["hum", "up", "frontend"], vec!["hum", "logs", "api"]] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(required_selection(&cli), Err(EXIT_INVALID_CONFIG));
+        }
+    }
+
+    #[test]
+    fn command_words_are_reserved_from_project_namespace() {
+        let error = Cli::try_parse_from(["hum", "status", "all-services", "status"])
+            .expect_err("status must be parsed as a command, not a project");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

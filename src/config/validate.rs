@@ -7,12 +7,28 @@ use super::model::Config;
 /// Validate a fully-merged configuration. Catches everything that can be
 /// checked statically: version, dangling references and dependency cycles.
 pub fn validate(config: &Config, file: &Path) -> Result<(), ConfigError> {
-    if config.version != 1 {
+    if !matches!(config.version, 1 | 2) {
         return Err(ConfigError::validation(
             file,
             "version",
             format!("unsupported config version {}", config.version),
-            "set `version: 1` — this is the only supported version",
+            "set `version: 1` for the legacy format or `version: 2` for project/templates",
+        ));
+    }
+
+    if config.version == 2
+        && config
+            .project
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return Err(ConfigError::validation(
+            file,
+            "project",
+            "version 2 configuration requires a project identifier",
+            "add `project: <name>` matching the global registry entry",
         ));
     }
 
@@ -59,14 +75,14 @@ pub fn validate(config: &Config, file: &Path) -> Result<(), ConfigError> {
         }
     }
 
-    for (name, profile) in &config.profiles {
-        for svc in &profile.services {
+    for (name, template) in &config.templates {
+        for svc in &template.services {
             if !config.services.contains_key(svc) {
                 return Err(ConfigError::validation(
                     file,
-                    format!("profiles.{name}.services"),
+                    format!("templates.{name}.services"),
                     format!("references unknown service '{svc}'"),
-                    format!("define a `services.{svc}` entry, or fix the typo in profiles.{name}"),
+                    format!("define a `services.{svc}` entry, or fix the typo in templates.{name}"),
                 ));
             }
         }

@@ -71,6 +71,9 @@ projects:
     config: ~/code/compri/hum.yaml
 ```
 
+A copyable registry shape is available at
+[`examples/registry.example.yaml`](examples/registry.example.yaml).
+
 Each project owns a versioned `hum.yaml`. The future-format example is
 [`examples/hum.v2.example.yaml`](examples/hum.v2.example.yaml). It intentionally
 does not validate with the current v1 binary yet. Machine-specific values can
