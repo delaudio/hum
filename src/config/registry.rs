@@ -139,7 +139,7 @@ fn read_registry(path: &Path) -> Result<Registry, RegistryError> {
         source,
     })?;
     let registry: Registry =
-        serde_yaml::from_str(&contents).map_err(|error| RegistryError::Parse {
+        yaml_serde::from_str(&contents).map_err(|error| RegistryError::Parse {
             file: path.to_path_buf(),
             description: error.to_string(),
         })?;

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::config::loader::expand_home;
@@ -36,12 +37,21 @@ impl DoctorCheck {
 /// RF-16: run every static/dynamic environment check the PRD describes.
 /// `root_dir` is the directory the config file lives in, used to resolve
 /// relative repository paths and requirement files.
-pub fn run(config: &Config, root_dir: &std::path::Path) -> Vec<DoctorCheck> {
+pub fn run_with_env(
+    config: &Config,
+    root_dir: &std::path::Path,
+    cli_overrides: &HashMap<String, String>,
+) -> Vec<DoctorCheck> {
     let mut results = Vec::new();
 
     // Repositories
     for (name, repo) in &config.repositories {
         let path = expand_home(&repo.path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            root_dir.join(path)
+        };
         if path.is_dir() {
             results.push(DoctorCheck::ok(
                 None,
@@ -62,7 +72,14 @@ pub fn run(config: &Config, root_dir: &std::path::Path) -> Vec<DoctorCheck> {
             .repository
             .as_ref()
             .and_then(|r| config.repositories.get(r))
-            .map(|r| expand_home(&r.path))
+            .map(|r| {
+                let path = expand_home(&r.path);
+                if path.is_absolute() {
+                    path
+                } else {
+                    root_dir.join(path)
+                }
+            })
             .unwrap_or_else(|| root_dir.to_path_buf());
         let cwd = match &svc.cwd {
             Some(c) => base.join(c),
@@ -81,6 +98,28 @@ pub fn run(config: &Config, root_dir: &std::path::Path) -> Vec<DoctorCheck> {
                 format!("not found: {}", cwd.display()),
             ));
         }
+
+        let resolved_env =
+            match crate::config::environment::resolve_service_env(svc, &cwd, cli_overrides) {
+                Ok(env) => {
+                    if let Some(env_file) = &svc.env_file {
+                        let path = if env_file.is_absolute() {
+                            env_file.clone()
+                        } else {
+                            cwd.join(env_file)
+                        };
+                        results.push(DoctorCheck::ok(
+                            Some(name),
+                            format!("Env file found ({})", path.display()),
+                        ));
+                    }
+                    Some(env)
+                }
+                Err(error) => {
+                    results.push(DoctorCheck::fail(Some(name), "Env file", error.to_string()));
+                    None
+                }
+            };
 
         for command in &svc.requires.commands {
             if which::which(command).is_ok() {
@@ -115,7 +154,12 @@ pub fn run(config: &Config, root_dir: &std::path::Path) -> Vec<DoctorCheck> {
         }
 
         for var in &svc.requires.env {
-            if std::env::var(var).is_ok() {
+            if cli_overrides.contains_key(var)
+                || std::env::var_os(var).is_some()
+                || resolved_env
+                    .as_ref()
+                    .is_some_and(|environment| environment.contains_key(var))
+            {
                 results.push(DoctorCheck::ok(Some(name), format!("env {var} set")));
             } else {
                 results.push(DoctorCheck::fail(

@@ -12,7 +12,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+yaml_serde = "0.10"
 anyhow = "1"
 async-recursion = "1"
 thiserror = "1"
@@ -23,6 +23,7 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 which = "6"
 dirs = "5"
+dotenvy = "0.15"
 humantime = "2"
 humantime-serde = "1"
 open = "5"
@@ -30,4 +31,3 @@ sysinfo = "0.32"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-

@@ -9,7 +9,7 @@ Current v1 CLI:
 hum up full
 ```
 
-Target v2 CLI (not implemented yet):
+Current project/template CLI:
 
 ```bash
 hum compri all-services start
@@ -20,8 +20,9 @@ their logs and runtime metadata to disk, and exits. There is no resident `hum`
 daemon. Later CLI invocations and the TUI reconcile that metadata with the
 operating system.
 
-> The repository is currently migrating from the session-owned v1 prototype to
-> this v2 model. Track progress in
+> Project/template selection and v2 configuration are implemented. The runtime
+> is still migrating from session-owned processes to the persistent v2 model.
+> Track progress in
 > [epic #16](https://github.com/delaudio/hum/issues/16).
 
 ## Concepts
@@ -46,20 +47,15 @@ hum <project> <template> tui
 `hum`, `hum <project>`, and `hum <project> <template>` provide progressively
 narrower interactive selection, with the final form opening the TUI.
 
-## Current configuration (v1)
+## Configuration discovery
 
-The binary currently accepts the session-owned v1 format and discovers
+The binary accepts both the legacy v1 and project/template v2 formats. It discovers
 `hum.yaml` from the current directory upwards, then at
 `$XDG_CONFIG_HOME/hum/hum.yaml`, falling back to
 `~/.config/hum/hum.yaml`. The runnable example is
 [`examples/hum.example.yaml`](examples/hum.example.yaml).
 
-The current commands remain `hum up <profile>`, `hum status`, and the other v1
-subcommands until the linked migration issues land.
-
-## Target configuration (v2, not implemented yet)
-
-The target v2 contract registers projects globally in
+The v2 contract registers projects globally in
 `~/.config/hum/config.yaml` (or
 `$XDG_CONFIG_HOME/hum/config.yaml`):
 
@@ -74,12 +70,16 @@ projects:
 A copyable registry shape is available at
 [`examples/registry.example.yaml`](examples/registry.example.yaml).
 
-Each project owns a versioned `hum.yaml`. The future-format example is
-[`examples/hum.v2.example.yaml`](examples/hum.v2.example.yaml). It intentionally
-does not validate with the current v1 binary yet. Machine-specific values can
-live in an untracked `hum.local.yaml` beside it.
+Each project owns a versioned `hum.yaml`. A complete example is
+[`examples/hum.v2.example.yaml`](examples/hum.v2.example.yaml). Machine-specific
+values can live in an untracked `hum.local.yaml` beside it.
 
 Relative paths are resolved from the configuration file that declares them.
+Repository paths are relative to `hum.yaml`; service `cwd` is relative to its
+repository, and `env_file` is relative to the resulting service working directory.
+Service environment precedence is `.env` file, `service.env`, inherited process
+environment, then repeatable `--env KEY=VALUE` CLI overrides. Unknown YAML fields
+and invalid names, ports, URLs, durations, commands, or references are rejected.
 
 ## Current runtime and logs (v1)
 

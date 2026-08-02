@@ -33,7 +33,7 @@ pub enum ConfigError {
 }
 
 impl ConfigError {
-    pub fn from_yaml(file: PathBuf, err: serde_yaml::Error) -> Self {
+    pub fn from_yaml(file: PathBuf, err: yaml_serde::Error) -> Self {
         let location = match err.location() {
             Some(loc) => format!(" (line {}, column {})", loc.line(), loc.column()),
             None => String::new(),
@@ -42,7 +42,57 @@ impl ConfigError {
             file,
             location,
             description: err.to_string(),
-            hint: "check indentation and YAML syntax around the reported location".into(),
+            hint: if err.to_string().contains("unknown field") {
+                "rename or remove the unknown field; valid field names are listed above".into()
+            } else {
+                "check indentation and YAML syntax around the reported location".into()
+            },
+        }
+    }
+
+    pub fn from_yaml_with_source(file: PathBuf, err: yaml_serde::Error, source: &str) -> Self {
+        let description = err.to_string();
+        let location = unknown_field_name(&description)
+            .and_then(|field| locate_field(source, field))
+            .map(|(line, column)| format!(" (line {line}, column {column})"))
+            .or_else(|| {
+                err.location()
+                    .map(|loc| format!(" (line {}, column {})", loc.line(), loc.column()))
+            })
+            .unwrap_or_default();
+        ConfigError::Parse {
+            file,
+            location,
+            hint: if description.contains("unknown field") {
+                "rename or remove the unknown field; valid field names are listed above".into()
+            } else {
+                "check indentation and YAML syntax around the reported location".into()
+            },
+            description,
+        }
+    }
+
+    pub fn unknown_field(
+        file: &std::path::Path,
+        field: &str,
+        valid: &[&str],
+        source: &str,
+    ) -> Self {
+        let location = locate_field(source, field)
+            .map(|(line, column)| format!(" (line {line}, column {column})"))
+            .unwrap_or_default();
+        ConfigError::Parse {
+            file: file.to_path_buf(),
+            location,
+            description: format!(
+                "unknown field `{field}`, expected one of {}",
+                valid
+                    .iter()
+                    .map(|field| format!("`{field}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            hint: "rename or remove the unknown field; valid field names are listed above".into(),
         }
     }
 
@@ -59,4 +109,21 @@ impl ConfigError {
             hint: hint.into(),
         }
     }
+}
+
+fn unknown_field_name(description: &str) -> Option<&str> {
+    description
+        .split_once("unknown field `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(field, _)| field)
+}
+
+fn locate_field(source: &str, field: &str) -> Option<(usize, usize)> {
+    source.lines().enumerate().find_map(|(line, text)| {
+        let code = text.split('#').next()?.trim_end();
+        let (candidate, _) = code.split_once(':')?;
+        let candidate = candidate.trim();
+        let unquoted = candidate.trim_matches(|character| character == '\'' || character == '"');
+        (unquoted == field).then(|| (line + 1, text.find(field).unwrap_or(0) + 1))
+    })
 }

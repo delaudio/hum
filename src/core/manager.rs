@@ -78,11 +78,12 @@ pub struct ServiceView {
 pub struct Manager {
     pub config: Config,
     pub root_dir: PathBuf,
+    env_overrides: HashMap<String, String>,
     services: HashMap<String, Arc<ServiceRuntime>>,
 }
 
 impl Manager {
-    pub fn new(loaded: Loaded) -> Self {
+    pub fn with_env(loaded: Loaded, env_overrides: HashMap<String, String>) -> Self {
         let services = loaded
             .config
             .services
@@ -92,6 +93,7 @@ impl Manager {
         Manager {
             config: loaded.config,
             root_dir: loaded.root_dir,
+            env_overrides,
             services,
         }
     }
@@ -100,6 +102,10 @@ impl Manager {
         let mut names: Vec<String> = self.services.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    pub fn env_overrides(&self) -> &HashMap<String, String> {
+        &self.env_overrides
     }
 
     pub fn logs(&self, name: &str) -> Option<Arc<LogBuffer>> {
@@ -137,10 +143,14 @@ impl Manager {
     }
 
     fn repo_root(&self, repo: &str) -> Option<PathBuf> {
-        self.config
-            .repositories
-            .get(repo)
-            .map(|r| crate::config::loader::expand_home(&r.path))
+        self.config.repositories.get(repo).map(|r| {
+            let path = crate::config::loader::expand_home(&r.path);
+            if path.is_absolute() {
+                path
+            } else {
+                self.root_dir.join(path)
+            }
+        })
     }
 
     fn service_cwd(&self, name: &str) -> Result<PathBuf> {
@@ -270,6 +280,7 @@ impl Manager {
             .clone()
             .ok_or_else(|| anyhow!("service '{name}' has no command configured"))?;
         let cwd = self.service_cwd(name)?;
+        let env = crate::config::environment::resolve_service_env(&svc, &cwd, &self.env_overrides)?;
 
         rt.set_status(ServiceStatus::Starting);
         *rt.blocked_reason.lock().unwrap() = None;
@@ -280,7 +291,7 @@ impl Manager {
             content: format!("starting: {command} (cwd: {})", cwd.display()),
         });
 
-        let process = RunningProcess::spawn(name, &command, &cwd, &svc.env, rt.logs.clone())?;
+        let process = RunningProcess::spawn(name, &command, &cwd, &env, rt.logs.clone())?;
         *rt.process.lock().unwrap() = Some(process.clone());
         *rt.started_at.lock().unwrap() = Some(Instant::now());
         rt.set_status(ServiceStatus::Running);
@@ -473,5 +484,45 @@ impl Manager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{RepositoryConfig, ServiceConfig};
+
+    #[test]
+    fn resolves_relative_repository_from_config_directory() {
+        let root = PathBuf::from("/tmp/hum-project");
+        let loaded = Loaded {
+            config: Config {
+                repositories: HashMap::from([(
+                    "api".to_string(),
+                    RepositoryConfig {
+                        path: "../api".into(),
+                    },
+                )]),
+                services: HashMap::from([(
+                    "server".to_string(),
+                    ServiceConfig {
+                        repository: Some("api".to_string()),
+                        cwd: Some("src".into()),
+                        command: Some("true".to_string()),
+                        ..ServiceConfig::default()
+                    },
+                )]),
+                ..Config::default()
+            },
+            base_path: root.join("hum.yaml"),
+            local_path: None,
+            root_dir: root.clone(),
+        };
+        let manager = Manager::with_env(loaded, HashMap::new());
+
+        assert_eq!(
+            manager.service_cwd("server").unwrap(),
+            root.join("../api/src")
+        );
     }
 }

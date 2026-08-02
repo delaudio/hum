@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
     /// Stable project identifier required by the v2 project/template model.
@@ -19,11 +20,13 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryConfig {
     pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub repository: Option<String>,
     pub cwd: Option<PathBuf>,
@@ -51,6 +54,7 @@ pub enum ReadyMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RequirementsConfig {
     #[serde(default)]
     pub commands: Vec<String>,
@@ -61,7 +65,7 @@ pub struct RequirementsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum HealthcheckConfig {
     Http {
         url: String,
@@ -103,6 +107,7 @@ fn default_status_codes() -> Vec<u16> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TemplateConfig {
     #[serde(default)]
     pub services: Vec<String>,

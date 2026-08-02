@@ -37,6 +37,15 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Override a service environment value (repeatable, KEY=VALUE)
+    #[arg(
+        long = "env",
+        global = true,
+        value_name = "KEY=VALUE",
+        action = clap::ArgAction::Append
+    )]
+    pub env: Vec<String>,
+
     /// Registered project name, for example `compri`
     pub project: Option<String>,
 
@@ -88,6 +97,13 @@ pub enum ConfigAction {
 }
 
 pub async fn run(cli: Cli) -> i32 {
+    let env_overrides = match config::environment::parse_overrides(&cli.env) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            eprintln!("✗ {error}");
+            return EXIT_INVALID_CONFIG;
+        }
+    };
     let (project, template) = match required_selection(&cli) {
         Ok(selection) => (selection.0.to_string(), selection.1.to_string()),
         Err(code) => return code,
@@ -125,7 +141,7 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Doctor => {
-            let results = doctor::run(&loaded.config, &loaded.root_dir);
+            let results = doctor::run_with_env(&loaded.config, &loaded.root_dir, &env_overrides);
             print_doctor(&results);
             if doctor::all_passed(&results) {
                 EXIT_OK
@@ -135,7 +151,7 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Tui => {
-            let manager = Arc::new(Manager::new(loaded));
+            let manager = Arc::new(Manager::with_env(loaded, env_overrides));
             match tui::run(manager, Some(template)).await {
                 Ok(()) => EXIT_OK,
                 Err(error) => {
@@ -146,7 +162,7 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Start { services, detach } => {
-            let manager = Arc::new(Manager::new(loaded));
+            let manager = Arc::new(Manager::with_env(loaded, env_overrides));
             for service in &services {
                 if !manager.config.services.contains_key(service) {
                     eprintln!("✗ unknown service '{service}'");
@@ -189,7 +205,7 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Stop { services } => {
-            let manager = Manager::new(loaded);
+            let manager = Manager::with_env(loaded, env_overrides);
             let targets = match selected_services(&manager, &template, services) {
                 Ok(targets) => targets,
                 Err(code) => return code,
@@ -205,7 +221,7 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Restart { services } => {
-            let manager = Manager::new(loaded);
+            let manager = Manager::with_env(loaded, env_overrides);
             let targets = match selected_services(&manager, &template, services) {
                 Ok(targets) => targets,
                 Err(code) => return code,
@@ -221,7 +237,7 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Status => {
-            let manager = Manager::new(loaded);
+            let manager = Manager::with_env(loaded, env_overrides);
             print_status(&manager);
             EXIT_OK
         }
@@ -424,6 +440,28 @@ mod tests {
                 lines: 25
             }) if service == "api"
         ));
+    }
+
+    #[test]
+    fn parses_repeatable_environment_overrides() {
+        let cli = Cli::try_parse_from([
+            "hum",
+            "compri",
+            "all-services",
+            "start",
+            "--env",
+            "API_URL=http://localhost:3000",
+            "--env",
+            "TOKEN=secret",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.env,
+            [
+                "API_URL=http://localhost:3000".to_string(),
+                "TOKEN=secret".to_string()
+            ]
+        );
     }
 
     #[test]

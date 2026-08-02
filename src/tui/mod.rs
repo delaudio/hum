@@ -210,7 +210,11 @@ async fn handle_key(app: &mut App, code: KeyCode) {
                 app.template_cursor = 0;
             }
             KeyCode::Char('d') => {
-                app.doctor_results = doctor::run(&app.manager.config, &app.manager.root_dir);
+                app.doctor_results = doctor::run_with_env(
+                    &app.manager.config,
+                    &app.manager.root_dir,
+                    app.manager.env_overrides(),
+                );
                 app.mode = Mode::Doctor;
             }
             KeyCode::Char('o') => {
