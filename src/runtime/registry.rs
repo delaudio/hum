@@ -134,6 +134,34 @@ impl RuntimeRegistry {
         )
     }
 
+    pub fn prepare_exit_code(&self, service: &str) -> Result<PathBuf> {
+        if !crate::config::validate::is_safe_identifier(service) {
+            anyhow::bail!("unsafe service identifier '{service}'");
+        }
+        let path = self.exit_code_path(service);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to prepare {}", path.display()))?;
+        restrict_file(&file)?;
+        Ok(path)
+    }
+
+    pub fn read_exit_code(&self, service: &str) -> Result<Option<i32>> {
+        if !crate::config::validate::is_safe_identifier(service) {
+            anyhow::bail!("unsafe service identifier '{service}'");
+        }
+        let path = self.exit_code_path(service);
+        let value = match fs::read_to_string(&path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(value.trim().parse::<i32>().ok())
+    }
+
     pub fn lock(&self) -> Result<ProjectLock> {
         let file = OpenOptions::new()
             .create(true)
@@ -250,6 +278,10 @@ impl RuntimeRegistry {
 
     fn entry_path(&self, service: &str) -> PathBuf {
         self.runtime_dir.join(format!("{service}.json"))
+    }
+
+    fn exit_code_path(&self, service: &str) -> PathBuf {
+        self.runtime_dir.join(format!("{service}.exit"))
     }
 
     fn valid_identity_path(&self, entry: &RuntimeEntry) -> bool {

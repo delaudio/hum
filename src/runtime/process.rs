@@ -20,6 +20,13 @@ pub enum DetachedStopOutcome {
     IdentityMismatch(String),
 }
 
+pub struct DetachedOutput<'a> {
+    pub exit_code_path: &'a std::path::Path,
+    pub stdout_path: &'a std::path::Path,
+    pub stderr_path: &'a std::path::Path,
+    pub log_policy: super::logs::LogPolicy,
+}
+
 /// Spawn a service in a new session with file-backed stdio. The returned
 /// process is intentionally not owned by the current Tokio runtime.
 pub fn spawn_detached(
@@ -27,9 +34,7 @@ pub fn spawn_detached(
     cwd: &std::path::Path,
     env: &std::collections::HashMap<String, String>,
     identity_file: &std::fs::File,
-    stdout_path: &std::path::Path,
-    stderr_path: &std::path::Path,
-    log_policy: super::logs::LogPolicy,
+    output: DetachedOutput<'_>,
 ) -> Result<DetachedProcess> {
     use std::process::Command as StdCommand;
 
@@ -51,9 +56,9 @@ pub fn spawn_detached(
         let executable = std::env::current_exe().context("failed to locate hum log sink")?;
         let mut sink = StdCommand::new(executable);
         sink.args(super::logs::internal_sink_args(
-            stdout_path,
-            stderr_path,
-            log_policy,
+            output.stdout_path,
+            output.stderr_path,
+            output.log_policy,
         ))
         .stdin(Stdio::from(OwnedFd::from(stdout_reader)))
         .stdout(Stdio::null())
@@ -81,9 +86,9 @@ pub fn spawn_detached(
     let sink = super::logs::spawn_test_sink(
         stdout_reader,
         stderr_reader,
-        stdout_path.to_path_buf(),
-        stderr_path.to_path_buf(),
-        log_policy,
+        output.stdout_path.to_path_buf(),
+        output.stderr_path.to_path_buf(),
+        output.log_policy,
     );
     #[cfg(not(test))]
     let (log_sink_pid, log_sink_start_time) = {
@@ -100,9 +105,12 @@ pub fn spawn_detached(
         .arg("-c")
         // Stop after creating the session but before evaluating user code so
         // the parent can persist identity metadata without an exit race.
-        .arg("kill -STOP $$; eval \"$1\"")
+        .arg(
+            "hum_exit_file=$2; trap 'hum_status=$?; trap - EXIT; printf \"%s\\n\" \"$hum_status\" > \"$hum_exit_file\"; exit \"$hum_status\"' EXIT; trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; kill -STOP $$; eval \"$1\"",
+        )
         .arg("hum-detached")
         .arg(command)
+        .arg(output.exit_code_path)
         .current_dir(cwd)
         .envs(env)
         .stdin(Stdio::null())

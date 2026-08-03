@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use crate::config::loader::expand_home;
 use crate::config::Config;
+use crate::runtime::detached::DetachedRuntime;
 use crate::runtime::portcheck;
+use crate::runtime::registry::{inspect_identity, IdentityStatus, RuntimeEntry};
 
 /// One diagnostic result (section 8.5 / RF-16). `scope` is `None` for
 /// repository/global checks, `Some(service)` for per-service checks.
@@ -37,10 +39,20 @@ impl DoctorCheck {
 /// RF-16: run every static/dynamic environment check the PRD describes.
 /// `root_dir` is the directory the config file lives in, used to resolve
 /// relative repository paths and requirement files.
-pub fn run_with_env(
+pub fn run_with_runtime(runtime: &DetachedRuntime) -> Vec<DoctorCheck> {
+    run_checks(
+        runtime.config(),
+        runtime.root_dir(),
+        runtime.env_overrides(),
+        runtime,
+    )
+}
+
+fn run_checks(
     config: &Config,
     root_dir: &std::path::Path,
     cli_overrides: &HashMap<String, String>,
+    runtime: &DetachedRuntime,
 ) -> Vec<DoctorCheck> {
     let mut results = Vec::new();
 
@@ -68,6 +80,45 @@ pub fn run_with_env(
 
     // Services
     for (name, svc) in &config.services {
+        let (runtime_entry, registry_read_failed) = match runtime.registry().load(name) {
+            Ok(entry) => (entry, false),
+            Err(error) => {
+                results.push(DoctorCheck::fail(
+                    Some(name),
+                    "Runtime registry",
+                    error.to_string(),
+                ));
+                (None, true)
+            }
+        };
+        let runtime_identity = runtime_entry
+            .as_ref()
+            .map(|entry| (entry, inspect_identity(entry)));
+        if !registry_read_failed {
+            match &runtime_identity {
+                None => results.push(DoctorCheck::ok(
+                    Some(name),
+                    "Runtime registry: no managed process",
+                )),
+                Some((entry, IdentityStatus::Matching)) => results.push(DoctorCheck::ok(
+                    Some(name),
+                    format!(
+                        "Runtime registry: managed by hum (PID {}, PGID {})",
+                        entry.pid, entry.pgid
+                    ),
+                )),
+                Some((_, IdentityStatus::Missing)) => results.push(DoctorCheck::fail(
+                    Some(name),
+                    "Runtime registry stale",
+                    "registered process is no longer present",
+                )),
+                Some((_, IdentityStatus::Mismatch(reason))) => results.push(DoctorCheck::fail(
+                    Some(name),
+                    "Runtime registry identity mismatch",
+                    reason.clone(),
+                )),
+            }
+        }
         let base = svc
             .repository
             .as_ref()
@@ -171,23 +222,7 @@ pub fn run_with_env(
         }
 
         if let Some(port) = svc.port {
-            match portcheck::check_port(port) {
-                None => results.push(DoctorCheck::ok(
-                    Some(name),
-                    format!("port {port} available"),
-                )),
-                Some(occupant) => {
-                    let who = occupant
-                        .pid
-                        .map(|pid| format!("PID {pid}"))
-                        .unwrap_or_else(|| "unknown process".to_string());
-                    results.push(DoctorCheck::fail(
-                        Some(name),
-                        format!("port {port} available"),
-                        format!("already in use by {who}"),
-                    ));
-                }
-            }
+            check_service_port(name, port, runtime_identity.as_ref(), &mut results);
         }
 
         // Convention: if this looks like a Node project (package.json
@@ -215,4 +250,101 @@ pub fn run_with_env(
 
 pub fn all_passed(results: &[DoctorCheck]) -> bool {
     results.iter().all(|r| r.ok)
+}
+
+fn check_service_port(
+    service: &str,
+    port: u16,
+    runtime_identity: Option<&(&RuntimeEntry, IdentityStatus)>,
+    results: &mut Vec<DoctorCheck>,
+) {
+    let listening = match portcheck::probe_port(port) {
+        portcheck::PortProbe::Listening => true,
+        portcheck::PortProbe::Closed => false,
+        portcheck::PortProbe::Unknown => portcheck::check_port(port).is_some(),
+    };
+    let occupant = listening.then(|| portcheck::identify_occupant(port));
+    if let Some((entry, IdentityStatus::Matching)) = runtime_identity {
+        let owned = occupant.as_ref().is_some_and(|occupant| {
+            occupant
+                .pid
+                .is_some_and(|pid| portcheck::belongs_to_process_group(pid, entry.pgid))
+        });
+        let owner = occupant.as_ref().and_then(format_known_occupant);
+        results.push(classify_port(service, port, true, listening, owner, owned));
+        return;
+    }
+
+    results.push(classify_port(
+        service,
+        port,
+        false,
+        listening,
+        occupant.as_ref().and_then(format_known_occupant),
+        false,
+    ));
+}
+
+fn format_known_occupant(occupant: &portcheck::PortOccupant) -> Option<String> {
+    occupant.pid.map(|pid| format!("PID {pid}"))
+}
+
+fn classify_port(
+    service: &str,
+    port: u16,
+    managed: bool,
+    listening: bool,
+    occupant: Option<String>,
+    owned: bool,
+) -> DoctorCheck {
+    match (managed, listening, occupant, owned) {
+        (true, true, Some(_), true) => DoctorCheck::ok(
+            Some(service),
+            format!("port {port} owned by managed service"),
+        ),
+        (true, true, Some(who), false) => DoctorCheck::fail(
+            Some(service),
+            format!("port {port} ownership"),
+            format!("managed service expects the port, but it is held by {who}"),
+        ),
+        (true, true, None, _) => DoctorCheck::ok(
+            Some(service),
+            format!("port {port} listener present (owner unavailable)"),
+        ),
+        (true, false, _, _) => DoctorCheck::fail(
+            Some(service),
+            format!("port {port} listener"),
+            "managed service is running but is not listening",
+        ),
+        (false, false, _, _) => DoctorCheck::ok(Some(service), format!("port {port} available")),
+        (false, true, who, _) => DoctorCheck::fail(
+            Some(service),
+            format!("port {port} occupied by external process"),
+            who.unwrap_or_else(|| "owner could not be identified".to_string()),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_diagnostics_distinguish_managed_external_and_missing_listener() {
+        let managed = classify_port("api", 3000, true, true, Some("PID 10".to_string()), true);
+        assert!(managed.ok);
+        assert!(managed.label.contains("managed service"));
+
+        let external = classify_port("api", 3000, false, true, Some("PID 11".to_string()), false);
+        assert!(!external.ok);
+        assert!(external.label.contains("external process"));
+
+        let missing = classify_port("api", 3000, true, false, None, false);
+        assert!(!missing.ok);
+        assert!(missing.detail.unwrap().contains("not listening"));
+
+        let unavailable_owner = classify_port("api", 3000, true, true, None, false);
+        assert!(unavailable_owner.ok);
+        assert!(unavailable_owner.label.contains("owner unavailable"));
+    }
 }

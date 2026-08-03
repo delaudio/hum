@@ -26,6 +26,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Logs => draw_logs(f, app, size),
         Mode::Details => draw_details(f, app, size),
         Mode::Doctor => draw_doctor(f, app, size),
+        Mode::QuitConfirm => draw_quit_confirm(f, app, size),
         Mode::Help => draw_help(f, size),
         Mode::Normal => {}
     }
@@ -65,22 +66,31 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec!["Service", "Process", "Port", "Health", "Detail"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = app
+    let mut rows: Vec<Row> = app
         .services
         .iter()
         .enumerate()
-        .filter_map(|(i, name)| {
-            let status = app.statuses.get(name)?;
-            let detail = status
-                .detail
-                .clone()
-                .or(status.health_detail.clone())
-                .unwrap_or_default();
+        .map(|(i, name)| {
             let style = if i == app.selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
+            let Some(status) = app.statuses.get(name) else {
+                return Row::new(vec![
+                    Cell::from(name.clone()),
+                    Cell::from("… loading"),
+                    Cell::from("unknown"),
+                    Cell::from("unchecked"),
+                    Cell::from("waiting for first monitor poll"),
+                ])
+                .style(style);
+            };
+            let detail = status
+                .detail
+                .clone()
+                .or(status.health_detail.clone())
+                .unwrap_or_default();
             let process_cell = Cell::from(format!(
                 "{} {}",
                 status.process.symbol(),
@@ -89,21 +99,28 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(process_color(status.process)));
             let health_cell = Cell::from(status.health.label())
                 .style(Style::default().fg(health_color(status.health)));
-            Some(
-                Row::new(vec![
-                    Cell::from(name.clone()),
-                    process_cell,
-                    Cell::from(match status.configured_port {
-                        Some(port) => format!("{port}/{}", status.port.label()),
-                        None => status.port.label().to_string(),
-                    }),
-                    health_cell,
-                    Cell::from(detail),
-                ])
-                .style(style),
-            )
+            Row::new(vec![
+                Cell::from(name.clone()),
+                process_cell,
+                Cell::from(match status.configured_port {
+                    Some(port) => format!("{port}/{}", status.port.label()),
+                    None => status.port.label().to_string(),
+                }),
+                health_cell,
+                Cell::from(detail),
+            ])
+            .style(style)
         })
         .collect();
+    if rows.is_empty() {
+        rows.push(Row::new(vec![
+            Cell::from("(no services in template)"),
+            Cell::from("—"),
+            Cell::from("—"),
+            Cell::from("—"),
+            Cell::from("Select another template with p"),
+        ]));
+    }
 
     let table = Table::new(
         rows,
@@ -156,7 +173,11 @@ fn draw_template_select(f: &mut Frame, app: &App, area: Rect) {
     templates.sort();
     let popup = centered_rect(40, 50, area);
     f.render_widget(Clear, popup);
-    let items: Vec<ListItem> = templates.iter().map(|p| ListItem::new(p.clone())).collect();
+    let items: Vec<ListItem> = if templates.is_empty() {
+        vec![ListItem::new("(no templates configured)")]
+    } else {
+        templates.iter().map(|p| ListItem::new(p.clone())).collect()
+    };
     let list = List::new(items)
         .block(
             Block::default()
@@ -165,12 +186,12 @@ fn draw_template_select(f: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(app.template_cursor()));
+    state.select((!templates.is_empty()).then_some(app.template_cursor()));
     f.render_stateful_widget(list, popup, &mut state);
 }
 
 fn draw_details(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(60, 60, area);
+    let popup = centered_rect(90, 70, area);
     f.render_widget(Clear, popup);
     let Some(name) = app.selected_name() else {
         return;
@@ -206,6 +227,20 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "—".into())
         )),
+        Line::from(format!(
+            "PGID          {}",
+            status
+                .pgid
+                .map(|pgid| pgid.to_string())
+                .unwrap_or_else(|| "—".into())
+        )),
+        Line::from(format!(
+            "Exit code     {}",
+            status
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "— (unavailable for detached process)".into())
+        )),
         Line::from(format!("Uptime        {uptime}")),
         Line::from(format!(
             "Port          {} ({})",
@@ -234,15 +269,48 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
             "Detail        {}",
             status.detail.clone().unwrap_or_else(|| "—".into())
         )),
+        Line::from(format!(
+            "Cwd           {}",
+            status
+                .cwd
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "—".into())
+        )),
+        Line::from(format!(
+            "Command       {}",
+            status.command.clone().unwrap_or_else(|| "—".into())
+        )),
+        Line::from(format!(
+            "Stdout log    {}",
+            status
+                .stdout_log
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "—".into())
+        )),
+        Line::from(format!(
+            "Stderr log    {}",
+            status
+                .stderr_log
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "—".into())
+        )),
         Line::from(""),
         Line::from("[esc] back"),
     ];
+    let visible_height = usize::from(popup.height.saturating_sub(2));
+    let max_scroll = text
+        .len()
+        .saturating_sub(visible_height)
+        .min(usize::from(u16::MAX)) as u16;
     f.render_widget(
-        Paragraph::new(text).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {name} ")),
-        ),
+        Paragraph::new(text)
+            .scroll((app.details_scroll.min(max_scroll), app.details_horizontal))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " {name} (j/k vertical, h/l horizontal, esc to close) "
+            ))),
         popup,
     );
 }
@@ -266,10 +334,17 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(" filter: /{} ", app.log_search)
     };
+    let visible_height = usize::from(popup.height.saturating_sub(2));
+    let scroll = lines
+        .len()
+        .saturating_sub(visible_height)
+        .min(usize::from(u16::MAX)) as u16;
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
-            " {name} — logs (/: search, c: clear view, esc: close){search}"
-        ))),
+        Paragraph::new(lines).scroll((scroll, 0)).block(
+            Block::default().borders(Borders::ALL).title(format!(
+                " {name} — logs (/: search, c: clear view, esc: close){search}"
+            )),
+        ),
         popup,
     );
 }
@@ -277,7 +352,7 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
 fn draw_doctor(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(80, 80, area);
     f.render_widget(Clear, popup);
-    let lines: Vec<Line> = app
+    let mut lines: Vec<Line> = app
         .doctor_results
         .iter()
         .map(|r| {
@@ -299,12 +374,39 @@ fn draw_doctor(f: &mut Frame, app: &App, area: Rect) {
             ))
         })
         .collect();
+    if app.doctor_in_flight {
+        lines.insert(0, Line::from("… diagnostics running in background"));
+    }
+    let visible_height = usize::from(popup.height.saturating_sub(2));
+    let max_scroll = lines
+        .len()
+        .saturating_sub(visible_height)
+        .min(usize::from(u16::MAX)) as u16;
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" doctor (esc to close) "),
-        ),
+        Paragraph::new(lines)
+            .scroll((app.doctor_scroll.min(max_scroll), 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" doctor (j/k or PgUp/PgDn, esc to close) "),
+            ),
+        popup,
+    );
+}
+
+fn draw_quit_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(62, 36, area);
+    f.render_widget(Clear, popup);
+    let template = app.template.as_deref().unwrap_or("(none)");
+    let text = vec![
+        Line::from("Choose explicitly what should happen to detached services:"),
+        Line::from(""),
+        Line::from("[l] leave services running and quit"),
+        Line::from(format!("[s] stop template '{template}' and quit")),
+        Line::from("[esc] cancel"),
+    ];
+    f.render_widget(
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" quit hum ")),
         popup,
     );
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::cursor::Show;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -24,14 +25,17 @@ const EVENT_TICK: Duration = Duration::from_millis(250);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_LOG_LINES: usize = 500;
 const MAX_LOG_VIEW_BYTES: usize = 4 * 1024 * 1024;
+const DETAIL_LINE_COUNT: u16 = 16;
+const DETAIL_HORIZONTAL_LIMIT: u16 = 512;
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Mode {
     Normal,
     TemplateSelect,
     Logs,
     Details,
     Doctor,
+    QuitConfirm,
     Help,
 }
 
@@ -45,9 +49,12 @@ pub struct App {
     log_bytes: usize,
     pub log_search: String,
     pub log_searching: bool,
+    pub details_scroll: u16,
+    pub details_horizontal: u16,
     mode: Mode,
     template_cursor: usize,
     doctor_results: Vec<doctor::DoctorCheck>,
+    pub doctor_scroll: u16,
     status_line: String,
     should_quit: bool,
     health_due: HashMap<String, Instant>,
@@ -62,6 +69,7 @@ pub struct App {
     runtime_due: Instant,
     health_in_flight: HashSet<String>,
     action_in_flight: bool,
+    doctor_in_flight: bool,
 }
 
 impl App {
@@ -82,9 +90,12 @@ impl App {
             log_bytes: 0,
             log_search: String::new(),
             log_searching: false,
+            details_scroll: 0,
+            details_horizontal: 0,
             mode: Mode::Normal,
             template_cursor: 0,
             doctor_results: Vec::new(),
+            doctor_scroll: 0,
             status_line: String::new(),
             should_quit: false,
             health_due: HashMap::new(),
@@ -99,6 +110,7 @@ impl App {
             runtime_due: Instant::now(),
             health_in_flight: HashSet::new(),
             action_in_flight: false,
+            doctor_in_flight: false,
         }
     }
 
@@ -136,6 +148,14 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(task) = self.poll_task.take() {
+            task.abort();
+        }
+    }
+}
+
 struct HealthUpdate {
     name: String,
     pid: Option<u32>,
@@ -154,23 +174,72 @@ enum MonitorMessage {
 
 struct ActionMessage {
     result: Result<String, String>,
+    quit_after_success: bool,
+}
+
+struct DoctorMessage {
+    result: Result<Vec<doctor::DoctorCheck>, String>,
 }
 
 /// Launch the interactive monitor. Quitting the TUI never stops services.
 pub async fn run(runtime: Arc<DetachedRuntime>, template: Option<String>) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    let mut session = TerminalSession::enter()?;
+    let stdout = std::io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = event_loop(&mut terminal, runtime, template).await;
+    drop(terminal);
+    let restored = session.restore();
+    match (result, restored) {
+        (Err(error), _) => Err(error),
+        (Ok(()), result) => result,
+    }
+}
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+struct TerminalSession {
+    raw: bool,
+    alternate: bool,
+}
 
-    result
+impl TerminalSession {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut session = Self {
+            raw: true,
+            alternate: false,
+        };
+        let mut stdout = std::io::stdout();
+        session.alternate = true;
+        execute!(stdout, EnterAlternateScreen)?;
+        Ok(session)
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let mut failure = None;
+        if self.raw {
+            match disable_raw_mode() {
+                Ok(()) => self.raw = false,
+                Err(error) => failure = Some(anyhow::Error::from(error)),
+            }
+        }
+        if self.alternate {
+            let mut stdout = std::io::stdout();
+            match execute!(stdout, LeaveAlternateScreen, Show) {
+                Ok(()) => self.alternate = false,
+                Err(error) => {
+                    failure.get_or_insert_with(|| anyhow::Error::from(error));
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 async fn event_loop(
@@ -183,6 +252,7 @@ async fn event_loop(
     let mut ticker = tokio::time::interval(EVENT_TICK);
     let (monitor_tx, mut monitor_rx) = mpsc::unbounded_channel();
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let (doctor_tx, mut doctor_rx) = mpsc::unbounded_channel();
     schedule_poll(&mut app, &monitor_tx);
 
     loop {
@@ -203,11 +273,15 @@ async fn event_loop(
                 MonitorMessage::Health(message) => apply_health(&mut app, message),
             },
             Some(message) = action_rx.recv() => apply_action(&mut app, message, &monitor_tx),
+            Some(message) = doctor_rx.recv() => apply_doctor(&mut app, message),
             maybe_event = events.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe_event {
-                    if key.kind == KeyEventKind::Press {
-                        handle_key(&mut app, key.code, &action_tx);
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        handle_key(&mut app, key.code, &action_tx, &doctor_tx);
                     }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error.into()),
+                    None => anyhow::bail!("terminal event stream closed"),
                 }
             }
         }
@@ -375,15 +449,41 @@ fn apply_action(
     monitor_tx: &mpsc::UnboundedSender<MonitorMessage>,
 ) {
     app.action_in_flight = false;
+    let succeeded = message.result.is_ok();
     app.status_line = match message.result {
         Ok(detail) => detail,
         Err(error) => format!("action failed: {error}"),
     };
+    if succeeded && message.quit_after_success {
+        app.should_quit = true;
+        return;
+    }
     app.invalidate_poll();
     schedule_poll(app, monitor_tx);
 }
 
-fn handle_key(app: &mut App, code: KeyCode, action_tx: &mpsc::UnboundedSender<ActionMessage>) {
+fn apply_doctor(app: &mut App, message: DoctorMessage) {
+    app.doctor_in_flight = false;
+    match message.result {
+        Ok(results) => {
+            let failures = results.iter().filter(|result| !result.ok).count();
+            app.doctor_results = results;
+            app.status_line = if failures == 0 {
+                "doctor completed: all checks passed".to_string()
+            } else {
+                format!("doctor completed: {failures} check(s) failed")
+            };
+        }
+        Err(error) => app.status_line = format!("doctor failed: {error}"),
+    }
+}
+
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    action_tx: &mpsc::UnboundedSender<ActionMessage>,
+    doctor_tx: &mpsc::UnboundedSender<DoctorMessage>,
+) {
     match app.mode {
         Mode::TemplateSelect => {
             let mut templates: Vec<String> =
@@ -413,6 +513,8 @@ fn handle_key(app: &mut App, code: KeyCode, action_tx: &mpsc::UnboundedSender<Ac
                         app.selected = 0;
                         app.status_line = format!("monitoring template '{template}'");
                         app.invalidate_poll();
+                    } else {
+                        app.status_line = "no templates are configured".to_string();
                     }
                     app.mode = Mode::Normal;
                 }
@@ -446,18 +548,109 @@ fn handle_key(app: &mut App, code: KeyCode, action_tx: &mpsc::UnboundedSender<Ac
                 _ => {}
             }
         }
-        Mode::Details | Mode::Doctor | Mode::Help => {
+        Mode::Details => match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.details_scroll = app.details_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.details_scroll = app
+                    .details_scroll
+                    .saturating_add(1)
+                    .min(DETAIL_LINE_COUNT.saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                app.details_scroll = app.details_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown => {
+                app.details_scroll = app
+                    .details_scroll
+                    .saturating_add(8)
+                    .min(DETAIL_LINE_COUNT.saturating_sub(1));
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                app.details_horizontal = app.details_horizontal.saturating_sub(4);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                app.details_horizontal = app
+                    .details_horizontal
+                    .saturating_add(4)
+                    .min(DETAIL_HORIZONTAL_LIMIT);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+            _ => {}
+        },
+        Mode::Doctor => match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.doctor_scroll = app.doctor_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.doctor_scroll = app
+                    .doctor_scroll
+                    .saturating_add(1)
+                    .min(app.doctor_results.len().saturating_sub(1) as u16);
+            }
+            KeyCode::PageUp => {
+                app.doctor_scroll = app.doctor_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown => {
+                app.doctor_scroll = app
+                    .doctor_scroll
+                    .saturating_add(8)
+                    .min(app.doctor_results.len().saturating_sub(1) as u16);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+            _ => {}
+        },
+        Mode::Help => {
             if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                 app.mode = Mode::Normal;
             }
         }
+        Mode::QuitConfirm => match code {
+            _ if app.action_in_flight => {
+                app.status_line = "wait for the stop action to finish".to_string();
+            }
+            KeyCode::Char('l') => app.should_quit = true,
+            KeyCode::Char('s') => {
+                if app.action_in_flight {
+                    app.status_line = "another action is still running".to_string();
+                    return;
+                }
+                let Some(template) = app.template.clone() else {
+                    app.status_line = "no template selected; nothing was stopped".to_string();
+                    app.mode = Mode::Normal;
+                    return;
+                };
+                let runtime = app.runtime.clone();
+                start_action_with_quit(
+                    app,
+                    action_tx,
+                    format!("stopping template '{template}' before quit..."),
+                    async move {
+                        let report = runtime
+                            .stop_template(&template, Duration::from_secs(10))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if report.succeeded() {
+                            Ok(format!("template '{template}' stopped"))
+                        } else {
+                            Err(report.failures[0].detail.clone())
+                        }
+                    },
+                );
+            }
+            KeyCode::Esc => app.mode = Mode::Normal,
+            _ => {}
+        },
         Mode::Normal => match code {
             KeyCode::Char('q') => {
                 if app.action_in_flight {
                     app.status_line =
                         "wait for the explicit start/stop/restart action to finish".to_string();
+                } else if app.doctor_in_flight {
+                    app.status_line = "wait for doctor to finish before quitting".to_string();
                 } else {
-                    app.should_quit = true;
+                    app.mode = Mode::QuitConfirm;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => app.prev(),
@@ -488,10 +681,12 @@ fn handle_key(app: &mut App, code: KeyCode, action_tx: &mpsc::UnboundedSender<Ac
                                     )
                                     .await
                                     .map_err(|error| error.to_string())?;
-                                if report.succeeded() {
+                                if !report.succeeded() {
+                                    Err(report.failures[0].detail.clone())
+                                } else if report.stopped.contains(&action_name) {
                                     Ok(format!("service '{action_name}' stopped"))
                                 } else {
-                                    Err(report.failures[0].detail.clone())
+                                    Ok(format!("service '{action_name}' was already stopped"))
                                 }
                             },
                         );
@@ -502,14 +697,20 @@ fn handle_key(app: &mut App, code: KeyCode, action_tx: &mpsc::UnboundedSender<Ac
                             action_tx,
                             format!("starting '{name}'..."),
                             async move {
-                                runtime
+                                let report = runtime
                                     .start_services(std::slice::from_ref(&action_name))
                                     .await
-                                    .map(|_| format!("service '{action_name}' started"))
-                                    .map_err(|error| error.to_string())
+                                    .map_err(|error| error.to_string())?;
+                                if report.started.contains(&action_name) {
+                                    Ok(format!("service '{action_name}' started"))
+                                } else {
+                                    Ok(format!("service '{action_name}' was already running"))
+                                }
                             },
                         );
                     }
+                } else {
+                    app.status_line = "this template contains no services".to_string();
                 }
             }
             KeyCode::Char('r') => {
@@ -539,21 +740,58 @@ fn handle_key(app: &mut App, code: KeyCode, action_tx: &mpsc::UnboundedSender<Ac
                             }
                         },
                     );
+                } else {
+                    app.status_line = "this template contains no services".to_string();
                 }
             }
-            KeyCode::Enter => app.mode = Mode::Details,
-            KeyCode::Char('l') => open_logs(app),
+            KeyCode::Enter => {
+                if app
+                    .selected_name()
+                    .is_some_and(|name| app.statuses.contains_key(&name))
+                {
+                    app.details_scroll = 0;
+                    app.details_horizontal = 0;
+                    app.mode = Mode::Details;
+                } else if app.selected_name().is_some() {
+                    app.status_line = "service status is still loading".to_string();
+                } else {
+                    app.status_line = "this template contains no services".to_string();
+                }
+            }
+            KeyCode::Char('l') => {
+                if app.selected_name().is_some() {
+                    open_logs(app);
+                } else {
+                    app.status_line = "this template contains no services".to_string();
+                }
+            }
             KeyCode::Char('p') => {
                 app.mode = Mode::TemplateSelect;
                 app.template_cursor = 0;
             }
             KeyCode::Char('d') => {
-                app.doctor_results = doctor::run_with_env(
-                    app.runtime.config(),
-                    app.runtime.root_dir(),
-                    app.runtime.env_overrides(),
-                );
+                if app.action_in_flight {
+                    app.status_line =
+                        "wait for the current action before running doctor".to_string();
+                    return;
+                }
+                if app.doctor_in_flight {
+                    app.status_line = "doctor is already running".to_string();
+                    return;
+                }
                 app.mode = Mode::Doctor;
+                app.doctor_scroll = 0;
+                app.doctor_in_flight = true;
+                app.status_line = "doctor running...".to_string();
+                let runtime = app.runtime.clone();
+                let tx = doctor_tx.clone();
+                tokio::spawn(async move {
+                    let result =
+                        tokio::task::spawn_blocking(move || doctor::run_with_runtime(&runtime))
+                            .await
+                            .map_err(|error| error.to_string());
+                    let _ = tx.send(DoctorMessage { result });
+                });
             }
             KeyCode::Char('o') => {
                 if let Some(name) = app.selected_name() {
@@ -564,8 +802,18 @@ fn handle_key(app: &mut App, code: KeyCode, action_tx: &mpsc::UnboundedSender<Ac
                         .get(&name)
                         .and_then(|service| service.url.clone())
                     {
-                        let _ = open::that(url);
+                        start_action(app, action_tx, format!("opening {url}..."), async move {
+                            tokio::task::spawn_blocking(move || open::that(url))
+                                .await
+                                .map_err(|error| error.to_string())?
+                                .map(|_| "URL opened".to_string())
+                                .map_err(|error| error.to_string())
+                        });
+                    } else {
+                        app.status_line = format!("service '{name}' has no URL configured");
                     }
+                } else {
+                    app.status_line = "this template contains no services".to_string();
                 }
             }
             KeyCode::Char('?') => app.mode = Mode::Help,
@@ -582,8 +830,35 @@ fn start_action<F>(
 ) where
     F: std::future::Future<Output = Result<String, String>> + Send + 'static,
 {
+    start_action_inner(app, tx, pending, false, action);
+}
+
+fn start_action_with_quit<F>(
+    app: &mut App,
+    tx: &mpsc::UnboundedSender<ActionMessage>,
+    pending: String,
+    action: F,
+) where
+    F: std::future::Future<Output = Result<String, String>> + Send + 'static,
+{
+    start_action_inner(app, tx, pending, true, action);
+}
+
+fn start_action_inner<F>(
+    app: &mut App,
+    tx: &mpsc::UnboundedSender<ActionMessage>,
+    pending: String,
+    quit_after_success: bool,
+    action: F,
+) where
+    F: std::future::Future<Output = Result<String, String>> + Send + 'static,
+{
     if app.action_in_flight {
         app.status_line = "another action is still running".to_string();
+        return;
+    }
+    if app.doctor_in_flight {
+        app.status_line = "wait for doctor to finish before starting an action".to_string();
         return;
     }
     app.action_in_flight = true;
@@ -593,6 +868,7 @@ fn start_action<F>(
     tokio::spawn(async move {
         let _ = tx.send(ActionMessage {
             result: action.await,
+            quit_after_success,
         });
     });
 }
@@ -704,4 +980,91 @@ fn append_log_lines(app: &mut App, stream: &str, lines: Vec<String>) {
 fn clear_log_view(app: &mut App) {
     app.log_lines.clear();
     app.log_bytes = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::config::{Config, Loaded, TemplateConfig};
+
+    use super::*;
+
+    fn empty_app() -> App {
+        let root = std::env::temp_dir().join(format!("hum-tui-test-{}", std::process::id()));
+        let loaded = Loaded {
+            config: Config {
+                version: 2,
+                project: Some("demo".to_string()),
+                templates: HashMap::from([(
+                    "empty".to_string(),
+                    TemplateConfig { services: vec![] },
+                )]),
+                ..Config::default()
+            },
+            base_path: root.join("hum.yaml"),
+            local_path: None,
+            root_dir: root.clone(),
+        };
+        let runtime = DetachedRuntime::with_state_root(
+            "demo".to_string(),
+            loaded,
+            HashMap::new(),
+            PathBuf::from(&root).join("state"),
+        )
+        .unwrap();
+        App::new(Arc::new(runtime), Some("empty".to_string()))
+    }
+
+    #[test]
+    fn quit_requires_an_explicit_leave_choice() {
+        let mut app = empty_app();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel();
+        let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
+
+        handle_key(&mut app, KeyCode::Char('q'), &action_tx, &doctor_tx);
+        assert_eq!(app.mode, Mode::QuitConfirm);
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, KeyCode::Esc, &action_tx, &doctor_tx);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, KeyCode::Char('q'), &action_tx, &doctor_tx);
+        handle_key(&mut app, KeyCode::Char('l'), &action_tx, &doctor_tx);
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn stop_and_quit_waits_for_a_successful_stop_action() {
+        let mut app = empty_app();
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
+        let (monitor_tx, _monitor_rx) = mpsc::unbounded_channel();
+
+        handle_key(&mut app, KeyCode::Char('q'), &action_tx, &doctor_tx);
+        handle_key(&mut app, KeyCode::Char('s'), &action_tx, &doctor_tx);
+        assert!(!app.should_quit);
+        assert!(app.action_in_flight);
+        handle_key(&mut app, KeyCode::Char('l'), &action_tx, &doctor_tx);
+        assert!(!app.should_quit);
+
+        let message = action_rx.recv().await.unwrap();
+        apply_action(&mut app, message, &monitor_tx);
+
+        assert!(app.should_quit);
+        assert!(!app.action_in_flight);
+    }
+
+    #[test]
+    fn empty_templates_report_actions_instead_of_opening_blank_views() {
+        let mut app = empty_app();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel();
+        let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
+
+        handle_key(&mut app, KeyCode::Enter, &action_tx, &doctor_tx);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.status_line.contains("no services"));
+    }
 }

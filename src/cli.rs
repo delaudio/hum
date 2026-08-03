@@ -150,7 +150,22 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Doctor => {
-            let results = doctor::run_with_env(&loaded.config, &loaded.root_dir, &env_overrides);
+            let runtime = match DetachedRuntime::new(project, loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ failed to initialize runtime diagnostics: {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
+            };
+            let results =
+                match tokio::task::spawn_blocking(move || doctor::run_with_runtime(&runtime)).await
+                {
+                    Ok(results) => results,
+                    Err(error) => {
+                        eprintln!("✗ doctor task failed: {error}");
+                        return EXIT_GENERIC;
+                    }
+                };
             print_doctor(&results);
             if doctor::all_passed(&results) {
                 EXIT_OK

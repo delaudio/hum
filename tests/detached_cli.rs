@@ -160,7 +160,13 @@ templates:
 
     let final_status = hum_command(&config, &state, &["status"]).output().unwrap();
     assert_success(&final_status);
-    assert!(String::from_utf8_lossy(&final_status.stdout).contains("missing"));
+    assert!(String::from_utf8_lossy(&final_status.stdout).contains("exited"));
+    assert_eq!(
+        fs::read_to_string(state.join("hum/e2e/runtime/worker.exit"))
+            .unwrap()
+            .trim(),
+        "143"
+    );
 
     let started_for_failure = hum_command(&config, &state, &["start"]).output().unwrap();
     assert_success(&started_for_failure);
@@ -264,6 +270,57 @@ templates:
         .unwrap();
     assert_success(&after_crash);
     assert!(String::from_utf8_lossy(&after_crash.stdout).contains("[REDACTED]"));
+}
+
+#[test]
+fn detached_command_records_a_natural_exit_code() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("hum-cli-exit-code-{}-{unique}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        process_groups: Vec::new(),
+    };
+    let config = root.join("hum.yaml");
+    let state = root.join("state");
+    fs::write(
+        &config,
+        r#"version: 2
+project: e2e
+services:
+  worker:
+    command: "sleep 0.2; exit 7"
+templates:
+  all:
+    services: [worker]
+"#,
+    )
+    .unwrap();
+
+    let started = hum_command(&config, &state, &["start"]).output().unwrap();
+    assert_success(&started);
+    let mut status_text = String::new();
+    for _ in 0..40 {
+        let status = hum_command(&config, &state, &["status"]).output().unwrap();
+        assert_success(&status);
+        status_text = String::from_utf8_lossy(&status.stdout).to_string();
+        if status_text.contains("exited") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(status_text.contains("exited"), "status was: {status_text}");
+    assert_eq!(
+        fs::read_to_string(state.join("hum/e2e/runtime/worker.exit"))
+            .unwrap()
+            .trim(),
+        "7"
+    );
 }
 
 fn hum_command(config: &Path, state: &Path, action: &[&str]) -> Command {

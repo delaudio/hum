@@ -62,6 +62,12 @@ pub struct DetachedServiceStatus {
     pub health: HealthState,
     pub configured_port: Option<u16>,
     pub pid: Option<u32>,
+    pub pgid: Option<i32>,
+    pub exit_code: Option<i32>,
+    pub cwd: Option<PathBuf>,
+    pub command: Option<String>,
+    pub stdout_log: Option<PathBuf>,
+    pub stderr_log: Option<PathBuf>,
     pub detail: Option<String>,
     pub health_detail: Option<String>,
     pub health_duration_ms: Option<u64>,
@@ -307,15 +313,24 @@ impl DetachedRuntime {
                 .load(name)
                 .with_context(|| format!("service '{name}' runtime entry could not be read"))?
             {
-                None => StatusSnapshot {
-                    entry: None,
-                    process: ProcessState::Missing,
-                    detail: None,
-                },
+                None => {
+                    let exit_code = self.registry.read_exit_code(name)?;
+                    StatusSnapshot {
+                        entry: None,
+                        process: if exit_code.is_some() {
+                            ProcessState::Exited
+                        } else {
+                            ProcessState::Missing
+                        },
+                        exit_code,
+                        detail: None,
+                    }
+                }
                 Some(entry) => match inspect_identity(&entry) {
                     IdentityStatus::Matching => StatusSnapshot {
                         entry: Some(entry),
                         process: ProcessState::Running,
+                        exit_code: None,
                         detail: None,
                     },
                     IdentityStatus::Missing => {
@@ -325,15 +340,22 @@ impl DetachedRuntime {
                         self.registry.remove(name).with_context(|| {
                             format!("service '{name}' stale runtime entry could not be removed")
                         })?;
+                        let exit_code = self.registry.read_exit_code(name)?;
                         StatusSnapshot {
                             entry: None,
-                            process: ProcessState::Missing,
+                            process: if exit_code.is_some() {
+                                ProcessState::Exited
+                            } else {
+                                ProcessState::Missing
+                            },
+                            exit_code,
                             detail: Some("stale runtime entry removed".to_string()),
                         }
                     }
                     IdentityStatus::Mismatch(reason) => StatusSnapshot {
                         entry: None,
                         process: ProcessState::Missing,
+                        exit_code: None,
                         detail: Some(format!(
                             "runtime identity mismatch: {reason}; verify the process before removing its registry entry"
                         )),
@@ -361,6 +383,8 @@ impl DetachedRuntime {
                 Some(_) => HealthState::Unhealthy,
                 None => HealthState::Unchecked,
             };
+            let configured_cwd = self.service_cwd(&name).ok();
+            let (stdout_log, stderr_log) = self.registry.log_paths(&name);
             statuses.push(DetachedServiceStatus {
                 name,
                 process: snapshot.process,
@@ -368,6 +392,18 @@ impl DetachedRuntime {
                 health,
                 configured_port: service.port,
                 pid: snapshot.entry.as_ref().map(|entry| entry.pid),
+                pgid: snapshot.entry.as_ref().map(|entry| entry.pgid),
+                // Detached children are re-parented to init, so hum cannot
+                // portably recover their exit status after the fact.
+                exit_code: snapshot.exit_code,
+                cwd: snapshot
+                    .entry
+                    .as_ref()
+                    .map(|entry| entry.cwd.clone())
+                    .or(configured_cwd),
+                command: service.command.clone(),
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
                 detail: snapshot.detail,
                 health_detail: None,
                 health_duration_ms: None,
@@ -589,6 +625,7 @@ impl DetachedRuntime {
         let env =
             crate::config::environment::resolve_service_env(service, &cwd, &self.env_overrides)?;
         let (stdout_log, stderr_log) = self.registry.log_paths(name);
+        let exit_code_file = self.registry.prepare_exit_code(name)?;
         let runtime_token = new_runtime_token()?;
         let identity = self.registry.create_identity(name, &runtime_token)?;
         let process = process::spawn_detached(
@@ -596,9 +633,12 @@ impl DetachedRuntime {
             &cwd,
             &env,
             identity.file(),
-            &stdout_log,
-            &stderr_log,
-            super::logs::LogPolicy::from(&self.config.logs),
+            process::DetachedOutput {
+                exit_code_path: &exit_code_file,
+                stdout_path: &stdout_log,
+                stderr_path: &stderr_log,
+                log_policy: super::logs::LogPolicy::from(&self.config.logs),
+            },
         )?;
         let start_time = match process_start_time(process.pid) {
             Ok(start_time) => start_time,
@@ -775,6 +815,7 @@ enum StartOne {
 struct StatusSnapshot {
     entry: Option<RuntimeEntry>,
     process: ProcessState,
+    exit_code: Option<i32>,
     detail: Option<String>,
 }
 
@@ -887,6 +928,12 @@ mod tests {
             health: HealthState::Unchecked,
             configured_port: Some(8080),
             pid: Some(123),
+            pgid: Some(123),
+            exit_code: None,
+            cwd: None,
+            command: None,
+            stdout_log: None,
+            stderr_log: None,
             detail: None,
             health_detail: None,
             health_duration_ms: None,
