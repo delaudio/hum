@@ -381,14 +381,55 @@ pub fn inspect_identity(entry: &RuntimeEntry) -> IdentityStatus {
         }
     }
 
-    if leader_alive {
-        IdentityStatus::Mismatch(format!(
-            "process group {} no longer holds its runtime identity lock",
-            entry.pgid
-        ))
-    } else {
-        IdentityStatus::Missing
+    if !leader_alive {
+        return IdentityStatus::Missing;
     }
+
+    // The leader may exit after the first process snapshot but before the
+    // identity lock is checked. Refresh once on this exceptional path so a
+    // normal exit is not reported as an identity mismatch. A matching live
+    // process without the lock remains a hard mismatch.
+    let mut refreshed = System::new();
+    refreshed.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new(),
+    );
+    let Some(leader) = refreshed.process(pid) else {
+        return IdentityStatus::Missing;
+    };
+    if matches!(
+        leader.status(),
+        sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+    ) {
+        return IdentityStatus::Missing;
+    }
+
+    #[cfg(unix)]
+    match classify_unix_leader(
+        entry,
+        leader.start_time(),
+        unsafe { libc::getpgid(entry.pid as i32) },
+        std::io::Error::last_os_error().raw_os_error(),
+    ) {
+        LeaderCheck::Gone => return IdentityStatus::Missing,
+        LeaderCheck::Mismatch(reason) => return IdentityStatus::Mismatch(reason),
+        LeaderCheck::Matching => {}
+    }
+    #[cfg(not(unix))]
+    if leader.start_time() != entry.process_start_time {
+        return IdentityStatus::Mismatch(format!(
+            "PID {} identity differs (start time {} vs {})",
+            entry.pid,
+            leader.start_time(),
+            entry.process_start_time
+        ));
+    }
+
+    IdentityStatus::Mismatch(format!(
+        "process group {} no longer holds its runtime identity lock",
+        entry.pgid
+    ))
 }
 
 #[cfg(unix)]
