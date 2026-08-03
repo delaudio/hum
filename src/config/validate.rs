@@ -31,6 +31,16 @@ pub fn validate(config: &Config, file: &Path) -> Result<(), ConfigError> {
             "add `project: <name>` matching the global registry entry",
         ));
     }
+    if let Some(project) = config.project.as_deref() {
+        if !is_safe_identifier(project) {
+            return Err(ConfigError::validation(
+                file,
+                "project",
+                "project identifier contains unsafe path characters",
+                "use letters, numbers, dots, underscores, or hyphens and start with a letter or number",
+            ));
+        }
+    }
 
     validate_names(config, file)?;
 
@@ -188,6 +198,14 @@ fn validate_names(config: &Config, file: &Path) -> Result<(), ConfigError> {
                     "use a stable non-empty identifier",
                 ));
             }
+            if !is_safe_identifier(name) {
+                return Err(ConfigError::validation(
+                    file,
+                    namespace,
+                    format!("name '{name}' contains unsafe path characters"),
+                    "use letters, numbers, dots, underscores, or hyphens and start with a letter or number",
+                ));
+            }
             let folded = name.to_lowercase();
             if let Some(other) = normalized.insert(folded, name) {
                 return Err(ConfigError::validation(
@@ -200,6 +218,16 @@ fn validate_names(config: &Config, file: &Path) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+pub fn is_safe_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
 }
 
 fn validate_url(file: &Path, field: String, url: &str) -> Result<(), ConfigError> {

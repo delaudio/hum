@@ -3,12 +3,6 @@
 `hum` is a lightweight launcher and terminal monitor for local multi-service
 development environments.
 
-Current v1 CLI:
-
-```bash
-hum up full
-```
-
 Current project/template CLI:
 
 ```bash
@@ -20,9 +14,9 @@ their logs and runtime metadata to disk, and exits. There is no resident `hum`
 daemon. Later CLI invocations and the TUI reconcile that metadata with the
 operating system.
 
-> Project/template selection and v2 configuration are implemented. The runtime
-> is still migrating from session-owned processes to the persistent v2 model.
-> Track progress in
+> Project/template selection, v2 configuration, and detached `start` are
+> implemented. Cross-invocation `status`, `stop`, `restart`, `logs`, and TUI
+> reconciliation are the next migration step. Track progress in
 > [epic #16](https://github.com/delaudio/hum/issues/16).
 
 ## Concepts
@@ -81,22 +75,24 @@ Service environment precedence is `.env` file, `service.env`, inherited process
 environment, then repeatable `--env KEY=VALUE` CLI overrides. Unknown YAML fields
 and invalid names, ports, URLs, durations, commands, or references are rejected.
 
-## Current runtime and logs (v1)
+## Current persistent runtime
 
-The v1 process and log state lives only in the running `hum` session. Closing
-that session removes the in-memory state, and a later `hum logs` invocation
-cannot attach to it. This limitation is the reason for the v2 migration.
-
-## Target runtime and logs (v2, not implemented yet)
-
-State is stored below `$XDG_STATE_HOME/hum/<project>` or
+`start` creates a dedicated session/process group for each service, redirects
+stdin to null and stdout/stderr to files, writes its registry entry atomically,
+then exits. State is stored below `$XDG_STATE_HOME/hum/<project>` or
 `~/.local/state/hum/<project>`. The registry records PID, process group, process
 start time, command identity, working directory, port, and log paths. PID
-identity is verified before signals are sent.
+identity is verified before signals are sent. A random, inherited identity lock
+keeps the whole process group recognizable even if its original shell exits.
 
-The TUI polls known PIDs directly, probes configured ports and health endpoints,
-and tails log files incrementally. `lsof` is reserved for diagnosing unknown
-port occupants; it is not used for ordinary polling.
+Project operations are serialized with `project.lock`; a repeated or concurrent
+`start` is idempotent. If a multi-service start partially fails, only processes
+created by that invocation are rolled back. `--detach` remains accepted as a
+deprecated no-op because detached execution is now the default.
+
+The TUI and cross-invocation commands still need to consume this registry. Port
+polling already uses bounded TCP connections; `lsof` is reserved for ownership
+checks and conflict diagnostics.
 
 ## Development
 

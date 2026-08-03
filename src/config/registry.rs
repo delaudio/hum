@@ -48,6 +48,9 @@ pub enum RegistryError {
     #[error("project name '{0}' is reserved by the hum CLI")]
     ReservedProject(String),
 
+    #[error("project name '{0}' contains unsafe path characters")]
+    InvalidProject(String),
+
     #[error("project configuration identifies itself as '{actual}', not '{requested}'")]
     ProjectMismatch { requested: String, actual: String },
 
@@ -64,6 +67,9 @@ pub fn resolve_project(
 ) -> Result<Loaded, RegistryError> {
     if is_reserved_project_name(project) {
         return Err(RegistryError::ReservedProject(project.to_string()));
+    }
+    if !super::validate::is_safe_identifier(project) {
+        return Err(RegistryError::InvalidProject(project.to_string()));
     }
     let loaded = if let Some(config) = explicit_config {
         super::loader::load(Some(config))?
@@ -155,6 +161,13 @@ fn read_registry(path: &Path) -> Result<Registry, RegistryError> {
         .find(|name| is_reserved_project_name(name))
     {
         return Err(RegistryError::ReservedProject(name.clone()));
+    }
+    if let Some(name) = registry
+        .projects
+        .keys()
+        .find(|name| !super::validate::is_safe_identifier(name))
+    {
+        return Err(RegistryError::InvalidProject(name.clone()));
     }
     Ok(registry)
 }

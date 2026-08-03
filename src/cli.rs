@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
 use crate::config::{self, RegistryError};
 use crate::core::Manager;
+use crate::runtime::detached::DetachedRuntime;
 use crate::{doctor, tui};
 
 pub const EXIT_OK: i32 = 0;
@@ -162,46 +162,43 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Start { services, detach } => {
-            let manager = Arc::new(Manager::with_env(loaded, env_overrides));
             for service in &services {
-                if !manager.config.services.contains_key(service) {
+                if !loaded.config.services.contains_key(service) {
                     eprintln!("✗ unknown service '{service}'");
                     return EXIT_SERVICE_NOT_FOUND;
                 }
             }
-
-            let result = if services.is_empty() {
-                manager.start_template(&template).await
-            } else {
-                manager.start_services(&services).await
+            let runtime = match DetachedRuntime::new(project, loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ failed to initialize runtime: {error}");
+                    return EXIT_START_FAILED;
+                }
             };
-
-            let start_ok = match &result {
-                Ok(started) => {
-                    println!("✓ started: {}", started.join(", "));
-                    true
+            let result = if services.is_empty() {
+                runtime.start_template(&template).await
+            } else {
+                runtime.start_services(&services).await
+            };
+            match result {
+                Ok(report) => {
+                    if !report.started.is_empty() {
+                        println!("✓ started: {}", report.started.join(", "));
+                    }
+                    if !report.already_running.is_empty() {
+                        println!("✓ already running: {}", report.already_running.join(", "));
+                    }
+                    println!("  runtime: {}", runtime.registry().root().display());
+                    if detach {
+                        eprintln!("⚠ --detach is no longer needed; start is always detached");
+                    }
+                    EXIT_OK
                 }
                 Err(error) => {
                     eprintln!("✗ {error}");
-                    false
+                    EXIT_START_FAILED
                 }
-            };
-            print_status(&manager);
-
-            if detach {
-                eprintln!(
-                    "⚠ transitional --detach mode is unsupervised until runtime registry support lands"
-                );
-                return if start_ok { EXIT_OK } else { EXIT_START_FAILED };
             }
-            if !start_ok {
-                let _ = manager.stop_all().await;
-                return EXIT_START_FAILED;
-            }
-
-            println!("\nhum is supervising these services in the foreground. Press Ctrl+C to stop them and exit.");
-            wait_for_ctrl_c_and_shutdown(&manager).await;
-            EXIT_OK
         }
 
         Command::Stop { services } => {
@@ -301,7 +298,8 @@ fn resolve_or_exit(
             eprintln!("✗ {error}");
             Err(EXIT_PROJECT_NOT_FOUND)
         }
-        Err(error @ RegistryError::ReservedProject(_)) => {
+        Err(error @ RegistryError::ReservedProject(_))
+        | Err(error @ RegistryError::InvalidProject(_)) => {
             eprintln!("✗ {error}");
             Err(EXIT_INVALID_CONFIG)
         }
@@ -332,19 +330,6 @@ fn selected_services(
         }
     }
     Ok(requested)
-}
-
-async fn wait_for_ctrl_c_and_shutdown(manager: &Arc<Manager>) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            _ = ticker.tick() => manager.reap_exited(),
-        }
-    }
-    println!("\nstopping services...");
-    let _ = manager.stop_all().await;
-    println!("✓ all services stopped");
 }
 
 fn print_status(manager: &Manager) {
