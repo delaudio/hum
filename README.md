@@ -95,7 +95,8 @@ as a deprecated no-op because detached execution is now the default.
 
 The TUI still needs to consume this registry. Port polling already uses bounded
 TCP connections; `lsof` is reserved for ownership checks and conflict
-diagnostics.
+diagnostics. Poll intervals, resource reuse, and the ten-service CPU/RSS budget
+are documented in [`docs/POLLING.md`](docs/POLLING.md).
 
 ## Development
 

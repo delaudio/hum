@@ -107,9 +107,9 @@ async fn event_loop(
     let mut app = App::new(manager.clone(), template);
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+    manager.schedule_poll();
 
     loop {
-        app.manager.reap_exited();
         terminal.draw(|f| ui::draw(f, &app))?;
 
         if app.should_quit {
@@ -117,7 +117,7 @@ async fn event_loop(
         }
 
         tokio::select! {
-            _ = ticker.tick() => { /* just redraw with fresh state */ }
+            _ = ticker.tick() => app.manager.schedule_poll(),
             maybe_event = events.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event {
                     if key.kind == KeyEventKind::Press {

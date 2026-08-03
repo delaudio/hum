@@ -1,0 +1,28 @@
+version: 2
+project: polling-benchmark
+
+services:
+  service-01: { command: "sleep 300", port: 45101, url: "http://127.0.0.1:45101" }
+  service-02: { command: "sleep 300", port: 45102, url: "http://127.0.0.1:45102" }
+  service-03: { command: "sleep 300", port: 45103, url: "http://127.0.0.1:45103" }
+  service-04: { command: "sleep 300", port: 45104, url: "http://127.0.0.1:45104" }
+  service-05: { command: "sleep 300", port: 45105, url: "http://127.0.0.1:45105" }
+  service-06: { command: "sleep 300", port: 45106, url: "http://127.0.0.1:45106" }
+  service-07: { command: "sleep 300", port: 45107, url: "http://127.0.0.1:45107" }
+  service-08: { command: "sleep 300", port: 45108, url: "http://127.0.0.1:45108" }
+  service-09: { command: "sleep 300", port: 45109, url: "http://127.0.0.1:45109" }
+  service-10: { command: "sleep 300", port: 45110, url: "http://127.0.0.1:45110" }
+
+templates:
+  all:
+    services:
+      - service-01
+      - service-02
+      - service-03
+      - service-04
+      - service-05
+      - service-06
+      - service-07
+      - service-08
+      - service-09
+      - service-10

@@ -205,9 +205,12 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
             view.url.clone().unwrap_or_else(|| "—".into())
         )),
         Line::from(format!(
-            "Health        {} ({})",
+            "Health        {} ({}, {})",
             view.health.label(),
-            view.health_detail.clone().unwrap_or_else(|| "—".into())
+            view.health_detail.clone().unwrap_or_else(|| "—".into()),
+            view.health_duration_ms
+                .map(|duration| format!("{duration} ms"))
+                .unwrap_or_else(|| "—".into())
         )),
         Line::from(format!(
             "Exit code     {}",

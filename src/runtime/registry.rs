@@ -278,16 +278,24 @@ impl Drop for ProjectLock {
 }
 
 pub fn inspect_identity(entry: &RuntimeEntry) -> IdentityStatus {
-    use sysinfo::System;
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
-    let system = System::new_all();
-    let mut group_exists = false;
+    let pid = sysinfo::Pid::from_u32(entry.pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new(),
+    );
 
-    if let Some(leader) = system.process(sysinfo::Pid::from_u32(entry.pid)) {
-        if !matches!(
+    let leader_alive = system.process(pid).is_some_and(|leader| {
+        !matches!(
             leader.status(),
             sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-        ) {
+        )
+    });
+    if let Some(leader) = system.process(pid) {
+        if leader_alive {
             #[cfg(unix)]
             let current_pgid = unsafe { libc::getpgid(entry.pid as i32) };
             #[cfg(not(unix))]
@@ -299,23 +307,6 @@ pub fn inspect_identity(entry: &RuntimeEntry) -> IdentityStatus {
                 ));
             }
         }
-    }
-
-    for process in system.processes().values() {
-        if matches!(
-            process.status(),
-            sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-        ) {
-            continue;
-        }
-        #[cfg(unix)]
-        let in_group = unsafe { libc::getpgid(process.pid().as_u32() as i32) } == entry.pgid;
-        #[cfg(not(unix))]
-        let in_group = process.pid().as_u32() == entry.pid;
-        if !in_group {
-            continue;
-        }
-        group_exists = true;
     }
 
     match identity_lock_is_held(&entry.identity_file) {
@@ -331,7 +322,7 @@ pub fn inspect_identity(entry: &RuntimeEntry) -> IdentityStatus {
         }
     }
 
-    if group_exists || system.process(sysinfo::Pid::from_u32(entry.pid)).is_some() {
+    if leader_alive {
         IdentityStatus::Mismatch(format!(
             "process group {} no longer holds its runtime identity lock",
             entry.pgid
@@ -361,11 +352,17 @@ pub fn new_runtime_token() -> Result<String> {
 }
 
 pub fn process_start_time(pid: u32) -> Result<u64> {
-    use sysinfo::System;
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     for _ in 0..20 {
-        let system = System::new_all();
-        if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
+        let process_pid = sysinfo::Pid::from_u32(pid);
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[process_pid]),
+            true,
+            ProcessRefreshKind::new(),
+        );
+        if let Some(process) = system.process(process_pid) {
             return Ok(process.start_time());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

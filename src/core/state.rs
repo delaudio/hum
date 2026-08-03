@@ -120,6 +120,7 @@ pub struct ServiceState {
     pub exit_code: Option<i32>,
     pub changed_at: DateTime<Utc>,
     pub last_health_at: Option<DateTime<Utc>>,
+    pub last_health_duration_ms: Option<u64>,
     pub health_detail: Option<String>,
     pub last_error: Option<String>,
 }
@@ -134,6 +135,7 @@ impl Default for ServiceState {
             exit_code: None,
             changed_at: Utc::now(),
             last_health_at: None,
+            last_health_duration_ms: None,
             health_detail: None,
             last_error: None,
         }
@@ -169,6 +171,7 @@ impl ServiceState {
         self.exit_code = None;
         self.health_detail = None;
         self.last_health_at = None;
+        self.last_health_duration_ms = None;
         self.last_error = None;
         self.changed_at = Utc::now();
         self.generation
@@ -194,6 +197,7 @@ impl ServiceState {
         self.health = HealthState::Unchecked;
         self.health_detail = None;
         self.last_health_at = None;
+        self.last_health_duration_ms = None;
         self.changed_at = Utc::now();
         self.generation
     }
@@ -203,6 +207,7 @@ impl ServiceState {
         self.health = HealthState::Unchecked;
         self.health_detail = None;
         self.last_health_at = None;
+        self.last_health_duration_ms = None;
         self.changed_at = Utc::now();
     }
 
@@ -212,6 +217,7 @@ impl ServiceState {
         self.exit_code = exit_code;
         self.health_detail = None;
         self.last_health_at = None;
+        self.last_health_duration_ms = None;
         self.last_error = Some(error.into());
         self.changed_at = Utc::now();
     }
@@ -241,6 +247,7 @@ impl ServiceState {
         generation: u64,
         health: HealthState,
         detail: impl Into<String>,
+        duration_ms: u64,
     ) -> bool {
         if self.generation != generation || self.process != ProcessState::Running {
             return false;
@@ -248,6 +255,7 @@ impl ServiceState {
         self.health = health;
         self.health_detail = Some(detail.into());
         self.last_health_at = Some(Utc::now());
+        self.last_health_duration_ms = Some(duration_ms);
         true
     }
 }
@@ -261,9 +269,10 @@ mod tests {
         let mut state = ServiceState::default();
         let generation = state.begin_start();
         assert!(state.mark_running(generation, true));
-        assert!(state.apply_health(generation, HealthState::Unhealthy, "timeout"));
+        assert!(state.apply_health(generation, HealthState::Unhealthy, "timeout", 42));
         assert_eq!(state.process, ProcessState::Running);
         assert_eq!(state.health, HealthState::Unhealthy);
+        assert_eq!(state.last_health_duration_ms, Some(42));
         assert_eq!(state.presentation(), PresentationState::Degraded);
     }
 
@@ -273,7 +282,7 @@ mod tests {
         let generation = state.begin_start();
         state.mark_running(generation, true);
         state.mark_exited(Some(1), "process exited");
-        assert!(!state.apply_health(generation, HealthState::Healthy, "ok"));
+        assert!(!state.apply_health(generation, HealthState::Healthy, "ok", 1));
         assert_eq!(state.process, ProcessState::Exited);
         assert_eq!(state.health, HealthState::Unchecked);
         assert_eq!(state.exit_code, Some(1));
@@ -291,7 +300,7 @@ mod tests {
         state.mark_running(second, true);
 
         assert_ne!(first, second);
-        assert!(!state.apply_health(first, HealthState::Healthy, "stale"));
+        assert!(!state.apply_health(first, HealthState::Healthy, "stale", 1));
         assert!(!state.mark_exited_for_generation(first, Some(1), "stale exit"));
         assert_eq!(state.process, ProcessState::Running);
         assert_eq!(state.health, HealthState::Checking);

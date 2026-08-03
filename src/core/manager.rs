@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,8 @@ use super::graph;
 use super::state::{HealthState, PortState, PresentationState, ProcessState, ServiceState};
 
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-const PORT_OWNER_TTL: Duration = Duration::from_secs(5);
+const PID_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const PORT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Everything `hum` tracks about one service while it's part of the running
 /// session.
@@ -26,7 +28,8 @@ pub struct ServiceRuntime {
     pub started_at: Mutex<Option<Instant>>,
     health_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     operation: tokio::sync::Mutex<()>,
-    port_owner_checked_at: Mutex<Option<Instant>>,
+    pid_checked_at: Mutex<Option<Instant>>,
+    port_checked_at: Mutex<Option<Instant>>,
 }
 
 impl ServiceRuntime {
@@ -38,7 +41,8 @@ impl ServiceRuntime {
             started_at: Mutex::new(None),
             health_task: Mutex::new(None),
             operation: tokio::sync::Mutex::new(()),
-            port_owner_checked_at: Mutex::new(None),
+            pid_checked_at: Mutex::new(None),
+            port_checked_at: Mutex::new(None),
         }
     }
 
@@ -62,6 +66,7 @@ pub struct ServiceView {
     pub exit_code: Option<i32>,
     pub changed_at: chrono::DateTime<chrono::Utc>,
     pub health_detail: Option<String>,
+    pub health_duration_ms: Option<u64>,
     pub last_error: Option<String>,
 }
 
@@ -70,6 +75,7 @@ pub struct Manager {
     pub root_dir: PathBuf,
     env_overrides: HashMap<String, String>,
     services: HashMap<String, Arc<ServiceRuntime>>,
+    poll_in_flight: AtomicBool,
 }
 
 impl Manager {
@@ -85,6 +91,7 @@ impl Manager {
             root_dir: loaded.root_dir,
             env_overrides,
             services,
+            poll_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -121,6 +128,7 @@ impl Manager {
             exit_code: state.exit_code,
             changed_at: state.changed_at,
             health_detail: state.health_detail,
+            health_duration_ms: state.last_health_duration_ms,
             last_error: state.last_error,
         })
     }
@@ -275,7 +283,7 @@ impl Manager {
                 return Err(anyhow!("port {port} is already in use by {who}"));
             }
             rt.state.lock().unwrap().port = PortState::Closed;
-            *rt.port_owner_checked_at.lock().unwrap() = None;
+            *rt.port_checked_at.lock().unwrap() = None;
         } else {
             rt.state.lock().unwrap().port = PortState::Unknown;
         }
@@ -391,7 +399,9 @@ impl Manager {
         let handle = tokio::spawn(async move {
             let interval = health::interval(&hc);
             loop {
+                let started = Instant::now();
                 let result = health::check_once(&hc).await;
+                let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 if !process.is_alive() {
                     let code = process.exit_code();
                     task_runtime
@@ -410,12 +420,12 @@ impl Manager {
                     Ok(()) => (HealthState::Healthy, "ok".to_string()),
                     Err(error) => (HealthState::Unhealthy, error),
                 };
-                if !task_runtime
-                    .state
-                    .lock()
-                    .unwrap()
-                    .apply_health(generation, health, detail)
-                {
+                if !task_runtime.state.lock().unwrap().apply_health(
+                    generation,
+                    health,
+                    detail,
+                    duration_ms,
+                ) {
                     return;
                 }
                 tokio::time::sleep(interval).await;
@@ -496,9 +506,31 @@ impl Manager {
     /// `Failed` (RNF-04: a crash must not bring down `hum` itself).
     pub fn reap_exited(&self) {
         for name in self.services.keys() {
-            self.reconcile_process(name);
-            self.update_port_state(name, false);
+            let Some(runtime) = self.services.get(name) else {
+                continue;
+            };
+            if poll_is_due(&runtime.pid_checked_at, PID_POLL_INTERVAL) {
+                self.reconcile_process(name);
+            }
+            if poll_is_due(&runtime.port_checked_at, PORT_POLL_INTERVAL) {
+                self.update_port_state(name, false);
+            }
         }
+    }
+
+    pub fn schedule_poll(self: &Arc<Self>) {
+        if self
+            .poll_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            manager.reap_exited();
+            manager.poll_in_flight.store(false, Ordering::Release);
+        });
     }
 
     fn reconcile_process(&self, name: &str) -> bool {
@@ -531,7 +563,7 @@ impl Manager {
         false
     }
 
-    fn update_port_state(&self, name: &str, force_owner_check: bool) {
+    fn update_port_state(&self, name: &str, _force_owner_check: bool) {
         let Some(rt) = self.services.get(name) else {
             return;
         };
@@ -545,57 +577,39 @@ impl Manager {
             return;
         };
         let snapshot = rt.state();
-        let expected_pid = rt
-            .process
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|process| process.pid);
-        let owner_check_is_fresh = rt
-            .port_owner_checked_at
-            .lock()
-            .unwrap()
-            .is_some_and(|checked| checked.elapsed() < PORT_OWNER_TTL);
-        let state = match portcheck::probe_port(port) {
-            portcheck::PortProbe::Listening
-                if snapshot.process.is_running() && !force_owner_check && owner_check_is_fresh =>
-            {
-                snapshot.port
-            }
+        let host = self
+            .config
+            .services
+            .get(name)
+            .and_then(|service| service.url.as_deref())
+            .and_then(|url| reqwest::Url::parse(url).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "localhost".to_string());
+        let state = match portcheck::probe_host_port(&host, port, Duration::from_millis(50)) {
             portcheck::PortProbe::Listening if snapshot.process.is_running() => {
-                let occupant = portcheck::identify_occupant(port);
-                *rt.port_owner_checked_at.lock().unwrap() = Some(Instant::now());
-                match (occupant.pid, expected_pid) {
-                    (Some(pid), Some(expected))
-                        if portcheck::belongs_to_process_tree(pid, expected as u32) =>
-                    {
-                        PortState::Listening
-                    }
-                    (Some(pid), _) => PortState::OccupiedByOther {
-                        pid: Some(pid),
-                        process_name: occupant.process_name,
-                    },
-                    (None, _) => PortState::Unknown,
-                }
+                // Start already diagnosed the port as free. Ordinary polling
+                // never shells out; explicit status/doctor handles ownership
+                // diagnostics when the state is unknown or contradictory.
+                PortState::Listening
             }
-            portcheck::PortProbe::Listening => {
-                *rt.port_owner_checked_at.lock().unwrap() = None;
-                PortState::OccupiedByOther {
-                    pid: None,
-                    process_name: None,
-                }
-            }
-            portcheck::PortProbe::Closed => {
-                *rt.port_owner_checked_at.lock().unwrap() = None;
-                PortState::Closed
-            }
-            portcheck::PortProbe::Unknown => {
-                *rt.port_owner_checked_at.lock().unwrap() = None;
-                PortState::Unknown
-            }
+            portcheck::PortProbe::Listening => PortState::OccupiedByOther {
+                pid: None,
+                process_name: None,
+            },
+            portcheck::PortProbe::Closed => PortState::Closed,
+            portcheck::PortProbe::Unknown => PortState::Unknown,
         };
         rt.state.lock().unwrap().port = state;
     }
+}
+
+fn poll_is_due(last: &Mutex<Option<Instant>>, interval: Duration) -> bool {
+    let mut last = last.lock().unwrap();
+    if last.is_some_and(|instant| instant.elapsed() < interval) {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
 }
 
 #[cfg(test)]
@@ -709,5 +723,45 @@ mod tests {
         assert_eq!(manager.services["server"].state().generation, 1);
         assert!(manager.view("server").unwrap().pid.is_some());
         manager.stop_service("server").await.unwrap();
+    }
+
+    #[test]
+    fn ordinary_port_poll_does_not_run_occupant_diagnostics() {
+        let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let root = std::env::temp_dir();
+        let loaded = Loaded {
+            config: Config {
+                services: HashMap::from([(
+                    "server".to_string(),
+                    ServiceConfig {
+                        command: Some("true".to_string()),
+                        port: Some(port),
+                        url: Some(format!("http://127.0.0.1:{port}")),
+                        ..ServiceConfig::default()
+                    },
+                )]),
+                ..Config::default()
+            },
+            base_path: root.join("hum.yaml"),
+            local_path: None,
+            root_dir: root,
+        };
+        let manager = Manager::with_env(loaded, HashMap::new());
+        let runtime = &manager.services["server"];
+        let generation = runtime.state.lock().unwrap().begin_start();
+        runtime
+            .state
+            .lock()
+            .unwrap()
+            .mark_running(generation, false);
+        portcheck::reset_diagnostic_call_count();
+
+        manager.update_port_state("server", false);
+
+        assert_eq!(runtime.state().port, PortState::Listening);
+        assert_eq!(portcheck::diagnostic_call_count(), 0);
     }
 }
