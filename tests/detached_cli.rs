@@ -3,11 +3,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use sysinfo::System;
+
+static PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn process_test_guard() -> MutexGuard<'static, ()> {
+    PROCESS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct Cleanup {
     root: PathBuf,
@@ -27,6 +36,7 @@ impl Drop for Cleanup {
 
 #[test]
 fn detached_start_survives_cli_exit_and_reconciles_concurrent_and_stale_state() {
+    let _process_guard = process_test_guard();
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -187,6 +197,7 @@ templates:
 
 #[test]
 fn noisy_service_logs_rotate_redact_and_survive_crash() {
+    let _process_guard = process_test_guard();
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -274,6 +285,7 @@ templates:
 
 #[test]
 fn detached_command_records_a_natural_exit_code() {
+    let _process_guard = process_test_guard();
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

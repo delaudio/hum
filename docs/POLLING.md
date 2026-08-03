@@ -17,8 +17,29 @@ services:
 
 ## Ten-service budget
 
-For a release build on an Apple Silicon development machine, the acceptance
-budget while the TUI is idle for 60 seconds is:
+The checked-in release smoke test starts ten detached fixture services, opens
+the TUI over a pseudoterminal, samples the monitor process, exits through the
+explicit leave-running path, stops every service, and verifies that no runtime
+registry entries remain. Its regression thresholds are:
+
+- ten-service detached startup: at most 2 s;
+- first TUI frame: at most 250 ms (the interactive target is approximately
+  200 ms);
+- average idle `hum` CPU: at most 2%;
+- peak `hum` resident memory: at most 60 MiB;
+- resident controller/monitor daemons after `start`: zero;
+- the bounded log-rotation helper: exactly one native `hum __log-sink` per
+  running service, at most 1% aggregate idle CPU and 80 MiB aggregate RSS for
+  ten services.
+
+Run the automated gate with:
+
+```bash
+cargo test --release --test performance_smoke -- --ignored --nocapture
+```
+
+The CI sample lasts three seconds after a short warm-up. For a lower-noise
+release measurement on a development machine, keep the TUI idle for 60 seconds:
 
 - average `hum` CPU: at most 2%;
 - `hum` resident memory: at most 60 MiB;
@@ -34,9 +55,16 @@ target/release/hum --config examples/hum.polling-benchmark.yaml polling-benchmar
 scripts/measure-polling-budget.sh <hum-pid> 60
 ```
 
-The harness samples CPU and RSS once per second and reports average CPU and peak
-RSS. Run an execution tracer alongside the sample when independently verifying
-that no `lsof` process appears during steady-state polling.
+The manual harness samples CPU and RSS once per second and reports average CPU
+and peak RSS. Run an execution tracer alongside the sample when independently
+verifying that no `lsof` process appears during steady-state polling.
+
+The strict values above are the local acceptance budget. Shared CI runners use
+explicitly documented regression ceilings (5 s startup, 1 s first frame, 5%
+TUI CPU, 100 MiB TUI RSS, 3% aggregate sink CPU, and 120 MiB aggregate sink
+RSS) to avoid treating host contention as a product regression. The smoke test
+uses interval CPU deltas and recognizes the rendered service table, rather than
+counting terminal initialization bytes as a frame.
 
 Recorded release-build sample on 2026-08-03 (Apple Silicon macOS, ten configured
 services, closed local ports, 60 one-second samples):

@@ -328,7 +328,7 @@ pub fn inspect_identity(entry: &RuntimeEntry) -> IdentityStatus {
         ProcessRefreshKind::new(),
     );
 
-    let leader_alive = system.process(pid).is_some_and(|leader| {
+    let mut leader_alive = system.process(pid).is_some_and(|leader| {
         !matches!(
             leader.status(),
             sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
@@ -337,13 +337,32 @@ pub fn inspect_identity(entry: &RuntimeEntry) -> IdentityStatus {
     if let Some(leader) = system.process(pid) {
         if leader_alive {
             #[cfg(unix)]
-            let current_pgid = unsafe { libc::getpgid(entry.pid as i32) };
+            match classify_unix_leader(
+                entry,
+                leader.start_time(),
+                unsafe { libc::getpgid(entry.pid as i32) },
+                std::io::Error::last_os_error().raw_os_error(),
+            ) {
+                LeaderCheck::Matching => {}
+                LeaderCheck::Gone => {
+                    // The leader disappeared between the process snapshot and
+                    // getpgid(). Descendants may still hold the identity lock,
+                    // so continue with the lock-based group check below.
+                    leader_alive = false;
+                }
+                LeaderCheck::Mismatch(reason) => return IdentityStatus::Mismatch(reason),
+            }
             #[cfg(not(unix))]
             let current_pgid = entry.pid as i32;
+            #[cfg(not(unix))]
             if current_pgid != entry.pgid || leader.start_time() != entry.process_start_time {
                 return IdentityStatus::Mismatch(format!(
-                    "PID {} start time or process group no longer matches its registry entry",
-                    entry.pid
+                    "PID {} identity differs (start time {} vs {}, process group {} vs {})",
+                    entry.pid,
+                    leader.start_time(),
+                    entry.process_start_time,
+                    current_pgid,
+                    entry.pgid
                 ));
             }
         }
@@ -370,6 +389,33 @@ pub fn inspect_identity(entry: &RuntimeEntry) -> IdentityStatus {
     } else {
         IdentityStatus::Missing
     }
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum LeaderCheck {
+    Matching,
+    Gone,
+    Mismatch(String),
+}
+
+#[cfg(unix)]
+fn classify_unix_leader(
+    entry: &RuntimeEntry,
+    observed_start_time: u64,
+    observed_pgid: i32,
+    pgid_error: Option<i32>,
+) -> LeaderCheck {
+    if observed_pgid < 0 && pgid_error == Some(libc::ESRCH) {
+        return LeaderCheck::Gone;
+    }
+    if observed_pgid != entry.pgid || observed_start_time != entry.process_start_time {
+        return LeaderCheck::Mismatch(format!(
+            "PID {} identity differs (start time {} vs {}, process group {} vs {})",
+            entry.pid, observed_start_time, entry.process_start_time, observed_pgid, entry.pgid
+        ));
+    }
+    LeaderCheck::Matching
 }
 
 fn identity_lock_is_held(path: &Path) -> Result<bool> {
@@ -585,5 +631,30 @@ mod tests {
         registry.remove("api").unwrap();
         assert!(registry.load("api").unwrap().is_none());
         fs::remove_dir_all(state).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vanished_leader_snapshot_falls_back_to_the_process_group_lock() {
+        let runtime_entry = entry("api", "a".repeat(64), PathBuf::from("identity"));
+
+        assert_eq!(
+            classify_unix_leader(
+                &runtime_entry,
+                runtime_entry.process_start_time,
+                -1,
+                Some(libc::ESRCH),
+            ),
+            LeaderCheck::Gone
+        );
+        assert!(matches!(
+            classify_unix_leader(
+                &runtime_entry,
+                runtime_entry.process_start_time,
+                runtime_entry.pgid + 1,
+                None,
+            ),
+            LeaderCheck::Mismatch(_)
+        ));
     }
 }

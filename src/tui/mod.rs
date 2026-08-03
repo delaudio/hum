@@ -984,14 +984,22 @@ fn clear_log_view(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::config::{Config, Loaded, TemplateConfig};
+    use crate::core::state::{PortState, ProcessState};
 
     use super::*;
 
-    fn empty_app() -> App {
-        let root = std::env::temp_dir().join(format!("hum-tui-test-{}", std::process::id()));
+    fn empty_app() -> (App, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("hum-tui-test-{}-{unique}", std::process::id()));
         let loaded = Loaded {
             config: Config {
                 version: 2,
@@ -1013,12 +1021,17 @@ mod tests {
             PathBuf::from(&root).join("state"),
         )
         .unwrap();
-        App::new(Arc::new(runtime), Some("empty".to_string()))
+        (App::new(Arc::new(runtime), Some("empty".to_string())), root)
+    }
+
+    fn cleanup(app: App, root: PathBuf) {
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn quit_requires_an_explicit_leave_choice() {
-        let mut app = empty_app();
+        let (mut app, root) = empty_app();
         let (action_tx, _action_rx) = mpsc::unbounded_channel();
         let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
 
@@ -1033,11 +1046,12 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('q'), &action_tx, &doctor_tx);
         handle_key(&mut app, KeyCode::Char('l'), &action_tx, &doctor_tx);
         assert!(app.should_quit);
+        cleanup(app, root);
     }
 
     #[tokio::test]
     async fn stop_and_quit_waits_for_a_successful_stop_action() {
-        let mut app = empty_app();
+        let (mut app, root) = empty_app();
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
         let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
         let (monitor_tx, _monitor_rx) = mpsc::unbounded_channel();
@@ -1054,11 +1068,12 @@ mod tests {
 
         assert!(app.should_quit);
         assert!(!app.action_in_flight);
+        cleanup(app, root);
     }
 
     #[test]
     fn empty_templates_report_actions_instead_of_opening_blank_views() {
-        let mut app = empty_app();
+        let (mut app, root) = empty_app();
         let (action_tx, _action_rx) = mpsc::unbounded_channel();
         let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
 
@@ -1066,5 +1081,57 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.status_line.contains("no services"));
+        cleanup(app, root);
+    }
+
+    #[test]
+    fn stale_health_results_cannot_overwrite_stop_or_restart_state() {
+        let (mut app, root) = empty_app();
+        let mut current = crate::runtime::detached::DetachedServiceStatus {
+            name: "worker".to_string(),
+            process: ProcessState::Running,
+            port: PortState::Closed,
+            health: HealthState::Checking,
+            configured_port: None,
+            pid: Some(22),
+            pgid: Some(22),
+            exit_code: None,
+            cwd: None,
+            command: None,
+            stdout_log: None,
+            stderr_log: None,
+            detail: None,
+            health_detail: None,
+            health_duration_ms: None,
+            started_at: None,
+        };
+        app.statuses.insert("worker".to_string(), current.clone());
+        app.health_in_flight.insert("worker".to_string());
+
+        apply_health(
+            &mut app,
+            HealthUpdate {
+                name: "worker".to_string(),
+                pid: Some(11),
+                result: Ok((HealthState::Healthy, "old process".to_string(), 1)),
+            },
+        );
+        assert_eq!(app.statuses["worker"].health, HealthState::Checking);
+
+        current.process = ProcessState::Stopping;
+        current.pid = Some(22);
+        current.health = HealthState::Unchecked;
+        app.statuses.insert("worker".to_string(), current);
+        app.health_in_flight.insert("worker".to_string());
+        apply_health(
+            &mut app,
+            HealthUpdate {
+                name: "worker".to_string(),
+                pid: Some(22),
+                result: Ok((HealthState::Healthy, "late stop result".to_string(), 1)),
+            },
+        );
+        assert_eq!(app.statuses["worker"].health, HealthState::Unchecked);
+        cleanup(app, root);
     }
 }

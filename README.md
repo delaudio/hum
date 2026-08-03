@@ -122,8 +122,9 @@ ten-service CPU/RSS budget are documented in
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+scripts/verify-test-count.sh 60
 cargo build --release
+cargo test --release --test performance_smoke -- --ignored --nocapture
 ```
 
 The detailed product contract, lifecycle, security model, migration notes, and

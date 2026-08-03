@@ -873,12 +873,21 @@ fn canonicalize_json(value: &mut serde_json::Value) {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::LazyLock;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tokio::sync::{Mutex, MutexGuard};
 
     use crate::config::{ServiceConfig, TemplateConfig};
     use crate::runtime::process::DetachedStopOutcome;
 
     use super::*;
+
+    static PROCESS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    async fn process_test_guard() -> MutexGuard<'static, ()> {
+        PROCESS_TEST_LOCK.lock().await
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -919,13 +928,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unverified_listener_never_marks_a_service_ready() {
-        let status = DetachedServiceStatus {
+    fn status(
+        process: ProcessState,
+        port: PortState,
+        health: HealthState,
+    ) -> DetachedServiceStatus {
+        DetachedServiceStatus {
             name: "server".to_string(),
-            process: ProcessState::Running,
-            port: PortState::ListeningUnverified,
-            health: HealthState::Unchecked,
+            process,
+            port,
+            health,
             configured_port: Some(8080),
             pid: Some(123),
             pgid: Some(123),
@@ -938,14 +950,98 @@ mod tests {
             health_detail: None,
             health_duration_ms: None,
             started_at: None,
-        };
+        }
+    }
 
-        assert_eq!(status.presentation(), PresentationState::Running);
+    #[test]
+    fn presentation_follows_process_port_and_health_state_transitions() {
+        assert_eq!(
+            status(
+                ProcessState::Starting,
+                PortState::Unknown,
+                HealthState::Unchecked
+            )
+            .presentation(),
+            PresentationState::Starting
+        );
+        assert_eq!(
+            status(
+                ProcessState::Stopping,
+                PortState::Unknown,
+                HealthState::Unchecked
+            )
+            .presentation(),
+            PresentationState::Stopping
+        );
+        assert_eq!(
+            status(
+                ProcessState::Exited,
+                PortState::Closed,
+                HealthState::Unchecked
+            )
+            .presentation(),
+            PresentationState::Exited
+        );
+        assert_eq!(
+            status(
+                ProcessState::Missing,
+                PortState::Unknown,
+                HealthState::Unchecked
+            )
+            .presentation(),
+            PresentationState::Missing
+        );
+
+        let mut blocked = status(
+            ProcessState::Missing,
+            PortState::Unknown,
+            HealthState::Unchecked,
+        );
+        blocked.detail = Some("dependency failed".to_string());
+        assert_eq!(blocked.presentation(), PresentationState::Blocked);
+
+        assert_eq!(
+            status(
+                ProcessState::Running,
+                PortState::ListeningUnverified,
+                HealthState::Unchecked
+            )
+            .presentation(),
+            PresentationState::Running
+        );
+        assert_eq!(
+            status(
+                ProcessState::Running,
+                PortState::Closed,
+                HealthState::Unhealthy
+            )
+            .presentation(),
+            PresentationState::Degraded
+        );
+        assert_eq!(
+            status(
+                ProcessState::Running,
+                PortState::Closed,
+                HealthState::Healthy
+            )
+            .presentation(),
+            PresentationState::Ready
+        );
+        assert_eq!(
+            status(
+                ProcessState::Running,
+                PortState::Listening,
+                HealthState::Unchecked
+            )
+            .presentation(),
+            PresentationState::Ready
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detached_service_survives_runtime_drop_and_is_rediscovered() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("survives");
         let state = root.join("state");
         let runtime = DetachedRuntime::with_state_root(
@@ -982,6 +1078,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn monitor_reconciles_external_crash_and_restart_across_instances() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("monitor-reconcile");
         let state = root.join("state");
         let first = DetachedRuntime::with_state_root(
@@ -1041,6 +1138,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_starts_are_serialized_and_idempotent() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("concurrent");
         let state = root.join("state");
         let first = DetachedRuntime::with_state_root(
@@ -1074,6 +1172,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn identity_mismatch_never_signals_reused_pid() {
+        let _process_guard = process_test_guard().await;
         let pid = std::process::id();
         let actual_start = process_start_time(pid).unwrap();
         let pgid = unsafe { libc::getpgid(pid as i32) };
@@ -1119,6 +1218,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn descendants_remain_owned_after_session_leader_exits() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("leader-exit");
         let state = root.join("state");
         let runtime = DetachedRuntime::with_state_root(
@@ -1152,6 +1252,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn crashed_entry_is_stale_and_next_start_replaces_it() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("crash");
         let state = root.join("state");
         let runtime = DetachedRuntime::with_state_root(
@@ -1183,6 +1284,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_start_rolls_back_only_new_processes() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("rollback");
         let state = root.join("state");
         let mut loaded = loaded(&root, "while :; do sleep 1; done");
@@ -1200,8 +1302,11 @@ mod tests {
             DetachedRuntime::with_state_root("demo".to_string(), loaded, HashMap::new(), state)
                 .unwrap();
 
-        assert!(runtime.start_template("all").await.is_err());
-        assert!(runtime.registry().load("server").unwrap().is_none());
+        let error = runtime.start_template("all").await.unwrap_err();
+        assert!(
+            runtime.registry().load("server").unwrap().is_none(),
+            "rollback left server registered: {error:#}"
+        );
         assert!(runtime.registry().load("broken").unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
     }
@@ -1209,6 +1314,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn template_stop_uses_reverse_dependency_order() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("stop-order");
         let state = root.join("state");
         let mut loaded = loaded(&root, "while :; do sleep 1; done");
@@ -1246,6 +1352,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_dependent_stop_does_not_stop_its_dependency() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("stop-blocks-dependency");
         let state = root.join("state");
         let mut loaded = loaded(&root, "while :; do sleep 1; done");
@@ -1304,6 +1411,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forced_stop_confirms_process_group_exit_before_registry_removal() {
+        let _process_guard = process_test_guard().await;
         let root = temp_root("kill-confirmation");
         let state = root.join("state");
         let runtime = DetachedRuntime::with_state_root(

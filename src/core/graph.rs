@@ -66,3 +66,63 @@ pub fn stop_order(start_order: &[String]) -> Vec<String> {
     v.reverse();
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::config::{Config, ServiceConfig, TemplateConfig};
+
+    use super::*;
+
+    fn service(dependencies: &[&str]) -> ServiceConfig {
+        ServiceConfig {
+            command: Some("true".to_string()),
+            depends_on: dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_string())
+                .collect(),
+            ..ServiceConfig::default()
+        }
+    }
+
+    #[test]
+    fn resolves_a_dag_once_in_dependency_order_and_reverses_for_stop() {
+        let config = Config {
+            services: HashMap::from([
+                ("database".to_string(), service(&[])),
+                ("cache".to_string(), service(&[])),
+                ("api".to_string(), service(&["database", "cache"])),
+                ("worker".to_string(), service(&["database"])),
+            ]),
+            templates: HashMap::from([(
+                "all".to_string(),
+                TemplateConfig {
+                    services: vec!["api".to_string(), "worker".to_string()],
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let start = services_for_template(&config, "all").unwrap();
+        assert_eq!(start, ["database", "cache", "api", "worker"]);
+        assert_eq!(stop_order(&start), ["worker", "api", "cache", "database"]);
+    }
+
+    #[test]
+    fn rejects_unknown_nodes_and_cycles_defensively() {
+        let mut config = Config {
+            services: HashMap::from([("api".to_string(), service(&["database"]))]),
+            ..Config::default()
+        };
+
+        let missing = resolve_start_order(&config, &["api".to_string()]).unwrap_err();
+        assert!(missing.to_string().contains("unknown service 'database'"));
+
+        config
+            .services
+            .insert("database".to_string(), service(&["api"]));
+        let cycle = resolve_start_order(&config, &["api".to_string()]).unwrap_err();
+        assert!(cycle.to_string().contains("circular dependency"));
+    }
+}

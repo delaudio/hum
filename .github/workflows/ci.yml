@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Lints
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Tests and non-empty suite gate
+        run: scripts/verify-test-count.sh 60
+      - name: Release build
+        run: cargo build --release
+
+  performance:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Ten-service performance smoke
+        env:
+          HUM_START_BUDGET_MS: 5000
+          HUM_FIRST_FRAME_BUDGET_MS: 1000
+          HUM_TUI_CPU_BUDGET_PERCENT: 5
+          HUM_TUI_RSS_BUDGET_MIB: 100
+          HUM_SINK_CPU_BUDGET_PERCENT: 3
+          HUM_SINK_RSS_BUDGET_MIB: 120
+        run: cargo test --release --test performance_smoke -- --ignored --nocapture
