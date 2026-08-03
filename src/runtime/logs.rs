@@ -541,6 +541,235 @@ pub fn tail_history(path: &Path, count: usize, rotated_files: usize) -> Result<V
     tail_sources(&sources, count)
 }
 
+/// A bounded, backwards reader over a snapshot of an active log and its rotations.
+///
+/// Each call advances towards older data without retaining the previously read
+/// history in memory. Open file handles keep the snapshot stable while the
+/// active writer continues rotating files.
+pub struct HistoryPager {
+    sources: Vec<HistorySource>,
+    source_index: usize,
+    reversed_line: Vec<u8>,
+    oversized_line: bool,
+    discard_newest_fragment: bool,
+    skip_trailing_separator: bool,
+    max_line_bytes: usize,
+    finished: bool,
+    saw_content: bool,
+}
+
+struct HistorySource {
+    file: File,
+    position: u64,
+    start_verified: bool,
+}
+
+impl HistoryPager {
+    pub fn open(path: &Path, rotated_files: usize, max_line_bytes: usize) -> Result<Self> {
+        let sources = open_history_sources(path, rotated_files, None)?;
+        Self::from_sources(sources, max_line_bytes)
+    }
+
+    fn from_sources(sources: Vec<HistorySource>, max_line_bytes: usize) -> Result<Self> {
+        let discard_newest_fragment = match sources.iter().find(|source| source.position > 0) {
+            Some(source) => {
+                let mut file = source.file.try_clone()?;
+                file.seek(SeekFrom::Start(source.position - 1))?;
+                let mut byte = [0];
+                file.read_exact(&mut byte)?;
+                byte[0] != b'\n'
+            }
+            _ => false,
+        };
+        Ok(Self {
+            sources,
+            source_index: 0,
+            reversed_line: Vec::new(),
+            oversized_line: false,
+            discard_newest_fragment,
+            skip_trailing_separator: true,
+            max_line_bytes,
+            finished: false,
+            saw_content: false,
+        })
+    }
+
+    /// Return the next older page in chronological order.
+    ///
+    /// Disk work per call is capped so a noisy or newline-free log cannot stall
+    /// the TUI. If a page is empty while `has_more` is true, another call keeps
+    /// advancing through that bounded input.
+    pub fn next_older(&mut self, count: usize) -> Result<Vec<String>> {
+        if count == 0 || self.finished {
+            return Ok(Vec::new());
+        }
+        let mut newest_first = Vec::new();
+        let mut bytes_read = 0;
+        while newest_first.len() < count
+            && bytes_read < MAX_TAIL_BYTES
+            && self.source_index < self.sources.len()
+        {
+            if self.sources[self.source_index].position == 0 {
+                self.source_index += 1;
+                continue;
+            }
+            let amount = (self.sources[self.source_index].position as usize)
+                .min(TAIL_READ_CHUNK)
+                .min(MAX_TAIL_BYTES - bytes_read);
+            let end = self.sources[self.source_index].position;
+            let start = end - amount as u64;
+            let mut chunk = vec![0; amount];
+            {
+                let source = &mut self.sources[self.source_index];
+                source.file.seek(SeekFrom::Start(start))?;
+                source.file.read_exact(&mut chunk)?;
+            }
+
+            let mut consumed = 0_u64;
+            for byte in chunk.into_iter().rev() {
+                consumed += 1;
+                bytes_read += 1;
+                self.consume_byte(byte, &mut newest_first);
+                if newest_first.len() == count || bytes_read == MAX_TAIL_BYTES {
+                    break;
+                }
+            }
+            self.sources[self.source_index].position = end - consumed;
+        }
+
+        if self.source_index == self.sources.len() && !self.finished {
+            self.finish_history(&mut newest_first);
+        }
+        newest_first.reverse();
+        Ok(newest_first)
+    }
+
+    pub fn has_more(&self) -> bool {
+        !self.finished
+    }
+
+    fn consume_byte(&mut self, byte: u8, lines: &mut Vec<String>) {
+        self.saw_content = true;
+        if self.discard_newest_fragment {
+            if byte == b'\n' {
+                self.discard_newest_fragment = false;
+                self.skip_trailing_separator = false;
+                lines.push("… [incomplete log line omitted]".to_string());
+            }
+            return;
+        }
+        if byte == b'\n' {
+            if self.skip_trailing_separator {
+                self.skip_trailing_separator = false;
+            } else {
+                lines.push(self.take_line());
+            }
+            return;
+        }
+        self.skip_trailing_separator = false;
+        if self.reversed_line.len() < self.max_line_bytes {
+            self.reversed_line.push(byte);
+        } else {
+            self.oversized_line = true;
+        }
+    }
+
+    fn take_line(&mut self) -> String {
+        if self.oversized_line {
+            self.reversed_line.clear();
+            self.oversized_line = false;
+            return "… [oversized log line omitted]".to_string();
+        }
+        self.reversed_line.reverse();
+        let line = String::from_utf8_lossy(&self.reversed_line).into_owned();
+        self.reversed_line.clear();
+        line
+    }
+
+    fn finish_history(&mut self, lines: &mut Vec<String>) {
+        let discarded_at_eof = self.discard_newest_fragment && self.saw_content;
+        if discarded_at_eof {
+            lines.push("… [incomplete log line omitted]".to_string());
+            self.discard_newest_fragment = false;
+        }
+        let oldest_verified = self
+            .sources
+            .last()
+            .is_some_and(|source| source.start_verified);
+        if !self.discard_newest_fragment && (!self.reversed_line.is_empty() || self.oversized_line)
+        {
+            if oldest_verified {
+                lines.push(self.take_line());
+            } else {
+                self.reversed_line.clear();
+                self.oversized_line = false;
+                lines.push("… [history boundary]".to_string());
+            }
+        } else if self.saw_content
+            && !oldest_verified
+            && !self.discard_newest_fragment
+            && !discarded_at_eof
+        {
+            lines.push("… [history boundary]".to_string());
+        }
+        self.finished = true;
+    }
+}
+
+fn open_history_sources(
+    path: &Path,
+    rotated_files: usize,
+    active: Option<(&File, u64, FileIdentity)>,
+) -> Result<Vec<HistorySource>> {
+    let mut sources = Vec::new();
+    let mut identities = std::collections::HashSet::new();
+    if let Some((file, length, identity)) = active {
+        identities.insert(identity);
+        sources.push(HistorySource {
+            file: file.try_clone()?,
+            position: length,
+            start_verified: read_boundary_marker(path, identity),
+        });
+    } else {
+        match File::open(path) {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                let identity = file_identity(&metadata);
+                identities.insert(identity);
+                sources.push(HistorySource {
+                    file,
+                    position: metadata.len(),
+                    start_verified: read_boundary_marker(path, identity),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to open {}", path.display()));
+            }
+        }
+    }
+    for index in 1..=rotated_files {
+        let rotated = rotated_path(path, index);
+        let file = match File::open(&rotated) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to open {}", rotated.display()));
+            }
+        };
+        let metadata = file.metadata()?;
+        let identity = file_identity(&metadata);
+        if identities.insert(identity) {
+            sources.push(HistorySource {
+                file,
+                position: metadata.len(),
+                start_verified: read_boundary_marker(&rotated, identity),
+            });
+        }
+    }
+    Ok(sources)
+}
+
 fn tail_sources(sources_newest_first: &[PathBuf], count: usize) -> Result<Vec<String>> {
     let mut sources = Vec::new();
     for source in sources_newest_first {
@@ -738,6 +967,19 @@ impl FileFollower {
             }
         }
         tail_open_sources(&mut sources, count)
+    }
+
+    pub fn history_pager(
+        &self,
+        rotated_files: usize,
+        max_line_bytes: usize,
+    ) -> Result<HistoryPager> {
+        let sources = open_history_sources(
+            &self.active_path,
+            rotated_files,
+            Some((&self.file, self.offset, self.identity)),
+        )?;
+        HistoryPager::from_sources(sources, max_line_bytes)
     }
 
     fn open(path: &Path, from_end: bool, max_partial_line: usize) -> Result<Option<Self>> {
@@ -1211,6 +1453,82 @@ mod tests {
                 rotated_path(&path, index)
             };
             remove_if_exists(&file).unwrap();
+        }
+    }
+
+    #[test]
+    fn history_pager_walks_backwards_in_bounded_pages() {
+        let path = temp_path("history-pager");
+        let mut content = (0..300)
+            .map(|index| format!("line-{index}\n"))
+            .collect::<String>();
+        content.push_str("incomplete-secret");
+        fs::write(&path, content).unwrap();
+
+        let mut pager = HistoryPager::open(&path, 0, 128).unwrap();
+        let newest = pager.next_older(100).unwrap();
+        let middle = pager.next_older(100).unwrap();
+        let oldest = pager.next_older(100).unwrap();
+        let boundary = pager.next_older(100).unwrap();
+
+        assert_eq!(newest.first().map(String::as_str), Some("line-201"));
+        assert_eq!(newest.get(98).map(String::as_str), Some("line-299"));
+        assert_eq!(
+            newest.last().map(String::as_str),
+            Some("… [incomplete log line omitted]")
+        );
+        assert_eq!(middle.first().map(String::as_str), Some("line-101"));
+        assert_eq!(middle.last().map(String::as_str), Some("line-200"));
+        assert_eq!(oldest.first().map(String::as_str), Some("line-1"));
+        assert_eq!(oldest.last().map(String::as_str), Some("line-100"));
+        assert_eq!(
+            boundary.first().map(String::as_str),
+            Some("… [history boundary]")
+        );
+        assert!(newest
+            .iter()
+            .chain(&middle)
+            .chain(&oldest)
+            .chain(&boundary)
+            .all(|line| !line.contains("incomplete-secret")));
+        assert!(!pager.has_more());
+        remove_if_exists(&path).unwrap();
+    }
+
+    #[test]
+    fn history_pager_omits_incomplete_newest_rotated_fragment_when_active_is_empty() {
+        let path = temp_path("history-pager-empty-active");
+        fs::write(&path, b"").unwrap();
+        fs::write(rotated_path(&path, 1), b"token=unredactable").unwrap();
+
+        let mut pager = HistoryPager::open(&path, 1, 128).unwrap();
+        let history = pager.next_older(20).unwrap();
+
+        assert_eq!(history, ["… [incomplete log line omitted]"]);
+        assert!(history.iter().all(|line| !line.contains("unredactable")));
+        remove_if_exists(&path).unwrap();
+        remove_if_exists(&rotated_path(&path, 1)).unwrap();
+    }
+
+    #[test]
+    fn history_pager_reassembles_lines_split_across_rotations() {
+        let path = temp_path("history-pager-split");
+        let mut writer = RotatingWriter::new(path.clone(), policy(6, 3)).unwrap();
+        writer.write_bounded(b"abcdefgh\nnext\n").unwrap();
+        drop(writer);
+
+        let mut pager = HistoryPager::open(&path, 3, 128).unwrap();
+        let history = pager.next_older(20).unwrap();
+
+        assert_eq!(history, ["abcdefgh", "next"]);
+        for index in 0..=3 {
+            let file = if index == 0 {
+                path.clone()
+            } else {
+                rotated_path(&path, index)
+            };
+            remove_if_exists(&file).unwrap();
+            remove_if_exists(&boundary_path(&file)).unwrap();
         }
     }
 

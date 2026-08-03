@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::core::state::HealthState;
 use crate::doctor;
 use crate::runtime::detached::{DetachedRuntime, DetachedServiceStatus};
-use crate::runtime::logs::{tail_history, FileFollower, Redactor};
+use crate::runtime::logs::{FileFollower, HistoryPager, Redactor};
 
 mod ui;
 
@@ -25,10 +25,13 @@ const EVENT_TICK: Duration = Duration::from_millis(250);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_LOG_LINES: usize = 500;
 const MAX_LOG_VIEW_BYTES: usize = 4 * 1024 * 1024;
+const INITIAL_LOG_LINES: usize = 200;
+const LOG_HISTORY_PAGE_LINES: usize = 100;
+const LOG_SCROLL_PAGE_LINES: usize = 20;
 const DETAIL_LINE_COUNT: u16 = 16;
 const DETAIL_HORIZONTAL_LIMIT: u16 = 512;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     Normal,
     TemplateSelect,
@@ -47,6 +50,11 @@ pub struct App {
     pub template: Option<String>,
     pub log_lines: VecDeque<String>,
     log_bytes: usize,
+    pub log_scroll_from_bottom: usize,
+    pub log_follow: bool,
+    pub log_history_exhausted: bool,
+    pub log_visible_height: usize,
+    log_history_stale: bool,
     pub log_search: String,
     pub log_searching: bool,
     pub details_scroll: u16,
@@ -60,6 +68,10 @@ pub struct App {
     health_due: HashMap<String, Instant>,
     stdout_follower: Option<FileFollower>,
     stderr_follower: Option<FileFollower>,
+    stdout_history: Option<HistoryPager>,
+    stderr_history: Option<HistoryPager>,
+    stdout_history_skip: usize,
+    stderr_history_skip: usize,
     log_service: Option<String>,
     redactor: Redactor,
     active_poll: Option<u64>,
@@ -88,6 +100,11 @@ impl App {
             template,
             log_lines: VecDeque::with_capacity(MAX_LOG_LINES),
             log_bytes: 0,
+            log_scroll_from_bottom: 0,
+            log_follow: true,
+            log_history_exhausted: false,
+            log_visible_height: LOG_SCROLL_PAGE_LINES,
+            log_history_stale: false,
             log_search: String::new(),
             log_searching: false,
             details_scroll: 0,
@@ -101,6 +118,10 @@ impl App {
             health_due: HashMap::new(),
             stdout_follower: None,
             stderr_follower: None,
+            stdout_history: None,
+            stderr_history: None,
+            stdout_history_skip: 0,
+            stderr_history_skip: 0,
             log_service: None,
             redactor,
             active_poll: None,
@@ -256,7 +277,7 @@ async fn event_loop(
     schedule_poll(&mut app, &monitor_tx);
 
     loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
 
         if app.should_quit {
             return Ok(());
@@ -540,7 +561,18 @@ fn handle_key(
             }
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
-                KeyCode::Char('c') => clear_log_view(app),
+                KeyCode::Up | KeyCode::Char('k') => scroll_logs_up(app, 1),
+                KeyCode::Down | KeyCode::Char('j') => scroll_logs_down(app, 1),
+                KeyCode::PageUp => scroll_logs_up(app, LOG_SCROLL_PAGE_LINES),
+                KeyCode::PageDown => scroll_logs_down(app, LOG_SCROLL_PAGE_LINES),
+                KeyCode::Home => scroll_logs_to_oldest(app),
+                KeyCode::End => return_to_live_logs(app),
+                KeyCode::Char('c') => {
+                    clear_log_view(app);
+                    app.log_scroll_from_bottom = 0;
+                    app.log_follow = true;
+                    app.log_history_stale = true;
+                }
                 KeyCode::Char('/') => {
                     app.log_search.clear();
                     app.log_searching = true;
@@ -884,32 +916,71 @@ fn open_logs(app: &mut App) {
     clear_log_view(app);
     app.log_search.clear();
     app.log_searching = false;
+    app.log_scroll_from_bottom = 0;
+    app.log_follow = true;
+    app.log_history_stale = false;
     let rotated_files = app.runtime.config().logs.rotated_files;
     let max_line_bytes = app.runtime.config().logs.max_line_bytes;
-    let mut stdout_follower = FileFollower::from_end_with_limit(&stdout_path, max_line_bytes)
-        .ok()
-        .flatten();
-    let mut stderr_follower = FileFollower::from_end_with_limit(&stderr_path, max_line_bytes)
-        .ok()
-        .flatten();
-    let stdout_tail = match stdout_follower.as_mut() {
-        Some(follower) => follower.initial_tail(200, rotated_files),
-        None => tail_history(&stdout_path, 200, rotated_files),
+    let stdout_follower = match FileFollower::from_end_with_limit(&stdout_path, max_line_bytes) {
+        Ok(follower) => follower,
+        Err(error) => {
+            app.status_line = format!("could not follow stdout log: {error}");
+            None
+        }
     };
+    let stderr_follower = match FileFollower::from_end_with_limit(&stderr_path, max_line_bytes) {
+        Ok(follower) => follower,
+        Err(error) => {
+            app.status_line = format!("could not follow stderr log: {error}");
+            None
+        }
+    };
+    let stdout_history_result = match stdout_follower.as_ref() {
+        Some(follower) => follower.history_pager(rotated_files, max_line_bytes),
+        None => HistoryPager::open(&stdout_path, rotated_files, max_line_bytes),
+    };
+    let stderr_history_result = match stderr_follower.as_ref() {
+        Some(follower) => follower.history_pager(rotated_files, max_line_bytes),
+        None => HistoryPager::open(&stderr_path, rotated_files, max_line_bytes),
+    };
+    let mut stdout_history = match stdout_history_result {
+        Ok(history) => Some(history),
+        Err(error) => {
+            app.status_line = format!("could not read stdout history: {error}");
+            None
+        }
+    };
+    let mut stderr_history = match stderr_history_result {
+        Ok(history) => Some(history),
+        Err(error) => {
+            app.status_line = format!("could not read stderr history: {error}");
+            None
+        }
+    };
+    let stdout_tail = stdout_history.as_mut().map_or_else(
+        || Ok(Vec::new()),
+        |history| history.next_older(INITIAL_LOG_LINES),
+    );
     match stdout_tail {
         Ok(lines) => append_log_lines(app, "stdout", lines),
         Err(error) => app.status_line = error.to_string(),
     }
-    let stderr_tail = match stderr_follower.as_mut() {
-        Some(follower) => follower.initial_tail(200, rotated_files),
-        None => tail_history(&stderr_path, 200, rotated_files),
-    };
+    let stderr_tail = stderr_history.as_mut().map_or_else(
+        || Ok(Vec::new()),
+        |history| history.next_older(INITIAL_LOG_LINES),
+    );
     match stderr_tail {
         Ok(lines) => append_log_lines(app, "stderr", lines),
         Err(error) => app.status_line = error.to_string(),
     }
     app.stdout_follower = stdout_follower;
     app.stderr_follower = stderr_follower;
+    app.log_history_exhausted = !stdout_history.as_ref().is_some_and(HistoryPager::has_more)
+        && !stderr_history.as_ref().is_some_and(HistoryPager::has_more);
+    app.stdout_history = stdout_history;
+    app.stderr_history = stderr_history;
+    app.stdout_history_skip = 0;
+    app.stderr_history_skip = 0;
     app.log_service = Some(name);
     app.mode = Mode::Logs;
 }
@@ -926,24 +997,34 @@ fn refresh_log_followers(app: &mut App) {
     };
     let max_line_bytes = app.runtime.config().logs.max_line_bytes;
     if app.stdout_follower.is_none() {
-        app.stdout_follower = FileFollower::from_start_with_limit(&stdout_path, max_line_bytes)
-            .ok()
-            .flatten();
+        match FileFollower::from_start_with_limit(&stdout_path, max_line_bytes) {
+            Ok(follower) => app.stdout_follower = follower,
+            Err(error) => app.status_line = format!("could not follow stdout log: {error}"),
+        }
     }
     if app.stderr_follower.is_none() {
-        app.stderr_follower = FileFollower::from_start_with_limit(&stderr_path, max_line_bytes)
-            .ok()
-            .flatten();
+        match FileFollower::from_start_with_limit(&stderr_path, max_line_bytes) {
+            Ok(follower) => app.stderr_follower = follower,
+            Err(error) => app.status_line = format!("could not follow stderr log: {error}"),
+        }
     }
     if let Some(follower) = &mut app.stdout_follower {
         match follower.read_new_lines() {
-            Ok(lines) => append_log_lines(app, "stdout", lines),
+            Ok(lines) if app.log_follow => {
+                app.log_history_stale |= !lines.is_empty();
+                append_log_lines(app, "stdout", lines);
+            }
+            Ok(_) => {}
             Err(error) => app.status_line = format!("log follow error: {error}"),
         }
     }
     if let Some(follower) = &mut app.stderr_follower {
         match follower.read_new_lines() {
-            Ok(lines) => append_log_lines(app, "stderr", lines),
+            Ok(lines) if app.log_follow => {
+                app.log_history_stale |= !lines.is_empty();
+                append_log_lines(app, "stderr", lines);
+            }
+            Ok(_) => {}
             Err(error) => app.status_line = format!("log follow error: {error}"),
         }
     }
@@ -951,19 +1032,7 @@ fn refresh_log_followers(app: &mut App) {
 
 fn append_log_lines(app: &mut App, stream: &str, lines: Vec<String>) {
     for line in lines {
-        let mut rendered = format!(
-            "[{stream}] {}",
-            app.redactor
-                .redact_bounded(&line, app.runtime.config().logs.max_line_bytes)
-        );
-        if rendered.len() > MAX_LOG_VIEW_BYTES {
-            let mut boundary = MAX_LOG_VIEW_BYTES.saturating_sub(16);
-            while !rendered.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            rendered.truncate(boundary);
-            rendered.push_str("… [truncated]");
-        }
+        let rendered = render_log_line(app, stream, &line);
         while app.log_lines.len() >= MAX_LOG_LINES
             || app.log_bytes + rendered.len() > MAX_LOG_VIEW_BYTES
         {
@@ -977,6 +1046,169 @@ fn append_log_lines(app: &mut App, stream: &str, lines: Vec<String>) {
     }
 }
 
+fn prepend_log_lines(app: &mut App, stream: &str, lines: Vec<String>) -> usize {
+    let rendered = lines
+        .into_iter()
+        .map(|line| render_log_line(app, stream, &line))
+        .collect::<Vec<_>>();
+    let added = rendered.len();
+    for line in rendered.into_iter().rev() {
+        while app.log_lines.len() >= MAX_LOG_LINES
+            || app.log_bytes + line.len() > MAX_LOG_VIEW_BYTES
+        {
+            let Some(removed) = app.log_lines.pop_back() else {
+                break;
+            };
+            app.log_bytes = app.log_bytes.saturating_sub(removed.len());
+        }
+        app.log_bytes += line.len();
+        app.log_lines.push_front(line);
+    }
+    added
+}
+
+fn render_log_line(app: &App, stream: &str, line: &str) -> String {
+    let mut rendered = format!(
+        "[{stream}] {}",
+        app.redactor
+            .redact_bounded(line, app.runtime.config().logs.max_line_bytes)
+    );
+    if rendered.len() > MAX_LOG_VIEW_BYTES {
+        let mut boundary = MAX_LOG_VIEW_BYTES.saturating_sub(16);
+        while !rendered.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        rendered.truncate(boundary);
+        rendered.push_str("… [truncated]");
+    }
+    rendered
+}
+
+fn scroll_logs_up(app: &mut App, amount: usize) {
+    if app.log_follow && app.log_history_stale {
+        refresh_log_history_snapshot(app);
+    }
+    app.log_follow = false;
+    app.log_scroll_from_bottom = app.log_scroll_from_bottom.saturating_add(amount);
+    let near_oldest_loaded = app.log_scroll_from_bottom >= max_log_scroll(app);
+    if near_oldest_loaded {
+        load_older_logs(app);
+    }
+}
+
+fn scroll_logs_to_oldest(app: &mut App) {
+    if app.log_follow && app.log_history_stale {
+        refresh_log_history_snapshot(app);
+    }
+    app.log_follow = false;
+    load_older_logs(app);
+    app.log_scroll_from_bottom = max_log_scroll(app);
+}
+
+fn scroll_logs_down(app: &mut App, amount: usize) {
+    if app.log_scroll_from_bottom <= amount {
+        return_to_live_logs(app);
+    } else {
+        app.log_scroll_from_bottom -= amount;
+    }
+}
+
+fn load_older_logs(app: &mut App) {
+    if app.log_history_exhausted {
+        return;
+    }
+    let stdout = next_history_page(&mut app.stdout_history, &mut app.stdout_history_skip);
+    let stderr = next_history_page(&mut app.stderr_history, &mut app.stderr_history_skip);
+    let mut added = 0;
+    match stdout {
+        Ok(lines) => added += prepend_log_lines(app, "stdout", lines),
+        Err(error) => app.status_line = format!("log history error: {error}"),
+    }
+    match stderr {
+        Ok(lines) => added += prepend_log_lines(app, "stderr", lines),
+        Err(error) => app.status_line = format!("log history error: {error}"),
+    }
+    if added > 0 {
+        app.log_scroll_from_bottom = max_log_scroll(app);
+    }
+    app.log_history_exhausted = !app
+        .stdout_history
+        .as_ref()
+        .is_some_and(HistoryPager::has_more)
+        && !app
+            .stderr_history
+            .as_ref()
+            .is_some_and(HistoryPager::has_more);
+    if added == 0 && !app.log_history_exhausted {
+        app.status_line = "scanning older log data; scroll up again to continue".to_string();
+    }
+}
+
+fn max_log_scroll(app: &App) -> usize {
+    app.log_lines.len().saturating_sub(app.log_visible_height)
+}
+
+fn next_history_page(history: &mut Option<HistoryPager>, skip: &mut usize) -> Result<Vec<String>> {
+    let Some(history) = history else {
+        return Ok(Vec::new());
+    };
+    if *skip > 0 {
+        let skipped = history.next_older(*skip)?;
+        *skip = (*skip).saturating_sub(skipped.len());
+        if *skip > 0 || (skipped.is_empty() && history.has_more()) {
+            return Ok(Vec::new());
+        }
+    }
+    history.next_older(LOG_HISTORY_PAGE_LINES)
+}
+
+fn refresh_log_history_snapshot(app: &mut App) {
+    let Some(service) = app.log_service.clone() else {
+        return;
+    };
+    let Ok((stdout_path, stderr_path)) = app.runtime.log_paths(&service) else {
+        return;
+    };
+    let rotated_files = app.runtime.config().logs.rotated_files;
+    let max_line_bytes = app.runtime.config().logs.max_line_bytes;
+    let stdout = match app.stdout_follower.as_ref() {
+        Some(follower) => follower.history_pager(rotated_files, max_line_bytes),
+        None => HistoryPager::open(&stdout_path, rotated_files, max_line_bytes),
+    };
+    let stderr = match app.stderr_follower.as_ref() {
+        Some(follower) => follower.history_pager(rotated_files, max_line_bytes),
+        None => HistoryPager::open(&stderr_path, rotated_files, max_line_bytes),
+    };
+    match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => {
+            app.stdout_history = Some(stdout);
+            app.stderr_history = Some(stderr);
+            app.stdout_history_skip = app
+                .log_lines
+                .iter()
+                .filter(|line| line.starts_with("[stdout] "))
+                .count();
+            app.stderr_history_skip = app
+                .log_lines
+                .iter()
+                .filter(|line| line.starts_with("[stderr] "))
+                .count();
+            app.log_history_exhausted = false;
+            app.log_history_stale = false;
+        }
+        (Err(error), _) => app.status_line = format!("could not refresh stdout history: {error}"),
+        (_, Err(error)) => app.status_line = format!("could not refresh stderr history: {error}"),
+    }
+}
+
+fn return_to_live_logs(app: &mut App) {
+    let search = std::mem::take(&mut app.log_search);
+    let searching = app.log_searching;
+    open_logs(app);
+    app.log_search = search;
+    app.log_searching = searching;
+}
+
 fn clear_log_view(app: &mut App) {
     app.log_lines.clear();
     app.log_bytes = 0;
@@ -985,21 +1217,33 @@ fn clear_log_view(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::config::{Config, Loaded, TemplateConfig};
+    use crate::config::{Config, Loaded, ServiceConfig, TemplateConfig};
     use crate::core::state::{PortState, ProcessState};
 
     use super::*;
 
-    fn empty_app() -> (App, PathBuf) {
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_root() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("hum-tui-test-{}-{unique}", std::process::id()));
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "hum-tui-test-{}-{unique}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn empty_app() -> (App, PathBuf) {
+        let root = test_root();
         let loaded = Loaded {
             config: Config {
                 version: 2,
@@ -1027,6 +1271,35 @@ mod tests {
     fn cleanup(app: App, root: PathBuf) {
         drop(app);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn logs_app() -> (App, PathBuf) {
+        let root = test_root();
+        let loaded = Loaded {
+            config: Config {
+                version: 2,
+                project: Some("demo".to_string()),
+                services: HashMap::from([("api".to_string(), ServiceConfig::default())]),
+                templates: HashMap::from([(
+                    "logs".to_string(),
+                    TemplateConfig {
+                        services: vec!["api".to_string()],
+                    },
+                )]),
+                ..Config::default()
+            },
+            base_path: root.join("hum.yaml"),
+            local_path: None,
+            root_dir: root.clone(),
+        };
+        let runtime = DetachedRuntime::with_state_root(
+            "demo".to_string(),
+            loaded,
+            HashMap::new(),
+            root.join("state"),
+        )
+        .unwrap();
+        (App::new(Arc::new(runtime), Some("logs".to_string())), root)
     }
 
     #[test]
@@ -1132,6 +1405,79 @@ mod tests {
             },
         );
         assert_eq!(app.statuses["worker"].health, HealthState::Unchecked);
+        cleanup(app, root);
+    }
+
+    #[test]
+    fn log_view_scrolls_into_disk_history_and_end_returns_live() {
+        let (mut app, root) = logs_app();
+        let (stdout, _stderr) = app.runtime.log_paths("api").unwrap();
+        fs::create_dir_all(stdout.parent().unwrap()).unwrap();
+        let content = (0..300)
+            .map(|index| format!("line-{index}\n"))
+            .collect::<String>();
+        fs::write(&stdout, content).unwrap();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel();
+        let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
+
+        open_logs(&mut app);
+        assert!(app.log_follow);
+        assert_eq!(app.log_lines.len(), INITIAL_LOG_LINES);
+
+        let mut stdout_file = OpenOptions::new().append(true).open(&stdout).unwrap();
+        write!(
+            stdout_file,
+            "{}",
+            (300..700)
+                .map(|index| format!("line-{index}\n"))
+                .collect::<String>()
+        )
+        .unwrap();
+        drop(stdout_file);
+        refresh_log_followers(&mut app);
+        assert_eq!(app.log_lines.len(), MAX_LOG_LINES);
+        assert!(app.log_lines.back().unwrap().contains("line-699"));
+
+        handle_key(&mut app, KeyCode::Home, &action_tx, &doctor_tx);
+        assert!(!app.log_follow);
+        assert_eq!(app.log_scroll_from_bottom, max_log_scroll(&app));
+        assert!(app.log_lines.iter().any(|line| line.contains("line-100")));
+        let oldest_offset = app.log_scroll_from_bottom;
+        handle_key(&mut app, KeyCode::PageDown, &action_tx, &doctor_tx);
+        assert_eq!(
+            app.log_scroll_from_bottom,
+            oldest_offset - LOG_SCROLL_PAGE_LINES
+        );
+
+        let mut stdout_file = OpenOptions::new().append(true).open(&stdout).unwrap();
+        writeln!(stdout_file, "line-700").unwrap();
+        drop(stdout_file);
+        refresh_log_followers(&mut app);
+        assert!(app.log_lines.iter().all(|line| !line.contains("line-700")));
+
+        app.log_search = "line-29".to_string();
+        handle_key(&mut app, KeyCode::End, &action_tx, &doctor_tx);
+        assert!(app.log_follow);
+        assert_eq!(app.log_scroll_from_bottom, 0);
+        assert_eq!(app.log_search, "line-29");
+        assert!(app.log_lines.back().unwrap().contains("line-700"));
+        cleanup(app, root);
+    }
+
+    #[test]
+    fn log_view_keeps_its_memory_bounds() {
+        let (mut app, root) = empty_app();
+        append_log_lines(
+            &mut app,
+            "stdout",
+            (0..(MAX_LOG_LINES + 100))
+                .map(|index| format!("line-{index}"))
+                .collect(),
+        );
+
+        assert_eq!(app.log_lines.len(), MAX_LOG_LINES);
+        assert!(app.log_bytes <= MAX_LOG_VIEW_BYTES);
+        assert!(app.log_lines.front().unwrap().contains("line-100"));
         cleanup(app, root);
     }
 }

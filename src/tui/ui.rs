@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use super::{App, Mode};
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -315,10 +315,10 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
+fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let popup = centered_rect(90, 80, area);
     f.render_widget(Clear, popup);
-    let Some(name) = app.selected_name() else {
+    let Some(name) = app.log_service.as_deref() else {
         return;
     };
     let lines: Vec<Line> = app
@@ -335,14 +335,22 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
         format!(" filter: /{} ", app.log_search)
     };
     let visible_height = usize::from(popup.height.saturating_sub(2));
-    let scroll = lines
-        .len()
-        .saturating_sub(visible_height)
+    app.log_visible_height = visible_height;
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let from_bottom = app.log_scroll_from_bottom.min(max_scroll);
+    let scroll = max_scroll
+        .saturating_sub(from_bottom)
         .min(usize::from(u16::MAX)) as u16;
+    let state = if app.log_follow { "LIVE" } else { "PAUSED" };
+    let history = if app.log_history_exhausted {
+        " oldest loaded"
+    } else {
+        " Home: older"
+    };
     f.render_widget(
         Paragraph::new(lines).scroll((scroll, 0)).block(
             Block::default().borders(Borders::ALL).title(format!(
-                " {name} — logs (/: search, c: clear view, esc: close){search}"
+                " {name} — logs [{state}] (j/k, PgUp/PgDn, End: live,{history}, /: search, c: clear, esc: close){search}"
             )),
         ),
         popup,

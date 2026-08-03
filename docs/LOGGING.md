@@ -55,7 +55,11 @@ hum compri all-services logs api --lines 100 --follow
 ```
 
 The CLI reads at most 512 KiB per stream for an initial tail and marks a tail
-that had to be truncated. In the TUI, `l` opens a byte-bounded incremental view,
-`/` searches the current view, and `c` clears only the view. Neither action
-deletes or truncates persistent files; cleanup is exclusively controlled by the
-rotation and retention policy above.
+that had to be truncated. In the TUI, `l` opens a byte-bounded incremental view.
+Use the arrows or `j`/`k` to scroll, Page Up/Page Down for larger steps, `Home`
+to progressively load older retained pages from disk, and `End` to return to the
+live tail. Scrolling up pauses live follow so incoming output cannot move the
+viewport; returning to the bottom reloads the current tail. `/` searches the
+current view, and `c` clears only the view. None of these actions deletes or
+truncates persistent files; cleanup is exclusively controlled by the rotation
+and retention policy above.

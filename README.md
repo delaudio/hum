@@ -104,15 +104,17 @@ failure behavior.
 
 The TUI consumes this registry in a single non-overlapping background poll,
 detects processes started or stopped by other invocations, and reads persistent
-log files incrementally into a bounded 500-line view. Closing it leaves all
-services running unless the quit dialog's explicit "stop template and quit"
+log files incrementally into a bounded 500-line view. Its log window supports
+scrolling, pauses live follow away from the bottom, and pages older retained
+history directly from disk; `End` returns to the current tail. Closing it leaves
+all services running unless the quit dialog's explicit "stop template and quit"
 choice is selected; the view also has a 4 MiB byte ceiling. Doctor runs outside
 the input/render loop and distinguishes managed listeners, foreign port owners,
 and stale registry entries. The details view includes PID/PGID, port and health
 state, command, cwd, persistent log paths, and the last exit code when the shell
 wrapper can observe it. An `exec` replacement or `SIGKILL` remains explicitly
-unavailable because no resident hum daemon waits on detached services. Port polling uses
-bounded TCP connections; `lsof` is reserved
+unavailable because no resident hum daemon waits on detached services. Port
+polling uses bounded TCP connections; `lsof` is reserved
 for explicit conflict diagnostics. Poll intervals, resource reuse, and the
 ten-service CPU/RSS budget are documented in
 [`docs/POLLING.md`](docs/POLLING.md).
