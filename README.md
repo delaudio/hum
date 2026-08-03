@@ -11,12 +11,12 @@ hum compri all-services start
 
 The command starts the selected services in independent process groups, writes
 their logs and runtime metadata to disk, and exits. There is no resident `hum`
-daemon. Later CLI invocations and the TUI reconcile that metadata with the
-operating system.
+daemon. Later CLI invocations reconcile that metadata with the operating
+system; TUI integration is tracked separately.
 
-> Project/template selection, v2 configuration, and detached `start` are
-> implemented. Cross-invocation `status`, `stop`, `restart`, `logs`, and TUI
-> reconciliation are the next migration step. Track progress in
+> Project/template selection, v2 configuration, detached `start`, and
+> cross-invocation `status`, `stop`, `restart`, and `logs` are implemented.
+> TUI reconciliation is the next migration step. Track progress in
 > [epic #16](https://github.com/delaudio/hum/issues/16).
 
 ## Concepts
@@ -33,7 +33,7 @@ hum <project> <template> start
 hum <project> <template> stop
 hum <project> <template> restart
 hum <project> <template> status
-hum <project> <template> logs [service] [--follow]
+hum <project> <template> logs <service> [--follow]
 hum <project> <template> doctor
 hum <project> <template> tui
 ```
@@ -86,13 +86,16 @@ identity is verified before signals are sent. A random, inherited identity lock
 keeps the whole process group recognizable even if its original shell exits.
 
 Project operations are serialized with `project.lock`; a repeated or concurrent
-`start` is idempotent. If a multi-service start partially fails, only processes
-created by that invocation are rolled back. `--detach` remains accepted as a
-deprecated no-op because detached execution is now the default.
+`start` is idempotent. `status`, `restart`, and `stop` reconcile the same state
+across independent CLI invocations, while `logs` tails the persistent stdout and
+stderr files. Stop order is the reverse dependency order and its grace period is
+configurable with `--timeout`. If a multi-service start partially fails, only
+processes created by that invocation are rolled back. `--detach` remains accepted
+as a deprecated no-op because detached execution is now the default.
 
-The TUI and cross-invocation commands still need to consume this registry. Port
-polling already uses bounded TCP connections; `lsof` is reserved for ownership
-checks and conflict diagnostics.
+The TUI still needs to consume this registry. Port polling already uses bounded
+TCP connections; `lsof` is reserved for ownership checks and conflict
+diagnostics.
 
 ## Development
 

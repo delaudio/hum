@@ -101,6 +101,17 @@ pub fn belongs_to_process_tree(pid: u32, root_pid: u32) -> bool {
     false
 }
 
+pub fn belongs_to_process_group(pid: u32, pgid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getpgid(pid as i32) == pgid }
+    }
+    #[cfg(not(unix))]
+    {
+        pid as i32 == pgid
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

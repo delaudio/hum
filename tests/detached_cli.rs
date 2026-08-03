@@ -54,8 +54,8 @@ templates:
     )
     .unwrap();
 
-    let first = start_command(&config, &state).spawn().unwrap();
-    let second = start_command(&config, &state).spawn().unwrap();
+    let first = hum_command(&config, &state, &["start"]).spawn().unwrap();
+    let second = hum_command(&config, &state, &["start"]).spawn().unwrap();
     let first = first.wait_with_output().unwrap();
     let second = second.wait_with_output().unwrap();
     assert_success(&first);
@@ -86,27 +86,95 @@ templates:
     thread::sleep(Duration::from_millis(250));
     assert!(fs::metadata(&stdout_log).unwrap().len() > initial_len);
 
-    unsafe {
-        assert_eq!(libc::kill(-first_pgid, libc::SIGKILL), 0);
-    }
-    wait_for_group_exit(first_pgid);
+    let status = hum_command(&config, &state, &["status"]).output().unwrap();
+    assert_success(&status);
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(status_text.contains("worker"));
+    assert!(status_text.contains("running"));
+    assert!(status_text.contains(&first_pid.to_string()));
 
-    let restarted = start_command(&config, &state).output().unwrap();
+    let logs = hum_command(&config, &state, &["logs", "worker", "-n", "20"])
+        .output()
+        .unwrap();
+    assert_success(&logs);
+    assert!(String::from_utf8_lossy(&logs.stdout).contains("cli-detached-ok"));
+
+    let restarted = hum_command(&config, &state, &["restart", "--timeout", "1s"])
+        .output()
+        .unwrap();
     assert_success(&restarted);
-    assert!(String::from_utf8_lossy(&restarted.stdout).contains("✓ started: worker"));
-    let second_entry = read_entry(&entry_path);
-    let second_pgid = second_entry["pgid"].as_i64().unwrap() as i32;
-    assert_ne!(second_entry["runtime_token"], first_entry["runtime_token"]);
-    cleanup.process_groups.push(second_pgid);
+    assert!(String::from_utf8_lossy(&restarted.stdout).contains("✓ restarted: worker"));
+    let restarted_entry = read_entry(&entry_path);
+    let restarted_pgid = restarted_entry["pgid"].as_i64().unwrap() as i32;
+    assert_ne!(
+        restarted_entry["runtime_token"],
+        first_entry["runtime_token"]
+    );
+    cleanup.process_groups.push(restarted_pgid);
+
+    unsafe {
+        assert_eq!(libc::kill(-restarted_pgid, libc::SIGKILL), 0);
+    }
+    wait_for_group_exit(restarted_pgid);
+
+    let stale_status = hum_command(&config, &state, &["status"]).output().unwrap();
+    assert_success(&stale_status);
+    let stale_status_text = String::from_utf8_lossy(&stale_status.stdout);
+    assert!(stale_status_text.contains("missing"));
+    assert!(stale_status_text.contains("stale runtime entry removed"));
+    assert!(!entry_path.exists());
+
+    let stale_replaced = hum_command(&config, &state, &["start"]).output().unwrap();
+    assert_success(&stale_replaced);
+    assert!(String::from_utf8_lossy(&stale_replaced.stdout).contains("✓ started: worker"));
+    let replacement_entry = read_entry(&entry_path);
+    let replacement_pgid = replacement_entry["pgid"].as_i64().unwrap() as i32;
+    assert_ne!(
+        replacement_entry["runtime_token"],
+        restarted_entry["runtime_token"]
+    );
+    cleanup.process_groups.push(replacement_pgid);
+
+    let stopped = hum_command(&config, &state, &["stop", "--timeout", "1s"])
+        .output()
+        .unwrap();
+    assert_success(&stopped);
+    assert!(String::from_utf8_lossy(&stopped.stdout).contains("✓ stopped: worker"));
+    assert!(!entry_path.exists());
+
+    let already_stopped = hum_command(&config, &state, &["stop"]).output().unwrap();
+    assert_success(&already_stopped);
+    assert!(String::from_utf8_lossy(&already_stopped.stdout).contains("✓ already stopped: worker"));
+
+    let final_status = hum_command(&config, &state, &["status"]).output().unwrap();
+    assert_success(&final_status);
+    assert!(String::from_utf8_lossy(&final_status.stdout).contains("missing"));
+
+    let started_for_failure = hum_command(&config, &state, &["start"]).output().unwrap();
+    assert_success(&started_for_failure);
+    let failure_entry = read_entry(&entry_path);
+    cleanup
+        .process_groups
+        .push(failure_entry["pgid"].as_i64().unwrap() as i32);
+    fs::remove_file(failure_entry["identity_file"].as_str().unwrap()).unwrap();
+    let failed_restart = hum_command(&config, &state, &["restart", "--timeout", "10ms"])
+        .output()
+        .unwrap();
+    assert_eq!(failed_restart.status.code(), Some(7));
+    let failure_text = String::from_utf8_lossy(&failed_restart.stderr);
+    assert!(failure_text.contains("project 'e2e' template 'all'"));
+    assert!(failure_text.contains("worker"));
+    assert!(entry_path.exists());
 }
 
-fn start_command(config: &Path, state: &Path) -> Command {
+fn hum_command(config: &Path, state: &Path, action: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hum"));
     command
         .env("XDG_STATE_HOME", state)
         .arg("--config")
         .arg(config)
-        .args(["e2e", "all", "start"])
+        .args(["e2e", "all"])
+        .args(action)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command

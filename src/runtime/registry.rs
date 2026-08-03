@@ -319,13 +319,10 @@ pub fn inspect_identity(entry: &RuntimeEntry) -> IdentityStatus {
     }
 
     match identity_lock_is_held(&entry.identity_file) {
-        Ok(true) if group_exists => return IdentityStatus::Matching,
-        Ok(true) => {
-            return IdentityStatus::Mismatch(format!(
-                "runtime identity lock is held but process group {} is missing",
-                entry.pgid
-            ));
-        }
+        // The group can disappear from a process snapshot just before its
+        // final inherited descriptor closes. Keep polling the lock instead of
+        // deleting the registry during that exit window.
+        Ok(true) => return IdentityStatus::Matching,
         Ok(false) => {}
         Err(error) => {
             return IdentityStatus::Mismatch(format!(

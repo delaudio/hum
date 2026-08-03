@@ -51,7 +51,6 @@ impl ServiceRuntime {
 /// CLI/TUI to render.
 #[derive(Debug, Clone)]
 pub struct ServiceView {
-    pub name: String,
     pub process: ProcessState,
     pub port_state: PortState,
     pub health: HealthState,
@@ -111,7 +110,6 @@ impl Manager {
         let state = rt.state();
         let presentation = state.presentation();
         Some(ServiceView {
-            name: name.to_string(),
             process: state.process,
             port_state: state.port,
             health: state.health,
@@ -125,13 +123,6 @@ impl Manager {
             health_detail: state.health_detail,
             last_error: state.last_error,
         })
-    }
-
-    pub fn all_views(&self) -> Vec<ServiceView> {
-        self.service_names()
-            .iter()
-            .filter_map(|n| self.view(n))
-            .collect()
     }
 
     fn repo_root(&self, repo: &str) -> Option<PathBuf> {

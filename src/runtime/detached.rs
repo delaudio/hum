@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Config, HealthcheckConfig, Loaded, ReadyMode};
 use crate::core::graph;
+use crate::core::state::{HealthState, PortState, ProcessState};
 
 use super::health;
 use super::portcheck;
@@ -23,6 +24,44 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 pub struct StartReport {
     pub started: Vec<String>,
     pub already_running: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct StopReport {
+    pub stopped: Vec<String>,
+    pub already_stopped: Vec<String>,
+    pub stale_removed: Vec<String>,
+    pub blocked: Vec<String>,
+    pub failures: Vec<StopFailure>,
+}
+
+impl StopReport {
+    pub fn succeeded(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub struct StopFailure {
+    pub service: String,
+    pub detail: String,
+}
+
+#[derive(Debug)]
+pub struct RestartReport {
+    pub stop: StopReport,
+    pub start: Option<StartReport>,
+}
+
+#[derive(Debug)]
+pub struct DetachedServiceStatus {
+    pub name: String,
+    pub process: ProcessState,
+    pub port: PortState,
+    pub health: HealthState,
+    pub configured_port: Option<u16>,
+    pub pid: Option<u32>,
+    pub detail: Option<String>,
 }
 
 pub struct DetachedRuntime {
@@ -80,11 +119,67 @@ impl DetachedRuntime {
         self.start_ordered(&order).await
     }
 
+    pub async fn status_template(&self, template: &str) -> Result<Vec<DetachedServiceStatus>> {
+        let order = graph::services_for_template(&self.config, template)?;
+        self.status_ordered(&order).await
+    }
+
+    pub async fn stop_template(&self, template: &str, grace: Duration) -> Result<StopReport> {
+        let order = graph::stop_order(&graph::services_for_template(&self.config, template)?);
+        self.stop_ordered(&order, grace).await
+    }
+
+    pub async fn stop_services(&self, services: &[String], grace: Duration) -> Result<StopReport> {
+        let requested = services.iter().cloned().collect::<HashSet<_>>();
+        let start_order = graph::resolve_start_order(&self.config, services)?;
+        let order = graph::stop_order(
+            &start_order
+                .into_iter()
+                .filter(|name| requested.contains(name))
+                .collect::<Vec<_>>(),
+        );
+        self.stop_ordered(&order, grace).await
+    }
+
+    pub async fn restart_template(&self, template: &str, grace: Duration) -> Result<RestartReport> {
+        let start_order = graph::services_for_template(&self.config, template)?;
+        let stop_order = graph::stop_order(&start_order);
+        self.restart_ordered(&stop_order, &start_order, grace).await
+    }
+
+    pub async fn restart_services(
+        &self,
+        services: &[String],
+        grace: Duration,
+    ) -> Result<RestartReport> {
+        let start_order = graph::resolve_start_order(&self.config, services)?;
+        let requested = services.iter().cloned().collect::<HashSet<_>>();
+        let stop_order = graph::stop_order(
+            &start_order
+                .iter()
+                .filter(|name| requested.contains(*name))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        self.restart_ordered(&stop_order, &start_order, grace).await
+    }
+
+    pub fn log_paths(&self, service: &str) -> Result<(PathBuf, PathBuf)> {
+        if !self.config.services.contains_key(service) {
+            anyhow::bail!("unknown service '{service}'");
+        }
+        Ok(self.registry.log_paths(service))
+    }
+
     async fn start_ordered(&self, order: &[String]) -> Result<StartReport> {
         let registry = self.registry.clone();
         let _lock = tokio::task::spawn_blocking(move || registry.lock())
             .await
             .context("project lock task failed")??;
+        self.start_ordered_locked(order).await
+    }
+
+    async fn start_ordered_locked(&self, order: &[String]) -> Result<StartReport> {
         let mut report = StartReport::default();
         let mut started_entries = Vec::new();
         let mut available = HashSet::new();
@@ -128,6 +223,231 @@ impl DetachedRuntime {
         }
 
         Ok(report)
+    }
+
+    async fn status_ordered(&self, order: &[String]) -> Result<Vec<DetachedServiceStatus>> {
+        let registry = self.registry.clone();
+        let project_lock = tokio::task::spawn_blocking(move || registry.lock())
+            .await
+            .context("project lock task failed")??;
+        let mut snapshots = Vec::with_capacity(order.len());
+        for name in order {
+            let snapshot = match self
+                .registry
+                .load(name)
+                .with_context(|| format!("service '{name}' runtime entry could not be read"))?
+            {
+                None => StatusSnapshot {
+                    entry: None,
+                    process: ProcessState::Missing,
+                    detail: None,
+                },
+                Some(entry) => match inspect_identity(&entry) {
+                    IdentityStatus::Matching => StatusSnapshot {
+                        entry: Some(entry),
+                        process: ProcessState::Running,
+                        detail: None,
+                    },
+                    IdentityStatus::Missing => {
+                        self.registry.remove(name).with_context(|| {
+                            format!("service '{name}' stale runtime entry could not be removed")
+                        })?;
+                        StatusSnapshot {
+                            entry: None,
+                            process: ProcessState::Missing,
+                            detail: Some("stale runtime entry removed".to_string()),
+                        }
+                    }
+                    IdentityStatus::Mismatch(reason) => StatusSnapshot {
+                        entry: None,
+                        process: ProcessState::Missing,
+                        detail: Some(format!(
+                            "runtime identity mismatch: {reason}; verify the process before removing its registry entry"
+                        )),
+                    },
+                },
+            };
+            snapshots.push((name.clone(), snapshot));
+        }
+        drop(project_lock);
+
+        let mut statuses = Vec::with_capacity(snapshots.len());
+        for (name, snapshot) in snapshots {
+            let service = self
+                .config
+                .services
+                .get(&name)
+                .ok_or_else(|| anyhow!("unknown service '{name}'"))?;
+            let port = self.observe_port(service.port, snapshot.entry.as_ref());
+            let health = match service.healthcheck.as_ref() {
+                Some(check) if health::check_once(check).await.is_ok() => HealthState::Healthy,
+                Some(_) => HealthState::Unhealthy,
+                None => HealthState::Unchecked,
+            };
+            statuses.push(DetachedServiceStatus {
+                name,
+                process: snapshot.process,
+                port,
+                health,
+                configured_port: service.port,
+                pid: snapshot.entry.as_ref().map(|entry| entry.pid),
+                detail: snapshot.detail,
+            });
+        }
+        Ok(statuses)
+    }
+
+    async fn stop_ordered(&self, order: &[String], grace: Duration) -> Result<StopReport> {
+        let registry = self.registry.clone();
+        let _lock = tokio::task::spawn_blocking(move || registry.lock())
+            .await
+            .context("project lock task failed")??;
+        self.stop_ordered_locked(order, grace).await
+    }
+
+    async fn stop_ordered_locked(&self, order: &[String], grace: Duration) -> Result<StopReport> {
+        let mut report = StopReport::default();
+        for (index, name) in order.iter().enumerate() {
+            let entry = match self.registry.load(name) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    report.failures.push(StopFailure {
+                        service: name.clone(),
+                        detail: format!(
+                            "project '{}' service '{name}' runtime entry could not be read: {error:#}; validate or repair its registry entry before retrying",
+                            self.project
+                        ),
+                    });
+                    report.blocked.extend_from_slice(&order[index + 1..]);
+                    break;
+                }
+            };
+            let Some(entry) = entry else {
+                report.already_stopped.push(name.clone());
+                continue;
+            };
+            match inspect_identity(&entry) {
+                IdentityStatus::Missing => match self.registry.remove(name) {
+                    Ok(()) => report.stale_removed.push(name.clone()),
+                    Err(error) => {
+                        report.failures.push(StopFailure {
+                                service: name.clone(),
+                                detail: format!(
+                                    "project '{}' service '{name}' stopped but stale registry cleanup failed: {error:#}; repair the runtime directory before retrying",
+                                    self.project
+                                ),
+                            });
+                        report.blocked.extend_from_slice(&order[index + 1..]);
+                        break;
+                    }
+                },
+                IdentityStatus::Mismatch(reason) => {
+                    report.failures.push(StopFailure {
+                        service: name.clone(),
+                        detail: format!(
+                            "project '{}' service '{name}' identity mismatch: {reason}; verify the PID/PGID and retry only after correcting the runtime entry",
+                            self.project
+                        ),
+                    });
+                    report.blocked.extend_from_slice(&order[index + 1..]);
+                    break;
+                }
+                IdentityStatus::Matching => match process::stop_detached(&entry, grace).await {
+                    Ok(
+                        outcome @ (DetachedStopOutcome::Stopped
+                        | DetachedStopOutcome::AlreadyMissing),
+                    ) => match self.registry.remove(name) {
+                        Ok(()) => match outcome {
+                            DetachedStopOutcome::Stopped => report.stopped.push(name.clone()),
+                            DetachedStopOutcome::AlreadyMissing => {
+                                report.stale_removed.push(name.clone())
+                            }
+                            DetachedStopOutcome::IdentityMismatch(_) => unreachable!(),
+                        },
+                        Err(error) => {
+                            report.failures.push(StopFailure {
+                                    service: name.clone(),
+                                    detail: format!(
+                                        "project '{}' service '{name}' exited but registry cleanup failed: {error:#}; repair the runtime directory before retrying",
+                                        self.project
+                                    ),
+                                });
+                            report.blocked.extend_from_slice(&order[index + 1..]);
+                            break;
+                        }
+                    },
+                    Ok(DetachedStopOutcome::IdentityMismatch(reason)) => {
+                        report.failures.push(StopFailure {
+                            service: name.clone(),
+                            detail: format!(
+                                "project '{}' service '{name}' changed identity while stopping: {reason}; inspect the current process before retrying",
+                                self.project
+                            ),
+                        });
+                        report.blocked.extend_from_slice(&order[index + 1..]);
+                        break;
+                    }
+                    Err(error) => {
+                        report.failures.push(StopFailure {
+                            service: name.clone(),
+                            detail: format!(
+                                "project '{}' service '{name}' could not be stopped: {error:#}; inspect its process group and retry",
+                                self.project
+                            ),
+                        });
+                        report.blocked.extend_from_slice(&order[index + 1..]);
+                        break;
+                    }
+                },
+            }
+        }
+        Ok(report)
+    }
+
+    async fn restart_ordered(
+        &self,
+        stop_order: &[String],
+        start_order: &[String],
+        grace: Duration,
+    ) -> Result<RestartReport> {
+        let registry = self.registry.clone();
+        let _lock = tokio::task::spawn_blocking(move || registry.lock())
+            .await
+            .context("project lock task failed")??;
+        let stop = self.stop_ordered_locked(stop_order, grace).await?;
+        if !stop.succeeded() {
+            return Ok(RestartReport { stop, start: None });
+        }
+        let start = self.start_ordered_locked(start_order).await?;
+        Ok(RestartReport {
+            stop,
+            start: Some(start),
+        })
+    }
+
+    fn observe_port(&self, port: Option<u16>, entry: Option<&RuntimeEntry>) -> PortState {
+        let Some(port) = port else {
+            return PortState::Unknown;
+        };
+        match portcheck::probe_port(port) {
+            portcheck::PortProbe::Closed => PortState::Closed,
+            portcheck::PortProbe::Unknown => PortState::Unknown,
+            portcheck::PortProbe::Listening => {
+                let occupant = portcheck::identify_occupant(port);
+                if entry.is_some_and(|entry| {
+                    occupant
+                        .pid
+                        .is_some_and(|pid| portcheck::belongs_to_process_group(pid, entry.pgid))
+                }) {
+                    PortState::Listening
+                } else {
+                    PortState::OccupiedByOther {
+                        pid: occupant.pid,
+                        process_name: occupant.process_name,
+                    }
+                }
+            }
+        }
     }
 
     async fn start_one(&self, name: &str) -> Result<StartOne> {
@@ -353,6 +673,12 @@ impl DetachedRuntime {
 enum StartOne {
     Started(Box<RuntimeEntry>),
     AlreadyRunning,
+}
+
+struct StatusSnapshot {
+    entry: Option<RuntimeEntry>,
+    process: ProcessState,
+    detail: Option<String>,
 }
 
 fn ensure_matching(entry: &RuntimeEntry, name: &str) -> Result<()> {
@@ -614,7 +940,12 @@ mod tests {
         .unwrap();
         runtime.start_template("all").await.unwrap();
         let first = runtime.registry().load("server").unwrap().unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..40 {
+            if inspect_identity(&first) == IdentityStatus::Missing {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(inspect_identity(&first), IdentityStatus::Missing);
 
         let report = runtime.start_template("all").await.unwrap();
@@ -649,6 +980,125 @@ mod tests {
         assert!(runtime.start_template("all").await.is_err());
         assert!(runtime.registry().load("server").unwrap().is_none());
         assert!(runtime.registry().load("broken").unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn template_stop_uses_reverse_dependency_order() {
+        let root = temp_root("stop-order");
+        let state = root.join("state");
+        let mut loaded = loaded(&root, "while :; do sleep 1; done");
+        loaded.config.services.clear();
+        loaded.config.services.insert(
+            "database".to_string(),
+            ServiceConfig {
+                command: Some("while :; do sleep 1; done".to_string()),
+                ..ServiceConfig::default()
+            },
+        );
+        loaded.config.services.insert(
+            "api".to_string(),
+            ServiceConfig {
+                command: Some("while :; do sleep 1; done".to_string()),
+                depends_on: vec!["database".to_string()],
+                ..ServiceConfig::default()
+            },
+        );
+        loaded.config.templates.get_mut("all").unwrap().services = vec!["api".to_string()];
+        let runtime =
+            DetachedRuntime::with_state_root("demo".to_string(), loaded, HashMap::new(), state)
+                .unwrap();
+
+        runtime.start_template("all").await.unwrap();
+        let report = runtime
+            .stop_template("all", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(report.succeeded());
+        assert_eq!(report.stopped, ["api", "database"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_dependent_stop_does_not_stop_its_dependency() {
+        let root = temp_root("stop-blocks-dependency");
+        let state = root.join("state");
+        let mut loaded = loaded(&root, "while :; do sleep 1; done");
+        loaded.config.services.clear();
+        for (name, dependencies) in [
+            ("database", Vec::new()),
+            ("api", vec!["database".to_string()]),
+        ] {
+            loaded.config.services.insert(
+                name.to_string(),
+                ServiceConfig {
+                    command: Some("while :; do sleep 1; done".to_string()),
+                    depends_on: dependencies,
+                    ..ServiceConfig::default()
+                },
+            );
+        }
+        loaded.config.templates.get_mut("all").unwrap().services = vec!["api".to_string()];
+        let runtime =
+            DetachedRuntime::with_state_root("demo".to_string(), loaded, HashMap::new(), state)
+                .unwrap();
+        runtime.start_template("all").await.unwrap();
+        let api = runtime.registry().load("api").unwrap().unwrap();
+        let database = runtime.registry().load("database").unwrap().unwrap();
+        fs::remove_file(&api.identity_file).unwrap();
+
+        let report = runtime
+            .stop_template("all", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(!report.succeeded());
+        assert_eq!(report.failures[0].service, "api");
+        assert_eq!(report.blocked, ["database"]);
+        assert_eq!(inspect_identity(&database), IdentityStatus::Matching);
+
+        process::abort_unregistered(process::DetachedProcess {
+            pid: api.pid,
+            pgid: api.pgid,
+        })
+        .unwrap();
+        process::abort_unregistered(process::DetachedProcess {
+            pid: database.pid,
+            pgid: database.pgid,
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        runtime.registry().remove("api").unwrap();
+        runtime.registry().remove("database").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_stop_confirms_process_group_exit_before_registry_removal() {
+        let root = temp_root("kill-confirmation");
+        let state = root.join("state");
+        let runtime = DetachedRuntime::with_state_root(
+            "demo".to_string(),
+            loaded(&root, "trap '' TERM; while :; do sleep 1; done"),
+            HashMap::new(),
+            state,
+        )
+        .unwrap();
+        runtime.start_template("all").await.unwrap();
+        let entry = runtime.registry().load("server").unwrap().unwrap();
+
+        let report = runtime
+            .stop_template("all", Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(report.succeeded());
+        let system = sysinfo::System::new_all();
+        assert!(!system.processes().values().any(|process| {
+            (unsafe { libc::getpgid(process.pid().as_u32() as i32) }) == entry.pgid
+        }));
+        assert!(runtime.registry().load("server").unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
     }
 }

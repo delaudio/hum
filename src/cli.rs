@@ -66,9 +66,19 @@ pub enum Command {
         detach: bool,
     },
     /// Stop the selected template or listed services
-    Stop { services: Vec<String> },
+    Stop {
+        services: Vec<String>,
+        /// Grace period before SIGKILL
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: std::time::Duration,
+    },
     /// Restart the selected template or listed services
-    Restart { services: Vec<String> },
+    Restart {
+        services: Vec<String>,
+        /// Grace period before SIGKILL during the stop phase
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: std::time::Duration,
+    },
     /// Show status for services in the selected template
     Status,
     /// Show captured logs for a service
@@ -201,42 +211,113 @@ pub async fn run(cli: Cli) -> i32 {
             }
         }
 
-        Command::Stop { services } => {
-            let manager = Manager::with_env(loaded, env_overrides);
-            let targets = match selected_services(&manager, &template, services) {
-                Ok(targets) => targets,
-                Err(code) => return code,
+        Command::Stop { services, timeout } => {
+            if let Err(code) = validate_services(&loaded.config, &services) {
+                return code;
+            }
+            let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ project '{project}' template '{template}': {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
             };
-            for name in &targets {
-                if let Err(error) = manager.stop_service(name).await {
-                    eprintln!("✗ failed to stop '{name}': {error}");
-                    return EXIT_STOP_FAILED;
+            let report = if services.is_empty() {
+                runtime.stop_template(&template, timeout).await
+            } else {
+                runtime.stop_services(&services, timeout).await
+            };
+            match report {
+                Ok(report) => print_stop_report(&project, &template, report),
+                Err(error) => {
+                    eprintln!(
+                        "✗ project '{project}' template '{template}' stop failed: {error:#}\n  → inspect status and retry the failed service"
+                    );
+                    EXIT_STOP_FAILED
                 }
             }
-            println!("✓ stopped: {}", targets.join(", "));
-            EXIT_OK
         }
 
-        Command::Restart { services } => {
-            let manager = Manager::with_env(loaded, env_overrides);
-            let targets = match selected_services(&manager, &template, services) {
-                Ok(targets) => targets,
-                Err(code) => return code,
+        Command::Restart { services, timeout } => {
+            if let Err(code) = validate_services(&loaded.config, &services) {
+                return code;
+            }
+            let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ project '{project}' template '{template}': {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
             };
-            for name in &targets {
-                if let Err(error) = manager.restart_service(name).await {
-                    eprintln!("✗ failed to restart '{name}': {error}");
-                    return EXIT_START_FAILED;
+            let report = if services.is_empty() {
+                runtime.restart_template(&template, timeout).await
+            } else {
+                runtime.restart_services(&services, timeout).await
+            };
+            match report {
+                Ok(report) => {
+                    if !report.stop.succeeded() {
+                        eprintln!(
+                            "✗ project '{project}' template '{template}' restart aborted during stop; no services were started"
+                        );
+                        return print_stop_report(&project, &template, report.stop);
+                    }
+                    if !report.stop.stale_removed.is_empty() {
+                        println!(
+                            "✓ removed stale state before restart: {}",
+                            report.stop.stale_removed.join(", ")
+                        );
+                    }
+                    let start = report
+                        .start
+                        .expect("successful restart must include a start report");
+                    let restarted = start.started;
+                    if !restarted.is_empty() {
+                        println!("✓ restarted: {}", restarted.join(", "));
+                    }
+                    if !start.already_running.is_empty() {
+                        println!("✓ already running: {}", start.already_running.join(", "));
+                    }
+                    EXIT_OK
+                }
+                Err(error) => {
+                    eprintln!(
+                        "✗ project '{project}' template '{template}' restart failed: {error:#}\n  → inspect status, correct the failed service, then retry"
+                    );
+                    EXIT_START_FAILED
                 }
             }
-            println!("✓ restarted: {}", targets.join(", "));
-            EXIT_OK
         }
 
         Command::Status => {
-            let manager = Manager::with_env(loaded, env_overrides);
-            print_status(&manager);
-            EXIT_OK
+            let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ project '{project}' template '{template}': {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
+            };
+            match runtime.status_template(&template).await {
+                Ok(statuses) => {
+                    print_detached_status(&statuses);
+                    if statuses.iter().any(|status| {
+                        status
+                            .detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.contains("identity mismatch"))
+                    }) {
+                        EXIT_RUNTIME_INCOHERENT
+                    } else {
+                        EXIT_OK
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "✗ project '{project}' template '{template}' status failed: {error:#}\n  → validate the runtime directory and retry"
+                    );
+                    EXIT_RUNTIME_INCOHERENT
+                }
+            }
         }
 
         Command::Logs {
@@ -248,11 +329,30 @@ pub async fn run(cli: Cli) -> i32 {
                 eprintln!("✗ unknown service '{service}'");
                 return EXIT_SERVICE_NOT_FOUND;
             }
-            println!(
-                "(no persistent log store yet for '{service}'; runtime persistence is tracked separately)"
-            );
-            let _ = (follow, lines);
-            EXIT_RUNTIME_INCOHERENT
+            let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ project '{project}' template '{template}': {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
+            };
+            let (stdout, stderr) = match runtime.log_paths(&service) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    eprintln!("✗ project '{project}' service '{service}': {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
+            };
+            match show_persistent_logs(&stdout, &stderr, lines, follow).await {
+                Ok(()) => EXIT_OK,
+                Err(error) => {
+                    eprintln!(
+                        "✗ project '{project}' template '{template}' service '{service}' logs failed: {error:#}\n  → check permissions below {}",
+                        runtime.registry().root().display()
+                    );
+                    EXIT_RUNTIME_INCOHERENT
+                }
+            }
         }
     }
 }
@@ -310,47 +410,128 @@ fn resolve_or_exit(
     }
 }
 
-fn selected_services(
-    manager: &Manager,
-    template: &str,
-    requested: Vec<String>,
-) -> Result<Vec<String>, i32> {
-    if requested.is_empty() {
-        return crate::core::graph::services_for_template(&manager.config, template).map_err(
-            |error| {
-                eprintln!("✗ {error}");
-                EXIT_TEMPLATE_NOT_FOUND
-            },
-        );
-    }
-    for service in &requested {
-        if !manager.config.services.contains_key(service) {
+fn validate_services(config: &config::Config, requested: &[String]) -> Result<(), i32> {
+    for service in requested {
+        if !config.services.contains_key(service) {
             eprintln!("✗ unknown service '{service}'");
             return Err(EXIT_SERVICE_NOT_FOUND);
         }
     }
-    Ok(requested)
+    Ok(())
 }
 
-fn print_status(manager: &Manager) {
-    println!(
-        "{:<22} {:<10} {:<22} {:<10} DETAIL",
-        "SERVICE", "PROCESS", "PORT", "HEALTH"
-    );
-    for view in manager.all_views() {
-        let port = view
-            .port
-            .map(|port| format!("{port}/{}", view.port_state.label()))
-            .unwrap_or_else(|| view.port_state.label().to_string());
-        let detail = view.last_error.or(view.health_detail).unwrap_or_default();
-        println!(
-            "{:<22} {:<10} {:<22} {:<10} {}",
-            view.name,
-            view.process.label(),
-            port,
-            view.health.label(),
-            detail
+fn print_stop_report(
+    project: &str,
+    template: &str,
+    report: crate::runtime::detached::StopReport,
+) -> i32 {
+    if !report.stopped.is_empty() {
+        println!("✓ stopped: {}", report.stopped.join(", "));
+    }
+    if !report.stale_removed.is_empty() {
+        println!("✓ removed stale state: {}", report.stale_removed.join(", "));
+    }
+    if !report.already_stopped.is_empty() {
+        println!("✓ already stopped: {}", report.already_stopped.join(", "));
+    }
+    if !report.blocked.is_empty() {
+        eprintln!(
+            "✗ not stopped because a dependent failed: {}",
+            report.blocked.join(", ")
         );
+    }
+    for failure in &report.failures {
+        eprintln!(
+            "✗ project '{project}' template '{template}' failed to stop '{}': {}",
+            failure.service, failure.detail
+        );
+    }
+    if report.succeeded() {
+        EXIT_OK
+    } else {
+        EXIT_STOP_FAILED
+    }
+}
+
+fn print_detached_status(statuses: &[crate::runtime::detached::DetachedServiceStatus]) {
+    println!(
+        "{:<22} {:<10} {:<8} {:<22} {:<10} DETAIL",
+        "SERVICE", "PROCESS", "PID", "PORT", "HEALTH"
+    );
+    for status in statuses {
+        let port = status
+            .configured_port
+            .map(|port| format!("{port}/{}", status.port.label()))
+            .unwrap_or_else(|| status.port.label().to_string());
+        let pid = status
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<22} {:<10} {:<8} {:<22} {:<10} {}",
+            status.name,
+            status.process.label(),
+            pid,
+            port,
+            status.health.label(),
+            status.detail.as_deref().unwrap_or_default()
+        );
+    }
+}
+
+fn parse_duration(value: &str) -> Result<std::time::Duration, String> {
+    humantime::parse_duration(value).map_err(|error| error.to_string())
+}
+
+async fn show_persistent_logs(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    lines: usize,
+    follow: bool,
+) -> anyhow::Result<()> {
+    let stdout_tail = crate::runtime::logs::tail_file(stdout_path, lines)?;
+    let stderr_tail = crate::runtime::logs::tail_file(stderr_path, lines)?;
+    for line in &stdout_tail {
+        println!("[stdout] {line}");
+    }
+    for line in &stderr_tail {
+        println!("[stderr] {line}");
+    }
+    if stdout_tail.is_empty() && stderr_tail.is_empty() && !follow {
+        println!("(no log output yet)");
+    }
+    if !follow {
+        return Ok(());
+    }
+
+    let mut stdout = crate::runtime::logs::FileFollower::from_end(stdout_path)?;
+    let mut stderr = crate::runtime::logs::FileFollower::from_end(stderr_path)?;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+    loop {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                return Ok(());
+            }
+            _ = ticker.tick() => {
+                if stdout.is_none() {
+                    stdout = crate::runtime::logs::FileFollower::from_end(stdout_path)?;
+                }
+                if stderr.is_none() {
+                    stderr = crate::runtime::logs::FileFollower::from_end(stderr_path)?;
+                }
+                if let Some(follower) = stdout.as_mut() {
+                    for line in follower.read_new_lines()? {
+                        println!("[stdout] {line}");
+                    }
+                }
+                if let Some(follower) = stderr.as_mut() {
+                    for line in follower.read_new_lines()? {
+                        println!("[stderr] {line}");
+                    }
+                }
+            }
+        }
     }
 }
 

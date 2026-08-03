@@ -167,8 +167,9 @@ pub async fn stop_detached(entry: &RuntimeEntry, grace: Duration) -> Result<Deta
     let deadline = tokio::time::Instant::now() + grace;
     loop {
         match inspect_identity(entry) {
-            IdentityStatus::Missing | IdentityStatus::Mismatch(_) => {
-                return Ok(DetachedStopOutcome::Stopped);
+            IdentityStatus::Missing => return Ok(DetachedStopOutcome::Stopped),
+            IdentityStatus::Mismatch(reason) => {
+                return Ok(DetachedStopOutcome::IdentityMismatch(reason));
             }
             IdentityStatus::Matching if tokio::time::Instant::now() >= deadline => break,
             IdentityStatus::Matching => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -178,11 +179,27 @@ pub async fn stop_detached(entry: &RuntimeEntry, grace: Duration) -> Result<Deta
     // Re-check identity immediately before the destructive signal.
     match inspect_identity(entry) {
         IdentityStatus::Matching => send_group_signal(entry.pgid, libc::SIGKILL)?,
-        IdentityStatus::Missing | IdentityStatus::Mismatch(_) => {
-            return Ok(DetachedStopOutcome::Stopped);
+        IdentityStatus::Missing => return Ok(DetachedStopOutcome::Stopped),
+        IdentityStatus::Mismatch(reason) => {
+            return Ok(DetachedStopOutcome::IdentityMismatch(reason));
         }
     }
-    Ok(DetachedStopOutcome::Stopped)
+    let kill_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match inspect_identity(entry) {
+            IdentityStatus::Missing => return Ok(DetachedStopOutcome::Stopped),
+            IdentityStatus::Mismatch(reason) => {
+                return Ok(DetachedStopOutcome::IdentityMismatch(reason));
+            }
+            IdentityStatus::Matching if tokio::time::Instant::now() >= kill_deadline => {
+                anyhow::bail!(
+                    "process group {} is still alive after SIGKILL confirmation timeout",
+                    entry.pgid
+                );
+            }
+            IdentityStatus::Matching => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
 }
 
 /// Emergency cleanup used only before a newly spawned process has enough
