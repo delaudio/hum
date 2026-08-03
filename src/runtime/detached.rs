@@ -1232,12 +1232,29 @@ mod tests {
         let entry = runtime.registry().load("server").unwrap().unwrap();
 
         for _ in 0..20 {
-            if unsafe { libc::getpgid(entry.pid as i32) } < 0 {
+            let system = sysinfo::System::new_all();
+            if system
+                .process(sysinfo::Pid::from_u32(entry.pid))
+                .is_none_or(|process| {
+                    matches!(
+                        process.status(),
+                        sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+                    )
+                })
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(unsafe { libc::getpgid(entry.pid as i32) } < 0);
+        let system = sysinfo::System::new_all();
+        assert!(system
+            .process(sysinfo::Pid::from_u32(entry.pid))
+            .is_none_or(|process| {
+                matches!(
+                    process.status(),
+                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+                )
+            }));
         assert_eq!(inspect_identity(&entry), IdentityStatus::Matching);
         assert_eq!(
             process::stop_detached(&entry, Duration::from_secs(1))
@@ -1344,7 +1361,7 @@ mod tests {
             .stop_template("all", Duration::from_secs(1))
             .await
             .unwrap();
-        assert!(report.succeeded());
+        assert!(report.succeeded(), "{report:#?}");
         assert_eq!(report.stopped, ["api", "database"]);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1431,7 +1448,10 @@ mod tests {
         assert!(report.succeeded());
         let system = sysinfo::System::new_all();
         assert!(!system.processes().values().any(|process| {
-            (unsafe { libc::getpgid(process.pid().as_u32() as i32) }) == entry.pgid
+            !matches!(
+                process.status(),
+                sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+            ) && (unsafe { libc::getpgid(process.pid().as_u32() as i32) }) == entry.pgid
         }));
         assert!(runtime.registry().load("server").unwrap().is_none());
         fs::remove_dir_all(root).unwrap();

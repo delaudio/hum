@@ -297,9 +297,13 @@ fn process_matches_start_time(pid: u32, start_time: u64) -> bool {
         true,
         ProcessRefreshKind::new(),
     );
-    system
-        .process(process_pid)
-        .is_some_and(|process| process.start_time() == start_time)
+    system.process(process_pid).is_some_and(|process| {
+        process.start_time() == start_time
+            && !matches!(
+                process.status(),
+                sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+            )
+    })
 }
 
 /// Emergency cleanup used only before a newly spawned process has enough
