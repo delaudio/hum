@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
@@ -236,12 +236,21 @@ fn ten_service_startup_tui_cpu_and_rss_stay_within_budget() {
 fn spawn_tui(fixture: &Fixture) -> TuiProcess {
     let mut master_fd = -1;
     let mut slave_fd = -1;
+    #[cfg(target_os = "macos")]
     let mut window = libc::winsize {
         ws_row: 30,
         ws_col: 120,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    #[cfg(target_os = "linux")]
+    let window = libc::winsize {
+        ws_row: 30,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    #[cfg(target_os = "macos")]
     let opened = unsafe {
         libc::openpty(
             &mut master_fd,
@@ -249,6 +258,16 @@ fn spawn_tui(fixture: &Fixture) -> TuiProcess {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             &mut window,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let opened = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &window,
         )
     };
     assert_eq!(
