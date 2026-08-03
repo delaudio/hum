@@ -19,7 +19,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, app, chunks[0]);
     draw_table(f, app, chunks[1]);
-    draw_status_bar(f, chunks[2]);
+    draw_status_bar(f, app, chunks[2]);
 
     match app.mode {
         Mode::TemplateSelect => draw_template_select(f, app, size),
@@ -27,14 +27,16 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Details => draw_details(f, app, size),
         Mode::Doctor => draw_doctor(f, app, size),
         Mode::Help => draw_help(f, size),
-        Mode::ConfirmQuit => draw_confirm_quit(f, app, size),
         Mode::Normal => {}
     }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let template = app.template.clone().unwrap_or_else(|| "(none)".to_string());
-    let text = format!(" hum — Template: {template}    Environment: local ");
+    let text = format!(
+        " hum — Project: {}    Template: {template}    Environment: local ",
+        app.runtime.project()
+    );
     let block = Block::default().borders(Borders::ALL).title(" hum ");
     f.render_widget(Paragraph::new(text).block(block), area);
 }
@@ -68,11 +70,11 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .filter_map(|(i, name)| {
-            let view = app.manager.view(name)?;
-            let detail = view
-                .last_error
+            let status = app.statuses.get(name)?;
+            let detail = status
+                .detail
                 .clone()
-                .or(view.health_detail.clone())
+                .or(status.health_detail.clone())
                 .unwrap_or_default();
             let style = if i == app.selected {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -81,19 +83,19 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             };
             let process_cell = Cell::from(format!(
                 "{} {}",
-                view.process.symbol(),
-                view.process.label()
+                status.process.symbol(),
+                status.process.label()
             ))
-            .style(Style::default().fg(process_color(view.process)));
-            let health_cell = Cell::from(view.health.label())
-                .style(Style::default().fg(health_color(view.health)));
+            .style(Style::default().fg(process_color(status.process)));
+            let health_cell = Cell::from(status.health.label())
+                .style(Style::default().fg(health_color(status.health)));
             Some(
                 Row::new(vec![
                     Cell::from(name.clone()),
                     process_cell,
-                    Cell::from(match view.port {
-                        Some(port) => format!("{port}/{}", view.port_state.label()),
-                        None => view.port_state.label().to_string(),
+                    Cell::from(match status.configured_port {
+                        Some(port) => format!("{port}/{}", status.port.label()),
+                        None => status.port.label().to_string(),
                     }),
                     health_cell,
                     Cell::from(detail),
@@ -119,9 +121,13 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_status_bar(f: &mut Frame, area: Rect) {
+fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let line1 = "[space] start/stop  [r] restart  [enter] details  [l] logs";
-    let line2 = "[p] templates  [d] doctor  [o] open URL  [?] help  [q] quit";
+    let line2 = if app.status_line.is_empty() {
+        "[p] templates  [d] doctor  [o] open URL  [?] help  [q] quit".to_string()
+    } else {
+        app.status_line.clone()
+    };
     let text = vec![Line::from(line1), Line::from(line2)];
     f.render_widget(Paragraph::new(text), area);
 }
@@ -146,7 +152,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn draw_template_select(f: &mut Frame, app: &App, area: Rect) {
-    let mut templates: Vec<String> = app.manager.config.templates.keys().cloned().collect();
+    let mut templates: Vec<String> = app.runtime.config().templates.keys().cloned().collect();
     templates.sort();
     let popup = centered_rect(40, 50, area);
     f.render_widget(Clear, popup);
@@ -169,62 +175,64 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     let Some(name) = app.selected_name() else {
         return;
     };
-    let Some(view) = app.manager.view(&name) else {
+    let Some(status) = app.statuses.get(&name) else {
         return;
     };
-    let uptime = view
-        .uptime
-        .map(|d| {
+    let uptime = status
+        .started_at
+        .and_then(|started_at| {
+            chrono::Utc::now()
+                .signed_duration_since(started_at)
+                .to_std()
+                .ok()
+        })
+        .map(|duration| {
             format!(
                 "{:02}:{:02}:{:02}",
-                d.as_secs() / 3600,
-                (d.as_secs() / 60) % 60,
-                d.as_secs() % 60
+                duration.as_secs() / 3600,
+                (duration.as_secs() / 60) % 60,
+                duration.as_secs() % 60
             )
         })
         .unwrap_or_else(|| "—".to_string());
+    let service = app.runtime.config().services.get(&name);
     let text = vec![
-        Line::from(format!("State         {}", view.presentation.label())),
-        Line::from(format!("Process       {}", view.process.label())),
+        Line::from(format!("State         {}", status.presentation().label())),
+        Line::from(format!("Process       {}", status.process.label())),
         Line::from(format!(
             "PID           {}",
-            view.pid
+            status
+                .pid
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "—".into())
         )),
         Line::from(format!("Uptime        {uptime}")),
         Line::from(format!(
             "Port          {} ({})",
-            view.port
+            status
+                .configured_port
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "—".into()),
-            view.port_state.label()
+            status.port.label()
         )),
         Line::from(format!(
             "URL           {}",
-            view.url.clone().unwrap_or_else(|| "—".into())
+            service
+                .and_then(|service| service.url.clone())
+                .unwrap_or_else(|| "—".into())
         )),
         Line::from(format!(
             "Health        {} ({}, {})",
-            view.health.label(),
-            view.health_detail.clone().unwrap_or_else(|| "—".into()),
-            view.health_duration_ms
+            status.health.label(),
+            status.health_detail.clone().unwrap_or_else(|| "—".into()),
+            status
+                .health_duration_ms
                 .map(|duration| format!("{duration} ms"))
                 .unwrap_or_else(|| "—".into())
         )),
         Line::from(format!(
-            "Exit code     {}",
-            view.exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "—".into())
-        )),
-        Line::from(format!(
-            "Last change   {}",
-            view.changed_at.with_timezone(&chrono::Local).to_rfc3339()
-        )),
-        Line::from(format!(
-            "Last error    {}",
-            view.last_error.clone().unwrap_or_else(|| "—".into())
+            "Detail        {}",
+            status.detail.clone().unwrap_or_else(|| "—".into())
         )),
         Line::from(""),
         Line::from("[esc] back"),
@@ -245,28 +253,12 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     let Some(name) = app.selected_name() else {
         return;
     };
-    let lines: Vec<Line> = app
-        .manager
-        .logs(&name)
-        .map(|buf| {
-            buf.tail(200)
-                .iter()
-                .map(|l| {
-                    Line::from(format!(
-                        "{}  [{}] {}",
-                        l.timestamp.format("%H:%M:%S"),
-                        l.stream.label(),
-                        l.content
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let lines: Vec<Line> = app.log_lines.iter().cloned().map(Line::from).collect();
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {name} — logs (esc to close) ")),
+                .title(format!(" {name} — logs (c clear, esc close) ")),
         ),
         popup,
     );
@@ -331,13 +323,4 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ),
         popup,
     );
-}
-
-fn draw_confirm_quit(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(50, 20, area);
-    f.render_widget(Clear, popup);
-    let _ = app;
-    let text = Paragraph::new("Stop all running services before quitting? [Y/n]")
-        .block(Block::default().borders(Borders::ALL).title(" quit "));
-    f.render_widget(text, popup);
 }

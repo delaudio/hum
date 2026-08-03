@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{Config, HealthcheckConfig, Loaded, ReadyMode};
 use crate::core::graph;
-use crate::core::state::{HealthState, PortState, ProcessState};
+use crate::core::state::{HealthState, PortState, PresentationState, ProcessState};
 
 use super::health;
 use super::portcheck;
@@ -53,7 +54,7 @@ pub struct RestartReport {
     pub start: Option<StartReport>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DetachedServiceStatus {
     pub name: String,
     pub process: ProcessState,
@@ -62,6 +63,32 @@ pub struct DetachedServiceStatus {
     pub configured_port: Option<u16>,
     pub pid: Option<u32>,
     pub detail: Option<String>,
+    pub health_detail: Option<String>,
+    pub health_duration_ms: Option<u64>,
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+impl DetachedServiceStatus {
+    pub fn presentation(&self) -> PresentationState {
+        match self.process {
+            ProcessState::Starting => PresentationState::Starting,
+            ProcessState::Stopping => PresentationState::Stopping,
+            ProcessState::Exited => PresentationState::Exited,
+            ProcessState::Missing if self.detail.is_some() => PresentationState::Blocked,
+            ProcessState::Missing => PresentationState::Missing,
+            ProcessState::Running if self.health == HealthState::Unhealthy => {
+                PresentationState::Degraded
+            }
+            ProcessState::Running
+                if self.health == HealthState::Healthy
+                    || (self.health == HealthState::Unchecked
+                        && self.port == PortState::Listening) =>
+            {
+                PresentationState::Ready
+            }
+            ProcessState::Running => PresentationState::Running,
+        }
+    }
 }
 
 pub struct DetachedRuntime {
@@ -89,7 +116,7 @@ impl DetachedRuntime {
     }
 
     #[cfg(test)]
-    fn with_state_root(
+    pub(crate) fn with_state_root(
         project: String,
         loaded: Loaded,
         env_overrides: HashMap<String, String>,
@@ -109,6 +136,22 @@ impl DetachedRuntime {
         &self.registry
     }
 
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn root_dir(&self) -> &std::path::Path {
+        &self.root_dir
+    }
+
+    pub fn env_overrides(&self) -> &HashMap<String, String> {
+        &self.env_overrides
+    }
+
     pub async fn start_template(&self, template: &str) -> Result<StartReport> {
         let order = graph::services_for_template(&self.config, template)?;
         self.start_ordered(&order).await
@@ -121,7 +164,30 @@ impl DetachedRuntime {
 
     pub async fn status_template(&self, template: &str) -> Result<Vec<DetachedServiceStatus>> {
         let order = graph::services_for_template(&self.config, template)?;
-        self.status_ordered(&order).await
+        self.status_ordered(&order, true).await
+    }
+
+    pub async fn monitor_template(&self, template: &str) -> Result<Vec<DetachedServiceStatus>> {
+        let order = graph::services_for_template(&self.config, template)?;
+        self.status_ordered(&order, false).await
+    }
+
+    pub async fn check_service_health(&self, name: &str) -> Result<(HealthState, String, u64)> {
+        let service = self
+            .config
+            .services
+            .get(name)
+            .ok_or_else(|| anyhow!("unknown service '{name}'"))?;
+        let Some(check) = service.healthcheck.as_ref() else {
+            return Ok((HealthState::Unchecked, "not configured".to_string(), 0));
+        };
+        let started = std::time::Instant::now();
+        let result = health::check_once(check).await;
+        let duration = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        Ok(match result {
+            Ok(()) => (HealthState::Healthy, "ok".to_string(), duration),
+            Err(detail) => (HealthState::Unhealthy, detail, duration),
+        })
     }
 
     pub async fn stop_template(&self, template: &str, grace: Duration) -> Result<StopReport> {
@@ -225,7 +291,11 @@ impl DetachedRuntime {
         Ok(report)
     }
 
-    async fn status_ordered(&self, order: &[String]) -> Result<Vec<DetachedServiceStatus>> {
+    async fn status_ordered(
+        &self,
+        order: &[String],
+        check_health: bool,
+    ) -> Result<Vec<DetachedServiceStatus>> {
         let registry = self.registry.clone();
         let project_lock = tokio::task::spawn_blocking(move || registry.lock())
             .await
@@ -278,8 +348,12 @@ impl DetachedRuntime {
                 .services
                 .get(&name)
                 .ok_or_else(|| anyhow!("unknown service '{name}'"))?;
-            let port = self.observe_port(service.port, snapshot.entry.as_ref());
-            let health = match service.healthcheck.as_ref() {
+            let port = self.observe_port(service.port, snapshot.entry.as_ref(), check_health);
+            let health = match service
+                .healthcheck
+                .as_ref()
+                .filter(|_| check_health && snapshot.process.is_running())
+            {
                 Some(check) if health::check_once(check).await.is_ok() => HealthState::Healthy,
                 Some(_) => HealthState::Unhealthy,
                 None => HealthState::Unchecked,
@@ -292,6 +366,9 @@ impl DetachedRuntime {
                 configured_port: service.port,
                 pid: snapshot.entry.as_ref().map(|entry| entry.pid),
                 detail: snapshot.detail,
+                health_detail: None,
+                health_duration_ms: None,
+                started_at: snapshot.entry.as_ref().map(|entry| entry.started_at),
             });
         }
         Ok(statuses)
@@ -425,28 +502,39 @@ impl DetachedRuntime {
         })
     }
 
-    fn observe_port(&self, port: Option<u16>, entry: Option<&RuntimeEntry>) -> PortState {
+    fn observe_port(
+        &self,
+        port: Option<u16>,
+        entry: Option<&RuntimeEntry>,
+        diagnose_owner: bool,
+    ) -> PortState {
         let Some(port) = port else {
             return PortState::Unknown;
         };
         match portcheck::probe_port(port) {
             portcheck::PortProbe::Closed => PortState::Closed,
             portcheck::PortProbe::Unknown => PortState::Unknown,
-            portcheck::PortProbe::Listening => {
-                let occupant = portcheck::identify_occupant(port);
-                if entry.is_some_and(|entry| {
-                    occupant
+            portcheck::PortProbe::Listening => match entry {
+                Some(_) if !diagnose_owner => PortState::ListeningUnverified,
+                Some(entry) => {
+                    let occupant = portcheck::identify_occupant(port);
+                    if occupant
                         .pid
                         .is_some_and(|pid| portcheck::belongs_to_process_group(pid, entry.pgid))
-                }) {
-                    PortState::Listening
-                } else {
-                    PortState::OccupiedByOther {
-                        pid: occupant.pid,
-                        process_name: occupant.process_name,
+                    {
+                        PortState::Listening
+                    } else {
+                        PortState::OccupiedByOther {
+                            pid: occupant.pid,
+                            process_name: occupant.process_name,
+                        }
                     }
                 }
-            }
+                None => PortState::OccupiedByOther {
+                    pid: None,
+                    process_name: None,
+                },
+            },
         }
     }
 
@@ -781,6 +869,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unverified_listener_never_marks_a_service_ready() {
+        let status = DetachedServiceStatus {
+            name: "server".to_string(),
+            process: ProcessState::Running,
+            port: PortState::ListeningUnverified,
+            health: HealthState::Unchecked,
+            configured_port: Some(8080),
+            pid: Some(123),
+            detail: None,
+            health_detail: None,
+            health_duration_ms: None,
+            started_at: None,
+        };
+
+        assert_eq!(status.presentation(), PresentationState::Running);
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detached_service_survives_runtime_drop_and_is_rediscovered() {
@@ -814,6 +920,65 @@ mod tests {
             DetachedStopOutcome::Stopped | DetachedStopOutcome::AlreadyMissing
         ));
         registry.remove("server").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_reconciles_external_crash_and_restart_across_instances() {
+        let root = temp_root("monitor-reconcile");
+        let state = root.join("state");
+        let first = DetachedRuntime::with_state_root(
+            "demo".to_string(),
+            loaded(&root, "while :; do sleep 1; done"),
+            HashMap::new(),
+            state.clone(),
+        )
+        .unwrap();
+        first.start_template("all").await.unwrap();
+        let entry = first.registry().load("server").unwrap().unwrap();
+        drop(first);
+
+        let monitor = DetachedRuntime::with_state_root(
+            "demo".to_string(),
+            loaded(&root, "while :; do sleep 1; done"),
+            HashMap::new(),
+            state.clone(),
+        )
+        .unwrap();
+        let running = monitor.monitor_template("all").await.unwrap();
+        assert_eq!(running[0].process, ProcessState::Running);
+        assert_eq!(running[0].pid, Some(entry.pid));
+
+        assert_eq!(unsafe { libc::kill(-entry.pgid, libc::SIGKILL) }, 0);
+        for _ in 0..40 {
+            if inspect_identity(&entry) == IdentityStatus::Missing {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let crashed = monitor.monitor_template("all").await.unwrap();
+        assert_eq!(crashed[0].process, ProcessState::Missing);
+        assert!(crashed[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("stale runtime entry")));
+
+        let external_controller = DetachedRuntime::with_state_root(
+            "demo".to_string(),
+            loaded(&root, "while :; do sleep 1; done"),
+            HashMap::new(),
+            state,
+        )
+        .unwrap();
+        external_controller.start_template("all").await.unwrap();
+        let restarted = monitor.monitor_template("all").await.unwrap();
+        assert_eq!(restarted[0].process, ProcessState::Running);
+        let replacement = monitor.registry().load("server").unwrap().unwrap();
+        process::stop_detached(&replacement, Duration::from_secs(2))
+            .await
+            .unwrap();
+        monitor.registry().remove("server").unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

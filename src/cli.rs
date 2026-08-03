@@ -4,7 +4,6 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 use crate::config::{self, RegistryError};
-use crate::core::Manager;
 use crate::runtime::detached::DetachedRuntime;
 use crate::{doctor, tui};
 
@@ -161,8 +160,14 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Tui => {
-            let manager = Arc::new(Manager::with_env(loaded, env_overrides));
-            match tui::run(manager, Some(template)).await {
+            let runtime = match DetachedRuntime::new(project, loaded, env_overrides) {
+                Ok(runtime) => Arc::new(runtime),
+                Err(error) => {
+                    eprintln!("✗ failed to initialize runtime monitor: {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
+            };
+            match tui::run(runtime, Some(template)).await {
                 Ok(()) => EXIT_OK,
                 Err(error) => {
                     eprintln!("✗ TUI error: {error}");

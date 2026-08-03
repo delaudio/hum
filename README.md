@@ -12,11 +12,12 @@ hum compri all-services start
 The command starts the selected services in independent process groups, writes
 their logs and runtime metadata to disk, and exits. There is no resident `hum`
 daemon. Later CLI invocations reconcile that metadata with the operating
-system; TUI integration is tracked separately.
+system. The TUI reads the same persistent registry and controls the detached
+runtime without owning service lifetimes.
 
 > Project/template selection, v2 configuration, detached `start`, and
-> cross-invocation `status`, `stop`, `restart`, and `logs` are implemented.
-> TUI reconciliation is the next migration step. Track progress in
+> cross-invocation `status`, `stop`, `restart`, and `logs`, plus external-runtime
+> TUI reconciliation, are implemented. Track the remaining work in
 > [epic #16](https://github.com/delaudio/hum/issues/16).
 
 ## Concepts
@@ -93,10 +94,13 @@ configurable with `--timeout`. If a multi-service start partially fails, only
 processes created by that invocation are rolled back. `--detach` remains accepted
 as a deprecated no-op because detached execution is now the default.
 
-The TUI still needs to consume this registry. Port polling already uses bounded
-TCP connections; `lsof` is reserved for ownership checks and conflict
-diagnostics. Poll intervals, resource reuse, and the ten-service CPU/RSS budget
-are documented in [`docs/POLLING.md`](docs/POLLING.md).
+The TUI consumes this registry in a single non-overlapping background poll,
+detects processes started or stopped by other invocations, and reads persistent
+log files incrementally into a bounded 500-line view. Closing it leaves all
+services running. Port polling uses bounded TCP connections; `lsof` is reserved
+for explicit conflict diagnostics. Poll intervals, resource reuse, and the
+ten-service CPU/RSS budget are documented in
+[`docs/POLLING.md`](docs/POLLING.md).
 
 ## Development
 

@@ -1,105 +1,51 @@
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local};
-
-/// RF-11: which stream a captured line came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum Stream {
-    Stdout,
-    Stderr,
-    /// Lines emitted by `hum` itself about the service (start/stop/crash).
-    System,
-}
-
-impl Stream {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Stream::Stdout => "stdout",
-            Stream::Stderr => "stderr",
-            Stream::System => "system",
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct LogLine {
-    pub timestamp: DateTime<Local>,
-    pub service: String,
-    pub stream: Stream,
-    pub content: String,
-}
-
-impl LogLine {
-    #[allow(dead_code)]
-    pub fn format(&self) -> String {
-        format!("{}  {}", self.timestamp.format("%H:%M:%S"), self.content)
-    }
-}
-
-/// RF-12: a circular buffer of log lines for a single service. Bounded so
-/// long-running services don't grow memory without limit.
-#[derive(Debug)]
-pub struct LogBuffer {
-    capacity: usize,
-    lines: Mutex<VecDeque<LogLine>>,
-}
-
-pub const DEFAULT_CAPACITY: usize = 10_000;
 const FOLLOW_READ_CHUNK: u64 = 64 * 1024;
 const MAX_PARTIAL_LINE: usize = 64 * 1024;
-
-impl LogBuffer {
-    pub fn new(capacity: usize) -> Arc<Self> {
-        Arc::new(LogBuffer {
-            capacity,
-            lines: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
-        })
-    }
-
-    pub fn push(&self, line: LogLine) {
-        let mut lines = self.lines.lock().unwrap();
-        if lines.len() >= self.capacity {
-            lines.pop_front();
-        }
-        lines.push_back(line);
-    }
-
-    #[allow(dead_code)]
-    pub fn snapshot(&self) -> Vec<LogLine> {
-        self.lines.lock().unwrap().iter().cloned().collect()
-    }
-
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        self.lines.lock().unwrap().clear();
-    }
-
-    pub fn tail(&self, n: usize) -> Vec<LogLine> {
-        let lines = self.lines.lock().unwrap();
-        let len = lines.len();
-        let skip = len.saturating_sub(n);
-        lines.iter().skip(skip).cloned().collect()
-    }
-}
+const TAIL_READ_CHUNK: usize = 64 * 1024;
+const MAX_TAIL_BYTES: usize = 512 * 1024;
 
 pub fn tail_file(path: &Path, count: usize) -> Result<Vec<String>> {
     if count == 0 || !path.exists() {
         return Ok(Vec::new());
     }
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut tail = VecDeque::with_capacity(count.min(1024));
-    for line in BufReader::new(file).lines() {
-        if tail.len() == count {
-            tail.pop_front();
-        }
-        tail.push_back(line?);
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut position = file.metadata()?.len();
+    let mut chunks = VecDeque::new();
+    let mut bytes_read = 0;
+    let mut newlines = 0;
+    while position > 0 && bytes_read < MAX_TAIL_BYTES && newlines <= count {
+        let amount = (position as usize)
+            .min(TAIL_READ_CHUNK)
+            .min(MAX_TAIL_BYTES - bytes_read);
+        position -= amount as u64;
+        file.seek(SeekFrom::Start(position))?;
+        let mut chunk = vec![0; amount];
+        file.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        bytes_read += amount;
+        chunks.push_front(chunk);
     }
-    Ok(tail.into_iter().collect())
+    let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
+    let content = String::from_utf8_lossy(&bytes);
+    let mut lines = content
+        .lines()
+        .rev()
+        .take(count)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    if position > 0 && newlines <= count {
+        if let Some(first) = lines.first_mut() {
+            first.insert_str(0, "… [tail truncated] ");
+        }
+    }
+    Ok(lines)
 }
 
 pub struct FileFollower {
@@ -189,6 +135,27 @@ mod tests {
         }
         assert!(!emitted.is_empty());
         assert!(emitted.iter().all(|line| line.ends_with("… [continued]")));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tail_reads_from_the_end_with_a_byte_limit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("hum-log-tail-{}-{unique}.log", std::process::id()));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"first\nsecond\nthird\n").unwrap();
+        assert_eq!(tail_file(&path, 2).unwrap(), ["second", "third"]);
+
+        file.set_len(0).unwrap();
+        file.write_all(&vec![b'x'; MAX_TAIL_BYTES * 2]).unwrap();
+        let tail = tail_file(&path, 2).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert!(tail[0].starts_with("… [tail truncated] "));
+        assert!(tail[0].len() <= MAX_TAIL_BYTES + 32);
         std::fs::remove_file(path).unwrap();
     }
 }

@@ -129,8 +129,6 @@ pub fn check_port(port: u16) -> Option<PortOccupant> {
 }
 
 pub fn identify_occupant(port: u16) -> PortOccupant {
-    #[cfg(test)]
-    DIAGNOSTIC_CALLS.with(|calls| calls.set(calls.get() + 1));
     // Best-effort: sysinfo does not expose per-socket ownership portably, so
     // we shell out to `lsof` on unix, which is present on macOS and most
     // Linux dev boxes, and fall back to "unknown" if it isn't.
@@ -179,21 +177,6 @@ pub fn identify_occupant(port: u16) -> PortOccupant {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static DIAGNOSTIC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub fn reset_diagnostic_call_count() {
-    DIAGNOSTIC_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(test)]
-pub fn diagnostic_call_count() -> usize {
-    DIAGNOSTIC_CALLS.with(std::cell::Cell::get)
-}
-
 pub fn belongs_to_process_tree(pid: u32, root_pid: u32) -> bool {
     use sysinfo::System;
 
@@ -209,15 +192,14 @@ pub fn belongs_to_process_tree(pid: u32, root_pid: u32) -> bool {
     false
 }
 
+#[cfg(unix)]
 pub fn belongs_to_process_group(pid: u32, pgid: i32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::getpgid(pid as i32) == pgid }
-    }
-    #[cfg(not(unix))]
-    {
-        pid as i32 == pgid
-    }
+    unsafe { libc::getpgid(pid as i32) == pgid }
+}
+
+#[cfg(not(unix))]
+pub fn belongs_to_process_group(pid: u32, pgid: i32) -> bool {
+    pid as i32 == pgid
 }
 
 #[cfg(test)]

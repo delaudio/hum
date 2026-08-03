@@ -3,15 +3,15 @@
 The ordinary monitor path is intentionally bounded for a template with ten
 services:
 
-- PID checks: every 500 ms, using only already-owned process handles or a
-  targeted refresh of a known PID.
+- PID checks: every 1 s in the TUI, using targeted inspection of registry PIDs.
 - Port checks: every 1 s, using a short TCP connection with a 50 ms total
   deadline across resolved IPv4/IPv6 addresses.
 - HTTP/TCP health: the service-configured interval and timeout. HTTP checks
   share one connection-pooled client and checks for one service never overlap.
-- Occupant diagnosis: `lsof -nP` only when a listener first appears in an
-  unknown state or when an explicit CLI operation requests diagnostics. It is
-  not part of a steady-state tick.
+- Occupant diagnosis: `lsof -nP` only when an explicit CLI status or conflict
+  operation requests diagnostics. The TUI
+  reports a live listener as `listening-unverified` unless ownership has been
+  proven elsewhere; it never runs `lsof` in a steady-state tick.
 - TUI polling: at most one background polling pass is in flight; rendering and
   input are never made to wait for TCP or process inspection.
 
@@ -45,7 +45,7 @@ services, closed local ports, 60 one-second samples):
 samples=60 average_cpu=0.02% max_rss=7.53MiB
 ```
 
-This fixture exercises the one-second ten-port polling path and the 500 ms TUI
-redraw/PID schedule. Health-check resource reuse is covered separately by the
+This fixture exercises the one-second ten-service runtime polling path and the
+250 ms TUI event/redraw tick. Health-check resource reuse is covered separately by the
 shared-client and non-overlap tests because the fixture intentionally has no
 external network dependency.
