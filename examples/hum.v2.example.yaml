@@ -1,5 +1,4 @@
-# Target hum v2 project configuration for Compri.
-# This documents the migration target and is not accepted by the v1 binary.
+# hum v2 project configuration for Compri.
 #
 # Once v2 registry support lands, register it in ~/.config/hum/config.yaml:
 #
@@ -11,6 +10,14 @@
 # Machine-specific values belong in hum.local.yaml next to this file.
 version: 2
 project: compri
+
+logs:
+  max_file_bytes: 10485760 # 10 MiB per active/rotated stream file
+  rotated_files: 3
+  max_line_bytes: 65536
+  retention: 7d
+  redact_patterns:
+    - "(?i)(token|password)=[^ ]+"
 
 repositories:
   applications:

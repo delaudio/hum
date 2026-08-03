@@ -34,7 +34,7 @@ hum <project> <template> start
 hum <project> <template> stop
 hum <project> <template> restart
 hum <project> <template> status
-hum <project> <template> logs <service> [--follow]
+hum <project> <template> logs [service] [--lines N] [--follow]
 hum <project> <template> doctor
 hum <project> <template> tui
 ```
@@ -94,10 +94,19 @@ configurable with `--timeout`. If a multi-service start partially fails, only
 processes created by that invocation are rolled back. `--detach` remains accepted
 as a deprecated no-op because detached execution is now the default.
 
+Each detached service streams stdout and stderr to a small native sink that
+rotates by byte count and exits automatically when both streams close. Defaults
+are 10 MiB per file, three rotated files, and 64 KiB per displayed line/chunk;
+all are configurable under `logs`. Raw files stay faithful to process output,
+while configured regular expressions are masked in CLI/TUI views. See
+[`docs/LOGGING.md`](docs/LOGGING.md) for retention, disk bounds, search, and
+failure behavior.
+
 The TUI consumes this registry in a single non-overlapping background poll,
 detects processes started or stopped by other invocations, and reads persistent
 log files incrementally into a bounded 500-line view. Closing it leaves all
-services running. Port polling uses bounded TCP connections; `lsof` is reserved
+services running; the view also has a 4 MiB byte ceiling. Port polling uses
+bounded TCP connections; `lsof` is reserved
 for explicit conflict diagnostics. Poll intervals, resource reuse, and the
 ten-service CPU/RSS budget are documented in
 [`docs/POLLING.md`](docs/POLLING.md).

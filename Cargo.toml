@@ -31,6 +31,7 @@ humantime-serde = "1"
 open = "5"
 sysinfo = "0.32"
 getrandom = "0.2"
+regex = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

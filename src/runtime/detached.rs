@@ -319,6 +319,9 @@ impl DetachedRuntime {
                         detail: None,
                     },
                     IdentityStatus::Missing => {
+                        process::wait_log_sink_exit(&entry).await.with_context(|| {
+                            format!("service '{name}' log sink is still draining")
+                        })?;
                         self.registry.remove(name).with_context(|| {
                             format!("service '{name}' stale runtime entry could not be removed")
                         })?;
@@ -549,7 +552,7 @@ impl DetachedRuntime {
             .as_deref()
             .ok_or_else(|| anyhow!("service '{name}' has no command"))?;
         let command_hash = stable_digest(command.as_bytes());
-        let config_hash = config_digest(service)?;
+        let config_hash = config_digest(&(service, &self.config.logs))?;
 
         if let Some(entry) = self.registry.load(name)? {
             match inspect_identity(&entry) {
@@ -564,6 +567,9 @@ impl DetachedRuntime {
                     ));
                 }
                 IdentityStatus::Missing | IdentityStatus::Mismatch(_) => {
+                    process::wait_log_sink_exit(&entry).await.with_context(|| {
+                        format!("previous log sink for service '{name}' is still draining")
+                    })?;
                     self.registry.remove(name)?;
                 }
             }
@@ -592,6 +598,7 @@ impl DetachedRuntime {
             identity.file(),
             &stdout_log,
             &stderr_log,
+            super::logs::LogPolicy::from(&self.config.logs),
         )?;
         let start_time = match process_start_time(process.pid) {
             Ok(start_time) => start_time,
@@ -605,6 +612,8 @@ impl DetachedRuntime {
             name.to_string(),
             process.pid,
             process.pgid,
+            process.log_sink_pid,
+            process.log_sink_start_time,
             start_time,
             runtime_token,
             identity.path().to_path_buf(),
@@ -1026,6 +1035,8 @@ mod tests {
             "server".to_string(),
             pid,
             pgid,
+            None,
+            None,
             actual_start.wrapping_add(1),
             "definitely-not-this-process-token".to_string(),
             PathBuf::from("/tmp/identity-does-not-exist.lock"),
@@ -1226,11 +1237,15 @@ mod tests {
         process::abort_unregistered(process::DetachedProcess {
             pid: api.pid,
             pgid: api.pgid,
+            log_sink_pid: api.log_sink_pid,
+            log_sink_start_time: api.log_sink_start_time,
         })
         .unwrap();
         process::abort_unregistered(process::DetachedProcess {
             pid: database.pid,
             pgid: database.pgid,
+            log_sink_pid: database.log_sink_pid,
+            log_sink_start_time: database.log_sink_start_time,
         })
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;

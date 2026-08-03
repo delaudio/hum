@@ -253,13 +253,23 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     let Some(name) = app.selected_name() else {
         return;
     };
-    let lines: Vec<Line> = app.log_lines.iter().cloned().map(Line::from).collect();
+    let lines: Vec<Line> = app
+        .log_lines
+        .iter()
+        .filter(|line| app.log_search.is_empty() || line.contains(&app.log_search))
+        .map(|line| Line::from(line.as_str()))
+        .collect();
+    let search = if app.log_searching {
+        format!(" search: /{}_ ", app.log_search)
+    } else if app.log_search.is_empty() {
+        String::new()
+    } else {
+        format!(" filter: /{} ", app.log_search)
+    };
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {name} — logs (c clear, esc close) ")),
-        ),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
+            " {name} — logs (/: search, c: clear view, esc: close){search}"
+        ))),
         popup,
     );
 }

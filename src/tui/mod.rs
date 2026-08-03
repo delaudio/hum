@@ -16,13 +16,14 @@ use tokio::sync::mpsc;
 use crate::core::state::HealthState;
 use crate::doctor;
 use crate::runtime::detached::{DetachedRuntime, DetachedServiceStatus};
-use crate::runtime::logs::{tail_file, FileFollower};
+use crate::runtime::logs::{tail_history, FileFollower, Redactor};
 
 mod ui;
 
 const EVENT_TICK: Duration = Duration::from_millis(250);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_LOG_LINES: usize = 500;
+const MAX_LOG_VIEW_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(PartialEq)]
 enum Mode {
@@ -41,6 +42,9 @@ pub struct App {
     pub selected: usize,
     pub template: Option<String>,
     pub log_lines: VecDeque<String>,
+    log_bytes: usize,
+    pub log_search: String,
+    pub log_searching: bool,
     mode: Mode,
     template_cursor: usize,
     doctor_results: Vec<doctor::DoctorCheck>,
@@ -50,6 +54,7 @@ pub struct App {
     stdout_follower: Option<FileFollower>,
     stderr_follower: Option<FileFollower>,
     log_service: Option<String>,
+    redactor: Redactor,
     active_poll: Option<u64>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
     poll_guard: Arc<tokio::sync::Mutex<()>>,
@@ -65,6 +70,8 @@ impl App {
             .as_deref()
             .and_then(|name| crate::core::graph::services_for_template(runtime.config(), name).ok())
             .unwrap_or_default();
+        let redactor = Redactor::new(&runtime.config().logs.redact_patterns)
+            .expect("validated redaction patterns");
         App {
             runtime,
             statuses: HashMap::new(),
@@ -72,6 +79,9 @@ impl App {
             selected: 0,
             template,
             log_lines: VecDeque::with_capacity(MAX_LOG_LINES),
+            log_bytes: 0,
+            log_search: String::new(),
+            log_searching: false,
             mode: Mode::Normal,
             template_cursor: 0,
             doctor_results: Vec::new(),
@@ -81,6 +91,7 @@ impl App {
             stdout_follower: None,
             stderr_follower: None,
             log_service: None,
+            redactor,
             active_poll: None,
             poll_task: None,
             poll_guard: Arc::new(tokio::sync::Mutex::new(())),
@@ -409,11 +420,32 @@ fn handle_key(app: &mut App, code: KeyCode, action_tx: &mpsc::UnboundedSender<Ac
                 _ => {}
             }
         }
-        Mode::Logs => match code {
-            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
-            KeyCode::Char('c') => app.log_lines.clear(),
-            _ => {}
-        },
+        Mode::Logs => {
+            if app.log_searching {
+                match code {
+                    KeyCode::Enter => app.log_searching = false,
+                    KeyCode::Esc => {
+                        app.log_searching = false;
+                        app.log_search.clear();
+                    }
+                    KeyCode::Backspace => {
+                        app.log_search.pop();
+                    }
+                    KeyCode::Char(character) => app.log_search.push(character),
+                    _ => {}
+                }
+                return;
+            }
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+                KeyCode::Char('c') => clear_log_view(app),
+                KeyCode::Char('/') => {
+                    app.log_search.clear();
+                    app.log_searching = true;
+                }
+                _ => {}
+            }
+        }
         Mode::Details | Mode::Doctor | Mode::Help => {
             if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                 app.mode = Mode::Normal;
@@ -573,17 +605,35 @@ fn open_logs(app: &mut App) {
         app.status_line = format!("could not locate logs for '{name}'");
         return;
     };
-    app.log_lines.clear();
-    match tail_file(&stdout_path, 200) {
+    clear_log_view(app);
+    app.log_search.clear();
+    app.log_searching = false;
+    let rotated_files = app.runtime.config().logs.rotated_files;
+    let max_line_bytes = app.runtime.config().logs.max_line_bytes;
+    let mut stdout_follower = FileFollower::from_end_with_limit(&stdout_path, max_line_bytes)
+        .ok()
+        .flatten();
+    let mut stderr_follower = FileFollower::from_end_with_limit(&stderr_path, max_line_bytes)
+        .ok()
+        .flatten();
+    let stdout_tail = match stdout_follower.as_mut() {
+        Some(follower) => follower.initial_tail(200, rotated_files),
+        None => tail_history(&stdout_path, 200, rotated_files),
+    };
+    match stdout_tail {
         Ok(lines) => append_log_lines(app, "stdout", lines),
         Err(error) => app.status_line = error.to_string(),
     }
-    match tail_file(&stderr_path, 200) {
+    let stderr_tail = match stderr_follower.as_mut() {
+        Some(follower) => follower.initial_tail(200, rotated_files),
+        None => tail_history(&stderr_path, 200, rotated_files),
+    };
+    match stderr_tail {
         Ok(lines) => append_log_lines(app, "stderr", lines),
         Err(error) => app.status_line = error.to_string(),
     }
-    app.stdout_follower = FileFollower::from_end(&stdout_path).ok().flatten();
-    app.stderr_follower = FileFollower::from_end(&stderr_path).ok().flatten();
+    app.stdout_follower = stdout_follower;
+    app.stderr_follower = stderr_follower;
     app.log_service = Some(name);
     app.mode = Mode::Logs;
 }
@@ -591,6 +641,23 @@ fn open_logs(app: &mut App) {
 fn refresh_log_followers(app: &mut App) {
     if app.mode != Mode::Logs {
         return;
+    }
+    let Some(service) = app.log_service.clone() else {
+        return;
+    };
+    let Ok((stdout_path, stderr_path)) = app.runtime.log_paths(&service) else {
+        return;
+    };
+    let max_line_bytes = app.runtime.config().logs.max_line_bytes;
+    if app.stdout_follower.is_none() {
+        app.stdout_follower = FileFollower::from_start_with_limit(&stdout_path, max_line_bytes)
+            .ok()
+            .flatten();
+    }
+    if app.stderr_follower.is_none() {
+        app.stderr_follower = FileFollower::from_start_with_limit(&stderr_path, max_line_bytes)
+            .ok()
+            .flatten();
     }
     if let Some(follower) = &mut app.stdout_follower {
         match follower.read_new_lines() {
@@ -608,9 +675,33 @@ fn refresh_log_followers(app: &mut App) {
 
 fn append_log_lines(app: &mut App, stream: &str, lines: Vec<String>) {
     for line in lines {
-        if app.log_lines.len() == MAX_LOG_LINES {
-            app.log_lines.pop_front();
+        let mut rendered = format!(
+            "[{stream}] {}",
+            app.redactor
+                .redact_bounded(&line, app.runtime.config().logs.max_line_bytes)
+        );
+        if rendered.len() > MAX_LOG_VIEW_BYTES {
+            let mut boundary = MAX_LOG_VIEW_BYTES.saturating_sub(16);
+            while !rendered.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            rendered.truncate(boundary);
+            rendered.push_str("… [truncated]");
         }
-        app.log_lines.push_back(format!("[{stream}] {line}"));
+        while app.log_lines.len() >= MAX_LOG_LINES
+            || app.log_bytes + rendered.len() > MAX_LOG_VIEW_BYTES
+        {
+            let Some(removed) = app.log_lines.pop_front() else {
+                break;
+            };
+            app.log_bytes = app.log_bytes.saturating_sub(removed.len());
+        }
+        app.log_bytes += rendered.len();
+        app.log_lines.push_back(rendered);
     }
+}
+
+fn clear_log_view(app: &mut App) {
+    app.log_lines.clear();
+    app.log_bytes = 0;
 }

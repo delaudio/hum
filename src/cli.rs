@@ -80,9 +80,9 @@ pub enum Command {
     },
     /// Show status for services in the selected template
     Status,
-    /// Show captured logs for a service
+    /// Show captured logs for the template or one service
     Logs {
-        service: String,
+        service: Option<String>,
         #[arg(short, long)]
         follow: bool,
         #[arg(short = 'n', long, default_value_t = 100)]
@@ -330,10 +330,6 @@ pub async fn run(cli: Cli) -> i32 {
             follow,
             lines,
         } => {
-            if !loaded.config.services.contains_key(&service) {
-                eprintln!("✗ unknown service '{service}'");
-                return EXIT_SERVICE_NOT_FOUND;
-            }
             let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -341,18 +337,46 @@ pub async fn run(cli: Cli) -> i32 {
                     return EXIT_RUNTIME_INCOHERENT;
                 }
             };
-            let (stdout, stderr) = match runtime.log_paths(&service) {
-                Ok(paths) => paths,
+            let services = match service {
+                Some(service) if runtime.config().services.contains_key(&service) => vec![service],
+                Some(service) => {
+                    eprintln!("✗ unknown service '{service}'");
+                    return EXIT_SERVICE_NOT_FOUND;
+                }
+                None => {
+                    match crate::core::graph::services_for_template(runtime.config(), &template) {
+                        Ok(services) => services,
+                        Err(error) => {
+                            eprintln!("✗ project '{project}' template '{template}': {error}");
+                            return EXIT_TEMPLATE_NOT_FOUND;
+                        }
+                    }
+                }
+            };
+            let sources = services
+                .into_iter()
+                .map(|service| {
+                    runtime
+                        .log_paths(&service)
+                        .map(|(stdout, stderr)| PersistentLogSource {
+                            service,
+                            stdout,
+                            stderr,
+                        })
+                })
+                .collect::<anyhow::Result<Vec<_>>>();
+            let sources = match sources {
+                Ok(sources) => sources,
                 Err(error) => {
-                    eprintln!("✗ project '{project}' service '{service}': {error}");
+                    eprintln!("✗ project '{project}' template '{template}': {error}");
                     return EXIT_RUNTIME_INCOHERENT;
                 }
             };
-            match show_persistent_logs(&stdout, &stderr, lines, follow).await {
+            match show_persistent_logs(&sources, &runtime.config().logs, lines, follow).await {
                 Ok(()) => EXIT_OK,
                 Err(error) => {
                     eprintln!(
-                        "✗ project '{project}' template '{template}' service '{service}' logs failed: {error:#}\n  → check permissions below {}",
+                        "✗ project '{project}' template '{template}' logs failed: {error:#}\n  → check permissions below {}",
                         runtime.registry().root().display()
                     );
                     EXIT_RUNTIME_INCOHERENT
@@ -489,28 +513,80 @@ fn parse_duration(value: &str) -> Result<std::time::Duration, String> {
 }
 
 async fn show_persistent_logs(
-    stdout_path: &Path,
-    stderr_path: &Path,
+    sources: &[PersistentLogSource],
+    config: &crate::config::LogConfig,
     lines: usize,
     follow: bool,
 ) -> anyhow::Result<()> {
-    let stdout_tail = crate::runtime::logs::tail_file(stdout_path, lines)?;
-    let stderr_tail = crate::runtime::logs::tail_file(stderr_path, lines)?;
-    for line in &stdout_tail {
-        println!("[stdout] {line}");
+    let redactor = crate::runtime::logs::Redactor::new(&config.redact_patterns)?;
+    let multiple = sources.len() > 1;
+    let mut any_output = false;
+    let mut followers = Vec::new();
+    for source in sources {
+        let mut stdout = follow
+            .then(|| {
+                crate::runtime::logs::FileFollower::from_end_with_limit(
+                    &source.stdout,
+                    config.max_line_bytes,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let mut stderr = follow
+            .then(|| {
+                crate::runtime::logs::FileFollower::from_end_with_limit(
+                    &source.stderr,
+                    config.max_line_bytes,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let stdout_tail = match stdout.as_mut() {
+            Some(follower) => follower.initial_tail(lines, config.rotated_files)?,
+            None => {
+                crate::runtime::logs::tail_history(&source.stdout, lines, config.rotated_files)?
+            }
+        };
+        let stderr_tail = match stderr.as_mut() {
+            Some(follower) => follower.initial_tail(lines, config.rotated_files)?,
+            None => {
+                crate::runtime::logs::tail_history(&source.stderr, lines, config.rotated_files)?
+            }
+        };
+        any_output |= !stdout_tail.is_empty() || !stderr_tail.is_empty();
+        for line in &stdout_tail {
+            print_visible_log(
+                multiple,
+                &source.service,
+                "stdout",
+                &redactor.redact_bounded(line, config.max_line_bytes),
+            );
+        }
+        for line in &stderr_tail {
+            print_visible_log(
+                multiple,
+                &source.service,
+                "stderr",
+                &redactor.redact_bounded(line, config.max_line_bytes),
+            );
+        }
+        if follow {
+            followers.push(PersistentLogFollowers {
+                service: source.service.clone(),
+                stdout_path: source.stdout.clone(),
+                stderr_path: source.stderr.clone(),
+                stdout,
+                stderr,
+            });
+        }
     }
-    for line in &stderr_tail {
-        println!("[stderr] {line}");
-    }
-    if stdout_tail.is_empty() && stderr_tail.is_empty() && !follow {
+    if !any_output && !follow {
         println!("(no log output yet)");
     }
     if !follow {
         return Ok(());
     }
 
-    let mut stdout = crate::runtime::logs::FileFollower::from_end(stdout_path)?;
-    let mut stderr = crate::runtime::logs::FileFollower::from_end(stderr_path)?;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
     loop {
         tokio::select! {
@@ -519,24 +595,64 @@ async fn show_persistent_logs(
                 return Ok(());
             }
             _ = ticker.tick() => {
-                if stdout.is_none() {
-                    stdout = crate::runtime::logs::FileFollower::from_end(stdout_path)?;
-                }
-                if stderr.is_none() {
-                    stderr = crate::runtime::logs::FileFollower::from_end(stderr_path)?;
-                }
-                if let Some(follower) = stdout.as_mut() {
-                    for line in follower.read_new_lines()? {
-                        println!("[stdout] {line}");
+                for source in &mut followers {
+                    if source.stdout.is_none() {
+                        source.stdout = crate::runtime::logs::FileFollower::from_start_with_limit(
+                            &source.stdout_path,
+                            config.max_line_bytes,
+                        )?;
                     }
-                }
-                if let Some(follower) = stderr.as_mut() {
-                    for line in follower.read_new_lines()? {
-                        println!("[stderr] {line}");
+                    if source.stderr.is_none() {
+                        source.stderr = crate::runtime::logs::FileFollower::from_start_with_limit(
+                            &source.stderr_path,
+                            config.max_line_bytes,
+                        )?;
+                    }
+                    if let Some(follower) = source.stdout.as_mut() {
+                        for line in follower.read_new_lines()? {
+                            print_visible_log(
+                                multiple,
+                                &source.service,
+                                "stdout",
+                                &redactor.redact_bounded(&line, config.max_line_bytes),
+                            );
+                        }
+                    }
+                    if let Some(follower) = source.stderr.as_mut() {
+                        for line in follower.read_new_lines()? {
+                            print_visible_log(
+                                multiple,
+                                &source.service,
+                                "stderr",
+                                &redactor.redact_bounded(&line, config.max_line_bytes),
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+struct PersistentLogSource {
+    service: String,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+struct PersistentLogFollowers {
+    service: String,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    stdout: Option<crate::runtime::logs::FileFollower>,
+    stderr: Option<crate::runtime::logs::FileFollower>,
+}
+
+fn print_visible_log(multiple: bool, service: &str, stream: &str, line: &str) {
+    if multiple {
+        println!("[{service}][{stream}] {line}");
+    } else {
+        println!("[{stream}] {line}");
     }
 }
 
@@ -610,7 +726,21 @@ mod tests {
                 service,
                 follow: true,
                 lines: 25
-            }) if service == "api"
+            }) if service.as_deref() == Some("api")
+        ));
+    }
+
+    #[test]
+    fn parses_template_wide_logs_without_a_service() {
+        let cli = Cli::try_parse_from(["hum", "compri", "all-services", "logs", "--lines", "10"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Logs {
+                service: None,
+                follow: false,
+                lines: 10
+            })
         ));
     }
 

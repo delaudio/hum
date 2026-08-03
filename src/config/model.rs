@@ -17,6 +17,47 @@ pub struct Config {
     pub services: HashMap<String, ServiceConfig>,
     #[serde(default, alias = "profiles")]
     pub templates: HashMap<String, TemplateConfig>,
+    #[serde(default)]
+    pub logs: LogConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    #[serde(default = "default_log_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_rotated_files")]
+    pub rotated_files: usize,
+    #[serde(default = "default_log_line_bytes")]
+    pub max_line_bytes: usize,
+    #[serde(default, with = "humantime_serde::option")]
+    pub retention: Option<Duration>,
+    #[serde(default)]
+    pub redact_patterns: Vec<String>,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: default_log_file_bytes(),
+            rotated_files: default_rotated_files(),
+            max_line_bytes: default_log_line_bytes(),
+            retention: None,
+            redact_patterns: Vec::new(),
+        }
+    }
+}
+
+fn default_log_file_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn default_rotated_files() -> usize {
+    3
+}
+
+fn default_log_line_bytes() -> usize {
+    64 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

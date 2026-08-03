@@ -72,6 +72,7 @@ templates:
     let first_entry = read_entry(&entry_path);
     let first_pid = first_entry["pid"].as_u64().unwrap() as u32;
     let first_pgid = first_entry["pgid"].as_i64().unwrap() as i32;
+    let first_sink_pid = first_entry["log_sink_pid"].as_u64().unwrap() as u32;
     cleanup.process_groups.push(first_pgid);
 
     let system = System::new_all();
@@ -98,6 +99,11 @@ templates:
         .unwrap();
     assert_success(&logs);
     assert!(String::from_utf8_lossy(&logs.stdout).contains("cli-detached-ok"));
+    let template_logs = hum_command(&config, &state, &["logs", "-n", "20"])
+        .output()
+        .unwrap();
+    assert_success(&template_logs);
+    assert!(String::from_utf8_lossy(&template_logs.stdout).contains("cli-detached-ok"));
 
     let restarted = hum_command(&config, &state, &["restart", "--timeout", "1s"])
         .output()
@@ -106,10 +112,13 @@ templates:
     assert!(String::from_utf8_lossy(&restarted.stdout).contains("✓ restarted: worker"));
     let restarted_entry = read_entry(&entry_path);
     let restarted_pgid = restarted_entry["pgid"].as_i64().unwrap() as i32;
+    let restarted_sink_pid = restarted_entry["log_sink_pid"].as_u64().unwrap() as u32;
     assert_ne!(
         restarted_entry["runtime_token"],
         first_entry["runtime_token"]
     );
+    assert_ne!(restarted_sink_pid, first_sink_pid);
+    assert!(!process_exists(first_sink_pid));
     cleanup.process_groups.push(restarted_pgid);
 
     unsafe {
@@ -123,12 +132,14 @@ templates:
     assert!(stale_status_text.contains("missing"));
     assert!(stale_status_text.contains("stale runtime entry removed"));
     assert!(!entry_path.exists());
+    assert!(!process_exists(restarted_sink_pid));
 
     let stale_replaced = hum_command(&config, &state, &["start"]).output().unwrap();
     assert_success(&stale_replaced);
     assert!(String::from_utf8_lossy(&stale_replaced.stdout).contains("✓ started: worker"));
     let replacement_entry = read_entry(&entry_path);
     let replacement_pgid = replacement_entry["pgid"].as_i64().unwrap() as i32;
+    let replacement_sink_pid = replacement_entry["log_sink_pid"].as_u64().unwrap() as u32;
     assert_ne!(
         replacement_entry["runtime_token"],
         restarted_entry["runtime_token"]
@@ -141,6 +152,7 @@ templates:
     assert_success(&stopped);
     assert!(String::from_utf8_lossy(&stopped.stdout).contains("✓ stopped: worker"));
     assert!(!entry_path.exists());
+    assert!(!process_exists(replacement_sink_pid));
 
     let already_stopped = hum_command(&config, &state, &["stop"]).output().unwrap();
     assert_success(&already_stopped);
@@ -165,6 +177,93 @@ templates:
     assert!(failure_text.contains("project 'e2e' template 'all'"));
     assert!(failure_text.contains("worker"));
     assert!(entry_path.exists());
+}
+
+#[test]
+fn noisy_service_logs_rotate_redact_and_survive_crash() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "hum-cli-log-rotation-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let mut cleanup = Cleanup {
+        root: root.clone(),
+        process_groups: Vec::new(),
+    };
+    let config = root.join("hum.yaml");
+    let state = root.join("state");
+    fs::write(
+        &config,
+        r#"version: 2
+project: e2e
+logs:
+  max_file_bytes: 128
+  rotated_files: 2
+  max_line_bytes: 32
+  redact_patterns: ["token=[^ ]+"]
+services:
+  worker:
+    command: "i=0; while [ $i -lt 1000 ]; do echo token=secret line-$i-abcdefghijklmnopqrstuvwxyz; i=$((i+1)); done; echo token=secret complete; echo token=secret error >&2; sleep 300"
+templates:
+  all:
+    services: [worker]
+"#,
+    )
+    .unwrap();
+
+    let started = hum_command(&config, &state, &["start"]).output().unwrap();
+    assert_success(&started);
+    let entry_path = state.join("hum/e2e/runtime/worker.json");
+    let entry = read_entry(&entry_path);
+    let pgid = entry["pgid"].as_i64().unwrap() as i32;
+    cleanup.process_groups.push(pgid);
+    let stdout = PathBuf::from(entry["stdout_log"].as_str().unwrap());
+    wait_for_log_set(&stdout, "complete", 2);
+
+    let status = hum_command(&config, &state, &["status"]).output().unwrap();
+    assert_success(&status);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running"));
+
+    let logs = hum_command(&config, &state, &["logs", "worker", "-n", "20"])
+        .output()
+        .unwrap();
+    assert_success(&logs);
+    let visible = String::from_utf8_lossy(&logs.stdout);
+    assert!(visible.contains("[REDACTED]"));
+    assert!(visible.contains("[stderr]"));
+    assert!(!visible.contains("token=secret"));
+
+    let files = [
+        stdout.clone(),
+        PathBuf::from(format!("{}.1", stdout.display())),
+        PathBuf::from(format!("{}.2", stdout.display())),
+    ];
+    assert!(files
+        .iter()
+        .all(|path| fs::metadata(path).unwrap().len() <= 128));
+    assert!(
+        files
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum::<u64>()
+            <= 128 * 3
+    );
+    assert!(!PathBuf::from(format!("{}.3", stdout.display())).exists());
+
+    unsafe {
+        assert_eq!(libc::kill(-pgid, libc::SIGKILL), 0);
+    }
+    wait_for_group_exit(pgid);
+    thread::sleep(Duration::from_millis(100));
+    let after_crash = hum_command(&config, &state, &["logs", "worker", "-n", "20"])
+        .output()
+        .unwrap();
+    assert_success(&after_crash);
+    assert!(String::from_utf8_lossy(&after_crash.stdout).contains("[REDACTED]"));
 }
 
 fn hum_command(config: &Path, state: &Path, action: &[&str]) -> Command {
@@ -203,6 +302,27 @@ fn wait_for_log(path: &Path, expected: &str) {
     panic!("{} did not contain {expected:?}", path.display());
 }
 
+fn wait_for_log_set(path: &Path, expected: &str, rotated_files: usize) {
+    for _ in 0..100 {
+        let found = (0..=rotated_files).any(|index| {
+            let candidate = if index == 0 {
+                path.to_path_buf()
+            } else {
+                PathBuf::from(format!("{}.{index}", path.display()))
+            };
+            fs::read_to_string(candidate).is_ok_and(|contents| contents.contains(expected))
+        });
+        if found {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "log set for {} did not contain {expected:?}",
+        path.display()
+    );
+}
+
 fn wait_for_group_exit(pgid: i32) {
     for _ in 0..40 {
         let result = unsafe { libc::kill(-pgid, 0) };
@@ -212,4 +332,9 @@ fn wait_for_group_exit(pgid: i32) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("process group {pgid} did not exit");
+}
+
+fn process_exists(pid: u32) -> bool {
+    let system = System::new_all();
+    system.process(sysinfo::Pid::from_u32(pid)).is_some()
 }

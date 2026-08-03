@@ -43,6 +43,7 @@ pub fn validate(config: &Config, file: &Path) -> Result<(), ConfigError> {
     }
 
     validate_names(config, file)?;
+    validate_logs(config, file)?;
 
     // Services can be selected explicitly and templates may overlap, so a port
     // must identify at most one service across the whole project.
@@ -176,6 +177,52 @@ pub fn validate(config: &Config, file: &Path) -> Result<(), ConfigError> {
 
     detect_cycles(config, file)?;
 
+    Ok(())
+}
+
+fn validate_logs(config: &Config, file: &Path) -> Result<(), ConfigError> {
+    if config.logs.max_file_bytes == 0 {
+        return Err(ConfigError::validation(
+            file,
+            "logs.max_file_bytes",
+            "maximum log file size must be greater than zero",
+            "set max_file_bytes to a positive byte count",
+        ));
+    }
+    if config.logs.rotated_files > 16 {
+        return Err(ConfigError::validation(
+            file,
+            "logs.rotated_files",
+            "at most 16 rotated files are supported per stream",
+            "lower rotated_files to 16 or less",
+        ));
+    }
+    if config.logs.max_line_bytes == 0 || config.logs.max_line_bytes > 16 * 1024 * 1024 {
+        return Err(ConfigError::validation(
+            file,
+            "logs.max_line_bytes",
+            "log line/chunk limit must be between 1 byte and 16 MiB",
+            "set max_line_bytes to a bounded positive value, for example 65536",
+        ));
+    }
+    for (index, pattern) in config.logs.redact_patterns.iter().enumerate() {
+        if pattern.is_empty() {
+            return Err(ConfigError::validation(
+                file,
+                format!("logs.redact_patterns.{index}"),
+                "redaction pattern cannot be empty",
+                "remove the empty entry or provide a regular expression",
+            ));
+        }
+        if let Err(error) = regex::Regex::new(pattern) {
+            return Err(ConfigError::validation(
+                file,
+                format!("logs.redact_patterns.{index}"),
+                format!("invalid redaction regular expression: {error}"),
+                "fix the regular expression syntax",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -419,6 +466,18 @@ mod tests {
         let mut config = valid_config();
         config.services.get_mut("api").unwrap().command = Some("  ".to_string());
         assert!(validate(&config, Path::new("hum.yaml")).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_log_limits_and_redaction_patterns() {
+        let file = Path::new("hum.yaml");
+        let mut config = valid_config();
+        config.logs.max_file_bytes = 0;
+        assert!(validate(&config, file).is_err());
+
+        config.logs.max_file_bytes = 1024;
+        config.logs.redact_patterns = vec!["(".to_string()];
+        assert!(validate(&config, file).is_err());
     }
 
     #[test]

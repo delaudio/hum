@@ -221,6 +221,7 @@ fn validate_partial_schema(
         "services",
         "templates",
         "profiles",
+        "logs",
     ];
     const REPOSITORY: &[&str] = &["path"];
     const SERVICE: &[&str] = &[
@@ -248,6 +249,13 @@ fn validate_partial_schema(
         "expected_status",
     ];
     const TEMPLATE: &[&str] = &["services"];
+    const LOGS: &[&str] = &[
+        "max_file_bytes",
+        "rotated_files",
+        "max_line_bytes",
+        "retention",
+        "redact_patterns",
+    ];
 
     let root = mapping(value, file)?;
     check_keys(root, CONFIG, file, source)?;
@@ -289,6 +297,9 @@ fn validate_partial_schema(
                 check_keys(template, TEMPLATE, file, source)?;
             }
         }
+    }
+    if let Some(logs) = root.get("logs").and_then(yaml_serde::Value::as_mapping) {
+        check_keys(logs, LOGS, file, source)?;
     }
     Ok(())
 }
