@@ -57,7 +57,9 @@ fn run_checks(
     let mut results = Vec::new();
 
     // Repositories
-    for (name, repo) in &config.repositories {
+    let mut repositories = config.repositories.iter().collect::<Vec<_>>();
+    repositories.sort_by_key(|(name, _)| *name);
+    for (name, repo) in repositories {
         let path = expand_home(&repo.path);
         let path = if path.is_absolute() {
             path
@@ -79,7 +81,9 @@ fn run_checks(
     }
 
     // Services
-    for (name, svc) in &config.services {
+    let mut services = config.services.iter().collect::<Vec<_>>();
+    services.sort_by_key(|(name, _)| *name);
+    for (name, svc) in services {
         let (runtime_entry, registry_read_failed) = match runtime.registry().load(name) {
             Ok(entry) => (entry, false),
             Err(error) => {

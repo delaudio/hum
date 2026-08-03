@@ -672,34 +672,124 @@ fn print_visible_log(multiple: bool, service: &str, stream: &str, line: &str) {
 }
 
 fn print_doctor(results: &[doctor::DoctorCheck]) {
-    let mut current_scope: Option<&str> = None;
+    print!("{}", format_doctor(results));
+}
+
+fn format_doctor(results: &[doctor::DoctorCheck]) -> String {
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+
+    const HEADERS: [&str; 4] = ["SERVICE", "STATUS", "CHECKS", "ISSUES"];
+    let mut grouped: BTreeMap<String, (usize, usize, Vec<String>)> = BTreeMap::new();
     for result in results {
-        let scope = result.scope.as_deref();
-        if scope != current_scope {
-            if let Some(scope) = scope {
-                println!("\n{scope}\n");
-            } else if current_scope.is_some() {
-                println!();
-            }
-            current_scope = scope;
-        }
+        let scope = result.scope.as_deref().unwrap_or("project").to_string();
+        let summary = grouped.entry(scope).or_default();
+        summary.1 += 1;
         if result.ok {
-            println!("✓ {}", result.label);
+            summary.0 += 1;
         } else {
-            println!(
-                "✗ {}: {}",
-                result.label,
-                result.detail.as_deref().unwrap_or("")
-            );
+            let label = doctor_cell(&result.label);
+            let detail = doctor_cell(result.detail.as_deref().unwrap_or(""));
+            summary.2.push(if detail.is_empty() {
+                label
+            } else {
+                format!("{label}: {detail}")
+            });
         }
     }
-    println!();
+    let mut rows = grouped
+        .into_iter()
+        .map(|(scope, (passed, total, issues))| {
+            [
+                scope,
+                if issues.is_empty() {
+                    "✓ PASS"
+                } else {
+                    "✗ FAIL"
+                }
+                .to_string(),
+                format!("{passed}/{total}"),
+                if issues.is_empty() {
+                    "—".to_string()
+                } else {
+                    issues.join("; ")
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        (left[0] != "project", &left[0]).cmp(&(right[0] != "project", &right[0]))
+    });
+    let widths: [usize; 4] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].chars().count())
+            .chain(std::iter::once(HEADERS[column].len()))
+            .max()
+            .unwrap_or(0)
+    });
+
+    let mut output = String::new();
+    writeln!(
+        output,
+        "{:<service_width$}  {:<status_width$}  {:<checks_width$}  {}",
+        HEADERS[0],
+        HEADERS[1],
+        HEADERS[2],
+        HEADERS[3],
+        service_width = widths[0],
+        status_width = widths[1],
+        checks_width = widths[2],
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        output,
+        "{:-<service_width$}  {:-<status_width$}  {:-<checks_width$}  {:-<issues_width$}",
+        "",
+        "",
+        "",
+        "",
+        service_width = widths[0],
+        status_width = widths[1],
+        checks_width = widths[2],
+        issues_width = widths[3],
+    )
+    .expect("writing to a string cannot fail");
+    for row in &rows {
+        writeln!(
+            output,
+            "{:<service_width$}  {:<status_width$}  {:<checks_width$}  {}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            service_width = widths[0],
+            status_width = widths[1],
+            checks_width = widths[2],
+        )
+        .expect("writing to a string cannot fail");
+    }
+
+    output.push('\n');
     if doctor::all_passed(results) {
-        println!("All checks passed.");
+        output.push_str("All checks passed.\n");
     } else {
         let failed = results.iter().filter(|result| !result.ok).count();
-        println!("{failed} check(s) failed.");
+        writeln!(output, "{failed} check(s) failed.").expect("writing to a string cannot fail");
     }
+    output
+}
+
+fn doctor_cell(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -707,6 +797,43 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn doctor_output_is_a_compact_table_with_failure_details() {
+        let output = format_doctor(&[
+            doctor::DoctorCheck {
+                scope: Some("api".to_string()),
+                label: "node available".to_string(),
+                ok: true,
+                detail: None,
+            },
+            doctor::DoctorCheck {
+                scope: Some("api".to_string()),
+                label: "port 3000 occupied by external process".to_string(),
+                ok: false,
+                detail: Some("PID 42\nretry after stopping it".to_string()),
+            },
+            doctor::DoctorCheck {
+                scope: None,
+                label: "Configuration is valid".to_string(),
+                ok: true,
+                detail: None,
+            },
+        ]);
+
+        let lines = output.lines().collect::<Vec<_>>();
+        assert!(lines[0].contains("SERVICE"));
+        assert!(lines[0].contains("STATUS"));
+        assert!(lines[0].contains("CHECKS"));
+        assert!(lines[0].contains("ISSUES"));
+        assert_eq!(output.matches("\napi").count(), 1);
+        assert!(output.contains("✗ FAIL"));
+        assert!(output.contains("1/2"));
+        assert!(output.contains("PID 42 retry after stopping it"));
+        assert!(output.contains("project"));
+        assert!(output.contains("1/1"));
+        assert!(output.ends_with("1 check(s) failed.\n"));
+    }
 
     #[test]
     fn parses_project_template_command_contract() {
