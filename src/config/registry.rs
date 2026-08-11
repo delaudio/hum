@@ -112,7 +112,10 @@ pub fn is_reserved_project_name(name: &str) -> bool {
         "start"
             | "stop"
             | "restart"
+            | "reset"
             | "status"
+            | "plan"
+            | "secrets"
             | "logs"
             | "doctor"
             | "tui"
@@ -191,21 +194,21 @@ mod tests {
     #[test]
     fn resolves_relative_project_config_from_registry() {
         let root = test_dir("registry");
-        let project = root.join("compri.yaml");
+        let project = root.join("demo.yaml");
         fs::write(
             &project,
-            "version: 2\nproject: compri\nservices: {}\ntemplates:\n  all-services:\n    services: []\n",
+            "version: 2\nproject: demo\nservices: {}\ntemplates:\n  all-services:\n    services: []\n",
         )
         .unwrap();
         let registry = root.join("config.yaml");
         fs::write(
             &registry,
-            "version: 1\nprojects:\n  compri:\n    config: compri.yaml\n",
+            "version: 1\nprojects:\n  demo:\n    config: demo.yaml\n",
         )
         .unwrap();
 
-        let loaded = resolve_project("compri", None, Some(&registry)).unwrap();
-        assert_eq!(loaded.config.project.as_deref(), Some("compri"));
+        let loaded = resolve_project("demo", None, Some(&registry)).unwrap();
+        assert_eq!(loaded.config.project.as_deref(), Some("demo"));
         assert!(loaded.config.templates.contains_key("all-services"));
         fs::remove_dir_all(root).unwrap();
     }

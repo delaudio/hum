@@ -1,15 +1,15 @@
-# hum v2 project configuration for Compri.
+# hum v2 project configuration for Demo.
 #
 # Once v2 registry support lands, register it in ~/.config/hum/config.yaml:
 #
 #   version: 1
 #   projects:
-#     compri:
-#       config: ~/code/compri/hum.yaml
+#     demo:
+#       config: ~/code/demo/hum.yaml
 #
 # Machine-specific values belong in hum.local.yaml next to this file.
 version: 2
-project: compri
+project: demo
 
 logs:
   max_file_bytes: 10485760 # 10 MiB per active/rotated stream file
@@ -21,13 +21,13 @@ logs:
 
 repositories:
   applications:
-    path: ~/code/compri/compri-applications
+    path: ~/code/demo/demo-applications
 
   api:
-    path: ~/code/compri/compri-api
+    path: ~/code/demo/demo-api
 
   agents:
-    path: ~/code/compri/compri-agents
+    path: ~/code/demo/demo-agents
 
 services:
   frontend:

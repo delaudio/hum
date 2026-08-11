@@ -1,0 +1,258 @@
+#![cfg(unix)]
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+struct Cleanup(PathBuf);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn compose_runtime_start_status_and_stop_use_isolated_project_state() {
+    let root = std::env::temp_dir().join(format!(
+        "hum-compose-cli-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(root.join("bin")).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let config = root.join("hum.yaml");
+    fs::write(
+        root.join("compose.yaml"),
+        "services:\n  database:\n    image: postgres:17\n",
+    )
+    .unwrap();
+    fs::write(root.join("database.env.example"), "DATABASE_URL=\n").unwrap();
+    fs::write(
+        &config,
+        r#"version: 3
+project: compose-e2e
+logs:
+  redact_patterns: [private-value]
+runtimes:
+  infra:
+    type: compose
+    project_name: compose_e2e
+    files: [compose.yaml]
+    generated_files: [runtime.generated.yaml]
+  local:
+    type: process
+environment_providers:
+  vault:
+    type: one-password
+tasks:
+  prepare:
+    command: [./prepare, "argument with spaces"]
+    check: [test, -f, prepared]
+services:
+  database:
+    runtime: infra
+    target: database
+    depends_on: [prepare]
+    env_from:
+      - provider: vault
+        reference: op://Development/database/environment
+        schema: database.env.example
+        cache: .hum/cache/database.env
+  api:
+    runtime: local
+    command: "true"
+    depends_on: [database]
+templates:
+  all:
+    services: [database]
+  infrastructure:
+    services: [database]
+"#,
+    )
+    .unwrap();
+    let prepare = root.join("prepare");
+    fs::write(
+        &prepare,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" >> task.log\nprintf 'services: {}\\n' > runtime.generated.yaml\n: > prepared\n",
+    )
+    .unwrap();
+    fs::set_permissions(&prepare, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let fake_docker = root.join("bin/docker");
+    fs::write(
+        &fake_docker,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$HUM_FAKE_DOCKER_LOG"
+env | grep '^HUM_RUNTIME_' >> "$HUM_FAKE_DOCKER_ENV" || true
+case "$*" in
+  *"ps --status running --services"*)
+    if [ -f "$HUM_FAKE_DOCKER_STATE" ]; then printf '%s\n' database; fi
+    ;;
+  *"ps --all --services"*)
+    if [ -f "$HUM_FAKE_DOCKER_STATE" ]; then printf '%s\n' database; fi
+    ;;
+  *"up --detach --wait database"*)
+    : > "$HUM_FAKE_DOCKER_STATE"
+    ;;
+  *"stop database"*)
+    rm -f "$HUM_FAKE_DOCKER_STATE"
+    ;;
+  *"logs --tail 5 database"*)
+    printf '%s\n' 'compose-log-line private-value'
+    ;;
+  *"down --volumes --remove-orphans"*)
+    rm -f "$HUM_FAKE_DOCKER_STATE"
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_docker, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake_op = root.join("bin/op");
+    fs::write(
+        &fake_op,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' 'DATABASE_URL=postgres://private-value'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_op, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let plan = hum(
+        &root,
+        &config,
+        &["plan", "api", "--json", "--exclude", "infrastructure"],
+    );
+    assert_success(&plan);
+    assert!(String::from_utf8_lossy(&plan.stdout).contains("\"name\": \"database\""));
+    let warning = String::from_utf8_lossy(&plan.stderr);
+    assert!(warning.contains("reintroduced from excluded template 'infrastructure'"));
+    assert!(!root.join(".hum/cache/database.env").exists());
+
+    let blocked = hum(
+        &root,
+        &config,
+        &["plan", "api", "--exclude-service", "database"],
+    );
+    assert_eq!(blocked.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&blocked.stderr)
+        .contains("cannot exclude service 'database' because 'api' depends on it"));
+
+    let doctor = hum(&root, &config, &["doctor", "--exclude", "infrastructure"]);
+    assert_success(&doctor);
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("All checks passed"));
+
+    let excluded_sync = hum(
+        &root,
+        &config,
+        &["secrets", "sync", "--exclude", "infrastructure"],
+    );
+    assert_success(&excluded_sync);
+    assert!(
+        String::from_utf8_lossy(&excluded_sync.stdout).contains("refreshed 0 environment source")
+    );
+    assert!(!root.join(".hum/cache/database.env").exists());
+
+    let excluded_start = hum(&root, &config, &["start", "--exclude", "infrastructure"]);
+    assert_success(&excluded_start);
+    assert!(!root.join("docker.log").exists());
+
+    let sync = hum(&root, &config, &["secrets", "sync"]);
+    assert_success(&sync);
+    let sync_output = String::from_utf8_lossy(&sync.stdout);
+    assert!(sync_output.contains("refreshed 1 environment source"));
+    assert!(!sync_output.contains("private-value"));
+    let cache = root.join(".hum/cache/database.env");
+    assert_eq!(
+        fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let start = hum(&root, &config, &["start"]);
+    assert_success(&start);
+    assert!(String::from_utf8_lossy(&start.stdout).contains("✓ started: database"));
+
+    let repeated = hum(&root, &config, &["start"]);
+    assert_success(&repeated);
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("✓ already running: database"));
+    assert_eq!(
+        fs::read_to_string(root.join("task.log")).unwrap(),
+        "argument with spaces\n"
+    );
+
+    let status = hum(&root, &config, &["status"]);
+    assert_success(&status);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("database"));
+    assert!(status.contains("running"));
+    assert!(status.contains("compose_e2e"));
+
+    let logs = hum(&root, &config, &["logs", "database", "--lines", "5"]);
+    assert_success(&logs);
+    let logs = String::from_utf8_lossy(&logs.stdout);
+    assert!(logs.contains("compose-log-line [REDACTED]"));
+    assert!(!logs.contains("private-value"));
+
+    let generated = root.join("state/hum/compose-e2e/compose/infra.generated.yaml");
+    let generated_contents = fs::read_to_string(generated).unwrap();
+    assert!(generated_contents.contains("HUM_RUNTIME_"));
+    assert!(!generated_contents.contains("private-value"));
+    let runtime_environment = fs::read_to_string(root.join("docker.env")).unwrap();
+    assert!(runtime_environment.contains("postgres://private-value"));
+
+    let stop = hum(&root, &config, &["stop"]);
+    assert_success(&stop);
+    assert!(String::from_utf8_lossy(&stop.stdout).contains("✓ stopped: database"));
+    assert!(!root.join("docker.state").exists());
+
+    assert_success(&hum(&root, &config, &["start"]));
+    let reset = hum(&root, &config, &["reset", "--yes"]);
+    assert_success(&reset);
+    assert!(String::from_utf8_lossy(&reset.stdout).contains("✓ reset Compose data"));
+    assert!(!root.join("docker.state").exists());
+
+    let docker_log = fs::read_to_string(root.join("docker.log")).unwrap();
+    assert!(docker_log.contains("--project-name compose_e2e"));
+    assert!(docker_log.contains("--file"));
+    assert!(docker_log.contains("runtime.generated.yaml"));
+    assert!(docker_log.contains("up --detach --wait database"));
+    assert!(docker_log.contains("stop database"));
+    assert!(docker_log.contains("logs --tail 5 database"));
+    assert!(docker_log.contains("--profile * down --volumes --remove-orphans"));
+}
+
+fn hum(root: &Path, config: &Path, arguments: &[&str]) -> Output {
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!(
+        "{}:{}",
+        root.join("bin").display(),
+        existing_path.to_string_lossy()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hum"));
+    command
+        .arg("--config")
+        .arg(config)
+        .arg("compose-e2e")
+        .arg("all")
+        .args(arguments)
+        .env("PATH", path)
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("HUM_FAKE_DOCKER_STATE", root.join("docker.state"))
+        .env("HUM_FAKE_DOCKER_LOG", root.join("docker.log"))
+        .env("HUM_FAKE_DOCKER_ENV", root.join("docker.env"));
+    command.output().unwrap()
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

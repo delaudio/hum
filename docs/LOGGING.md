@@ -48,10 +48,10 @@ discarding output so a noisy service is not terminated by a closed pipe.
 
 ```bash
 # every service in the selected template
-hum compri all-services logs --lines 100
+hum demo all-services logs --lines 100
 
 # one service, continuously across rotations
-hum compri all-services logs api --lines 100 --follow
+hum demo all-services logs api --lines 100 --follow
 ```
 
 The CLI reads at most 512 KiB per stream for an initial tail and marks a tail

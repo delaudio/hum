@@ -16,8 +16,9 @@ use tokio::sync::mpsc;
 
 use crate::core::state::HealthState;
 use crate::doctor;
-use crate::runtime::detached::{DetachedRuntime, DetachedServiceStatus};
+use crate::runtime::detached::DetachedServiceStatus;
 use crate::runtime::logs::{FileFollower, HistoryPager, Redactor};
+use crate::runtime::project::ProjectRuntime;
 
 mod ui;
 
@@ -28,6 +29,8 @@ const MAX_LOG_VIEW_BYTES: usize = 4 * 1024 * 1024;
 const INITIAL_LOG_LINES: usize = 200;
 const LOG_HISTORY_PAGE_LINES: usize = 100;
 const LOG_SCROLL_PAGE_LINES: usize = 20;
+const LOG_HORIZONTAL_STEP: u16 = 4;
+const EXTERNAL_LOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DETAIL_LINE_COUNT: u16 = 16;
 const DETAIL_HORIZONTAL_LIMIT: u16 = 512;
 
@@ -43,7 +46,7 @@ enum Mode {
 }
 
 pub struct App {
-    pub runtime: Arc<DetachedRuntime>,
+    pub runtime: Arc<ProjectRuntime>,
     pub statuses: HashMap<String, DetachedServiceStatus>,
     pub services: Vec<String>,
     pub selected: usize,
@@ -54,6 +57,7 @@ pub struct App {
     pub log_follow: bool,
     pub log_history_exhausted: bool,
     pub log_visible_height: usize,
+    pub log_horizontal: u16,
     log_history_stale: bool,
     pub log_search: String,
     pub log_searching: bool,
@@ -65,6 +69,7 @@ pub struct App {
     pub doctor_scroll: u16,
     status_line: String,
     should_quit: bool,
+    needs_full_clear: bool,
     health_due: HashMap<String, Instant>,
     stdout_follower: Option<FileFollower>,
     stderr_follower: Option<FileFollower>,
@@ -73,6 +78,10 @@ pub struct App {
     stdout_history_skip: usize,
     stderr_history_skip: usize,
     log_service: Option<String>,
+    external_logs: bool,
+    external_log_due: Instant,
+    active_external_log: Option<u64>,
+    next_external_log_id: u64,
     redactor: Redactor,
     active_poll: Option<u64>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
@@ -85,7 +94,7 @@ pub struct App {
 }
 
 impl App {
-    fn new(runtime: Arc<DetachedRuntime>, template: Option<String>) -> Self {
+    fn new(runtime: Arc<ProjectRuntime>, template: Option<String>) -> Self {
         let services = template
             .as_deref()
             .and_then(|name| crate::core::graph::services_for_template(runtime.config(), name).ok())
@@ -104,6 +113,7 @@ impl App {
             log_follow: true,
             log_history_exhausted: false,
             log_visible_height: LOG_SCROLL_PAGE_LINES,
+            log_horizontal: 0,
             log_history_stale: false,
             log_search: String::new(),
             log_searching: false,
@@ -115,6 +125,7 @@ impl App {
             doctor_scroll: 0,
             status_line: String::new(),
             should_quit: false,
+            needs_full_clear: false,
             health_due: HashMap::new(),
             stdout_follower: None,
             stderr_follower: None,
@@ -123,6 +134,10 @@ impl App {
             stdout_history_skip: 0,
             stderr_history_skip: 0,
             log_service: None,
+            external_logs: false,
+            external_log_due: Instant::now(),
+            active_external_log: None,
+            next_external_log_id: 0,
             redactor,
             active_poll: None,
             poll_task: None,
@@ -167,6 +182,12 @@ impl App {
         }
         self.runtime_due = Instant::now();
     }
+
+    fn invalidate_external_logs(&mut self) {
+        self.next_external_log_id = self.next_external_log_id.wrapping_add(1);
+        self.active_external_log = None;
+        self.external_log_due = Instant::now();
+    }
 }
 
 impl Drop for App {
@@ -202,8 +223,14 @@ struct DoctorMessage {
     result: Result<Vec<doctor::DoctorCheck>, String>,
 }
 
+struct ExternalLogMessage {
+    id: u64,
+    service: String,
+    result: Result<Vec<String>, String>,
+}
+
 /// Launch the interactive monitor. Quitting the TUI never stops services.
-pub async fn run(runtime: Arc<DetachedRuntime>, template: Option<String>) -> Result<()> {
+pub async fn run(runtime: Arc<ProjectRuntime>, template: Option<String>) -> Result<()> {
     let mut session = TerminalSession::enter()?;
     let stdout = std::io::stdout();
     let backend = CrosstermBackend::new(stdout);
@@ -265,7 +292,7 @@ impl Drop for TerminalSession {
 
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    runtime: Arc<DetachedRuntime>,
+    runtime: Arc<ProjectRuntime>,
     template: Option<String>,
 ) -> Result<()> {
     let mut app = App::new(runtime, template);
@@ -274,9 +301,14 @@ async fn event_loop(
     let (monitor_tx, mut monitor_rx) = mpsc::unbounded_channel();
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let (doctor_tx, mut doctor_rx) = mpsc::unbounded_channel();
+    let (external_log_tx, mut external_log_rx) = mpsc::unbounded_channel();
     schedule_poll(&mut app, &monitor_tx);
 
     loop {
+        if app.needs_full_clear {
+            terminal.clear()?;
+            app.needs_full_clear = false;
+        }
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         if app.should_quit {
@@ -286,6 +318,7 @@ async fn event_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 refresh_log_followers(&mut app);
+                schedule_external_log_refresh(&mut app, &external_log_tx);
                 schedule_poll(&mut app, &monitor_tx);
                 schedule_health_checks(&mut app, &monitor_tx);
             }
@@ -295,6 +328,7 @@ async fn event_loop(
             },
             Some(message) = action_rx.recv() => apply_action(&mut app, message, &monitor_tx),
             Some(message) = doctor_rx.recv() => apply_doctor(&mut app, message),
+            Some(message) = external_log_rx.recv() => apply_external_log(&mut app, message),
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -537,9 +571,9 @@ fn handle_key(
                     } else {
                         app.status_line = "no templates are configured".to_string();
                     }
-                    app.mode = Mode::Normal;
+                    close_modal(app);
                 }
-                KeyCode::Esc => app.mode = Mode::Normal,
+                KeyCode::Esc => close_modal(app),
                 _ => {}
             }
         }
@@ -560,13 +594,20 @@ fn handle_key(
                 return;
             }
             match code {
-                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+                KeyCode::Esc | KeyCode::Char('q') => close_modal(app),
                 KeyCode::Up | KeyCode::Char('k') => scroll_logs_up(app, 1),
                 KeyCode::Down | KeyCode::Char('j') => scroll_logs_down(app, 1),
                 KeyCode::PageUp => scroll_logs_up(app, LOG_SCROLL_PAGE_LINES),
                 KeyCode::PageDown => scroll_logs_down(app, LOG_SCROLL_PAGE_LINES),
                 KeyCode::Home => scroll_logs_to_oldest(app),
                 KeyCode::End => return_to_live_logs(app),
+                KeyCode::Left | KeyCode::Char('h') => {
+                    app.log_horizontal = app.log_horizontal.saturating_sub(LOG_HORIZONTAL_STEP);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    app.log_horizontal = app.log_horizontal.saturating_add(LOG_HORIZONTAL_STEP);
+                }
+                KeyCode::Char('0') => app.log_horizontal = 0,
                 KeyCode::Char('c') => {
                     clear_log_view(app);
                     app.log_scroll_from_bottom = 0;
@@ -608,7 +649,7 @@ fn handle_key(
                     .saturating_add(4)
                     .min(DETAIL_HORIZONTAL_LIMIT);
             }
-            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+            KeyCode::Esc | KeyCode::Char('q') => close_modal(app),
             _ => {}
         },
         Mode::Doctor => match code {
@@ -630,12 +671,12 @@ fn handle_key(
                     .saturating_add(8)
                     .min(app.doctor_results.len().saturating_sub(1) as u16);
             }
-            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+            KeyCode::Esc | KeyCode::Char('q') => close_modal(app),
             _ => {}
         },
         Mode::Help => {
             if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
-                app.mode = Mode::Normal;
+                close_modal(app);
             }
         }
         Mode::QuitConfirm => match code {
@@ -650,7 +691,7 @@ fn handle_key(
                 }
                 let Some(template) = app.template.clone() else {
                     app.status_line = "no template selected; nothing was stopped".to_string();
-                    app.mode = Mode::Normal;
+                    close_modal(app);
                     return;
                 };
                 let runtime = app.runtime.clone();
@@ -671,7 +712,7 @@ fn handle_key(
                     },
                 );
             }
-            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Esc => close_modal(app),
             _ => {}
         },
         Mode::Normal => match code {
@@ -819,7 +860,7 @@ fn handle_key(
                 let tx = doctor_tx.clone();
                 tokio::spawn(async move {
                     let result =
-                        tokio::task::spawn_blocking(move || doctor::run_with_runtime(&runtime))
+                        tokio::task::spawn_blocking(move || doctor::run_with_project(&runtime))
                             .await
                             .map_err(|error| error.to_string());
                     let _ = tx.send(DoctorMessage { result });
@@ -852,6 +893,14 @@ fn handle_key(
             _ => {}
         },
     }
+}
+
+fn close_modal(app: &mut App) {
+    app.mode = Mode::Normal;
+    // Log output can contain cursor-control sequences that make the physical
+    // terminal diverge from ratatui's previous buffer. Force one complete
+    // repaint whenever an overlay is dismissed so no modal cells can survive.
+    app.needs_full_clear = true;
 }
 
 fn start_action<F>(
@@ -909,14 +958,42 @@ fn open_logs(app: &mut App) {
     let Some(name) = app.selected_name() else {
         return;
     };
-    let Ok((stdout_path, stderr_path)) = app.runtime.log_paths(&name) else {
-        app.status_line = format!("could not locate logs for '{name}'");
-        return;
+    let (stdout_path, stderr_path) = match app.runtime.log_files(&name) {
+        Ok(Some(paths)) => paths,
+        Ok(None) => {
+            app.invalidate_external_logs();
+            clear_log_view(app);
+            app.log_search.clear();
+            app.log_searching = false;
+            app.log_scroll_from_bottom = 0;
+            app.log_horizontal = 0;
+            app.log_follow = true;
+            app.log_history_exhausted = true;
+            app.log_history_stale = false;
+            app.stdout_follower = None;
+            app.stderr_follower = None;
+            app.stdout_history = None;
+            app.stderr_history = None;
+            app.stdout_history_skip = 0;
+            app.stderr_history_skip = 0;
+            app.log_service = Some(name.clone());
+            app.external_logs = true;
+            app.mode = Mode::Logs;
+            app.status_line = format!("loading runtime logs for '{name}'...");
+            return;
+        }
+        Err(error) => {
+            app.status_line = format!("could not locate logs for '{name}': {error}");
+            return;
+        }
     };
+    app.invalidate_external_logs();
+    app.external_logs = false;
     clear_log_view(app);
     app.log_search.clear();
     app.log_searching = false;
     app.log_scroll_from_bottom = 0;
+    app.log_horizontal = 0;
     app.log_follow = true;
     app.log_history_stale = false;
     let rotated_files = app.runtime.config().logs.rotated_files;
@@ -986,7 +1063,7 @@ fn open_logs(app: &mut App) {
 }
 
 fn refresh_log_followers(app: &mut App) {
-    if app.mode != Mode::Logs {
+    if app.mode != Mode::Logs || app.external_logs {
         return;
     }
     let Some(service) = app.log_service.clone() else {
@@ -1030,6 +1107,66 @@ fn refresh_log_followers(app: &mut App) {
     }
 }
 
+fn schedule_external_log_refresh(app: &mut App, tx: &mpsc::UnboundedSender<ExternalLogMessage>) {
+    if app.mode != Mode::Logs
+        || !app.external_logs
+        || !app.log_follow
+        || app.active_external_log.is_some()
+        || Instant::now() < app.external_log_due
+    {
+        return;
+    }
+    let Some(service) = app.log_service.clone() else {
+        return;
+    };
+    app.next_external_log_id = app.next_external_log_id.wrapping_add(1);
+    let id = app.next_external_log_id;
+    app.active_external_log = Some(id);
+    app.external_log_due = Instant::now() + EXTERNAL_LOG_POLL_INTERVAL;
+    let runtime = app.runtime.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = runtime
+            .capture_external_logs(&service, INITIAL_LOG_LINES)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = tx.send(ExternalLogMessage {
+            id,
+            service,
+            result,
+        });
+    });
+}
+
+fn apply_external_log(app: &mut App, message: ExternalLogMessage) {
+    if app.active_external_log != Some(message.id) {
+        return;
+    }
+    app.active_external_log = None;
+    if app.mode != Mode::Logs
+        || !app.external_logs
+        || app.log_service.as_deref() != Some(message.service.as_str())
+    {
+        return;
+    }
+    match message.result {
+        Ok(lines) => {
+            clear_log_view(app);
+            append_log_lines(app, "runtime", lines);
+            app.log_scroll_from_bottom = 0;
+            app.log_history_exhausted = true;
+            app.log_history_stale = false;
+            app.status_line = format!("showing runtime logs for '{}'", message.service);
+        }
+        Err(error) => {
+            app.status_line = format!(
+                "could not load runtime logs for '{}': {error}",
+                message.service
+            )
+        }
+    }
+}
+
 fn append_log_lines(app: &mut App, stream: &str, lines: Vec<String>) {
     for line in lines {
         let rendered = render_log_line(app, stream, &line);
@@ -1068,10 +1205,11 @@ fn prepend_log_lines(app: &mut App, stream: &str, lines: Vec<String>) -> usize {
 }
 
 fn render_log_line(app: &App, stream: &str, line: &str) -> String {
+    let safe_line = sanitize_terminal_text(line);
     let mut rendered = format!(
         "[{stream}] {}",
         app.redactor
-            .redact_bounded(line, app.runtime.config().logs.max_line_bytes)
+            .redact_bounded(&safe_line, app.runtime.config().logs.max_line_bytes)
     );
     if rendered.len() > MAX_LOG_VIEW_BYTES {
         let mut boundary = MAX_LOG_VIEW_BYTES.saturating_sub(16);
@@ -1082,6 +1220,80 @@ fn render_log_line(app: &App, stream: &str, line: &str) -> String {
         rendered.push_str("… [truncated]");
     }
     rendered
+}
+
+#[derive(Clone, Copy)]
+enum TerminalSequence {
+    Text,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    ControlString,
+    ControlStringEscape,
+}
+
+/// Remove sequences that could move the real terminal cursor or alter its
+/// state. Log content is data: it must never become terminal instructions.
+fn sanitize_terminal_text(input: &str) -> String {
+    use TerminalSequence::*;
+
+    let mut output = String::with_capacity(input.len());
+    let mut state = Text;
+    for character in input.chars() {
+        state = match state {
+            Text => match character {
+                '\u{1b}' => Escape,
+                '\u{9b}' => Csi,
+                '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => ControlString,
+                '\t' => {
+                    output.push_str("    ");
+                    Text
+                }
+                '\r' | '\n' => {
+                    output.push(' ');
+                    Text
+                }
+                character if character.is_control() => Text,
+                character => {
+                    output.push(character);
+                    Text
+                }
+            },
+            Escape => match character {
+                '[' => Csi,
+                ']' | 'P' | 'X' | '^' | '_' => ControlString,
+                '\u{20}'..='\u{2f}' => EscapeIntermediate,
+                _ => Text,
+            },
+            EscapeIntermediate => {
+                if ('\u{30}'..='\u{7e}').contains(&character) {
+                    Text
+                } else {
+                    EscapeIntermediate
+                }
+            }
+            Csi => {
+                if ('\u{40}'..='\u{7e}').contains(&character) {
+                    Text
+                } else {
+                    Csi
+                }
+            }
+            ControlString => match character {
+                '\u{7}' => Text,
+                '\u{1b}' => ControlStringEscape,
+                _ => ControlString,
+            },
+            ControlStringEscape => {
+                if character == '\\' {
+                    Text
+                } else {
+                    ControlString
+                }
+            }
+        };
+    }
+    output
 }
 
 fn scroll_logs_up(app: &mut App, amount: usize) {
@@ -1258,7 +1470,7 @@ mod tests {
             local_path: None,
             root_dir: root.clone(),
         };
-        let runtime = DetachedRuntime::with_state_root(
+        let runtime = ProjectRuntime::with_state_root(
             "demo".to_string(),
             loaded,
             HashMap::new(),
@@ -1292,7 +1504,7 @@ mod tests {
             local_path: None,
             root_dir: root.clone(),
         };
-        let runtime = DetachedRuntime::with_state_root(
+        let runtime = ProjectRuntime::with_state_root(
             "demo".to_string(),
             loaded,
             HashMap::new(),
@@ -1319,6 +1531,57 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('q'), &action_tx, &doctor_tx);
         handle_key(&mut app, KeyCode::Char('l'), &action_tx, &doctor_tx);
         assert!(app.should_quit);
+        cleanup(app, root);
+    }
+
+    #[test]
+    fn closing_a_modal_requests_a_complete_terminal_repaint() {
+        let (mut app, root) = logs_app();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel();
+        let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
+        app.mode = Mode::Logs;
+
+        handle_key(&mut app, KeyCode::Esc, &action_tx, &doctor_tx);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.needs_full_clear);
+        cleanup(app, root);
+    }
+
+    #[test]
+    fn log_lines_cannot_emit_terminal_control_sequences() {
+        let (app, root) = empty_app();
+        let input = concat!(
+            "plain\r99%",
+            "\u{1b}[31mred\u{1b}[0m",
+            "\u{1b}]0;owned\u{7}",
+            " ok\tend",
+            "\u{9b}2Jdone"
+        );
+
+        let rendered = render_log_line(&app, "runtime", input);
+
+        assert_eq!(rendered, "[runtime] plain 99%red ok    enddone");
+        assert!(!rendered.chars().any(char::is_control));
+        cleanup(app, root);
+    }
+
+    #[test]
+    fn log_view_supports_horizontal_navigation() {
+        let (mut app, root) = logs_app();
+        let (action_tx, _action_rx) = mpsc::unbounded_channel();
+        let (doctor_tx, _doctor_rx) = mpsc::unbounded_channel();
+        app.mode = Mode::Logs;
+
+        handle_key(&mut app, KeyCode::Right, &action_tx, &doctor_tx);
+        handle_key(&mut app, KeyCode::Char('l'), &action_tx, &doctor_tx);
+        assert_eq!(app.log_horizontal, LOG_HORIZONTAL_STEP * 2);
+
+        handle_key(&mut app, KeyCode::Left, &action_tx, &doctor_tx);
+        assert_eq!(app.log_horizontal, LOG_HORIZONTAL_STEP);
+
+        handle_key(&mut app, KeyCode::Char('0'), &action_tx, &doctor_tx);
+        assert_eq!(app.log_horizontal, 0);
         cleanup(app, root);
     }
 
@@ -1478,6 +1741,42 @@ mod tests {
         assert_eq!(app.log_lines.len(), MAX_LOG_LINES);
         assert!(app.log_bytes <= MAX_LOG_VIEW_BYTES);
         assert!(app.log_lines.front().unwrap().contains("line-100"));
+        cleanup(app, root);
+    }
+
+    #[test]
+    fn external_runtime_log_snapshots_render_in_the_tui_and_ignore_stale_results() {
+        let (mut app, root) = empty_app();
+        app.mode = Mode::Logs;
+        app.external_logs = true;
+        app.log_service = Some("logto".to_string());
+        app.active_external_log = Some(7);
+
+        apply_external_log(
+            &mut app,
+            ExternalLogMessage {
+                id: 7,
+                service: "logto".to_string(),
+                result: Ok(vec!["first line".to_string(), "second line".to_string()]),
+            },
+        );
+        assert_eq!(app.log_lines.len(), 2);
+        assert!(app.log_lines[0].contains("[runtime] first line"));
+        assert!(app.status_line.contains("showing runtime logs"));
+
+        app.active_external_log = Some(9);
+        apply_external_log(
+            &mut app,
+            ExternalLogMessage {
+                id: 8,
+                service: "logto".to_string(),
+                result: Ok(vec!["stale line".to_string()]),
+            },
+        );
+        assert!(app
+            .log_lines
+            .iter()
+            .all(|line| !line.contains("stale line")));
         cleanup(app, root);
     }
 }

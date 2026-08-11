@@ -335,8 +335,17 @@ fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
         format!(" filter: /{} ", app.log_search)
     };
     let visible_height = usize::from(popup.height.saturating_sub(2));
+    let visible_width = usize::from(popup.width.saturating_sub(2));
     app.log_visible_height = visible_height;
     let max_scroll = lines.len().saturating_sub(visible_height);
+    let max_horizontal = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or_default()
+        .saturating_sub(visible_width)
+        .min(usize::from(u16::MAX)) as u16;
+    app.log_horizontal = app.log_horizontal.min(max_horizontal);
     let from_bottom = app.log_scroll_from_bottom.min(max_scroll);
     let scroll = max_scroll
         .saturating_sub(from_bottom)
@@ -348,9 +357,11 @@ fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
         " Home: older"
     };
     f.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)).block(
+        Paragraph::new(lines)
+            .scroll((scroll, app.log_horizontal))
+            .block(
             Block::default().borders(Borders::ALL).title(format!(
-                " {name} — logs [{state}] (j/k, PgUp/PgDn, End: live,{history}, /: search, c: clear, esc: close){search}"
+                " {name} — logs [{state}] (j/k: vertical, h/l: horizontal, 0: left, PgUp/PgDn, End: live,{history}, /: search, c: clear, esc: close){search}"
             )),
         ),
         popup,

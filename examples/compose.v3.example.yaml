@@ -1,0 +1,14 @@
+services:
+  database:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: local-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  migrate:
+    image: alpine:3.22
+    command: ["sh", "-c", "echo replace-with-your-migration-command"]

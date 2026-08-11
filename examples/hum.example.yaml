@@ -1,17 +1,17 @@
-# Runnable hum v1 configuration for Compri.
+# Runnable hum v1 configuration for Demo.
 # Copy this to hum.yaml and adjust repository paths for your machine, or
 # override them in an untracked hum.local.yaml.
 version: 1
 
 repositories:
   applications:
-    path: ~/code/compri/compri-applications
+    path: ~/code/demo/demo-applications
 
   api:
-    path: ~/code/compri/compri-api
+    path: ~/code/demo/demo-api
 
   agents:
-    path: ~/code/compri/compri-agents
+    path: ~/code/demo/demo-agents
 
 services:
   frontend:

@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,7 +9,8 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, HealthcheckConfig, Loaded, ReadyMode};
+use crate::config::{Config, HealthcheckConfig, Loaded, ReadyMode, RuntimeConfig};
+#[cfg(test)]
 use crate::core::graph;
 use crate::core::state::{HealthState, PortState, PresentationState, ProcessState};
 
@@ -142,10 +145,6 @@ impl DetachedRuntime {
         &self.registry
     }
 
-    pub fn project(&self) -> &str {
-        &self.project
-    }
-
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -158,82 +157,80 @@ impl DetachedRuntime {
         &self.env_overrides
     }
 
+    pub fn owns_service(&self, name: &str) -> bool {
+        let Some(service) = self.config.services.get(name) else {
+            return false;
+        };
+        if self.config.version <= 2 {
+            return true;
+        }
+        service.runtime.as_deref().is_some_and(|runtime| {
+            matches!(
+                self.config.runtimes.get(runtime),
+                Some(RuntimeConfig::Process {})
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub async fn start_template(&self, template: &str) -> Result<StartReport> {
         let order = graph::services_for_template(&self.config, template)?;
         self.start_ordered(&order).await
     }
 
-    pub async fn start_services(&self, services: &[String]) -> Result<StartReport> {
-        let order = graph::resolve_start_order(&self.config, services)?;
-        self.start_ordered(&order).await
+    pub async fn start_services_exact(&self, services: &[String]) -> Result<StartReport> {
+        let registry = self.registry.clone();
+        let _lock = tokio::task::spawn_blocking(move || registry.lock())
+            .await
+            .context("project lock task failed")??;
+        let mut report = StartReport::default();
+        let mut started_entries = Vec::new();
+        for name in services {
+            match self.start_one(name).await {
+                Ok(StartOne::Started(entry)) => {
+                    report.started.push(name.clone());
+                    started_entries.push(*entry);
+                }
+                Ok(StartOne::AlreadyRunning) => report.already_running.push(name.clone()),
+                Err(error) => return Err(self.with_rollback(error, &started_entries).await),
+            }
+        }
+        Ok(report)
     }
 
-    pub async fn status_template(&self, template: &str) -> Result<Vec<DetachedServiceStatus>> {
-        let order = graph::services_for_template(&self.config, template)?;
-        self.status_ordered(&order, true).await
+    pub async fn status_services(&self, services: &[String]) -> Result<Vec<DetachedServiceStatus>> {
+        self.status_ordered(services, true).await
     }
 
+    pub async fn monitor_services_exact(
+        &self,
+        services: &[String],
+    ) -> Result<Vec<DetachedServiceStatus>> {
+        self.status_ordered(services, false).await
+    }
+
+    pub async fn wait_service_ready(&self, service: &str) -> Result<()> {
+        self.wait_ready(service).await
+    }
+
+    #[cfg(test)]
     pub async fn monitor_template(&self, template: &str) -> Result<Vec<DetachedServiceStatus>> {
         let order = graph::services_for_template(&self.config, template)?;
         self.status_ordered(&order, false).await
     }
 
-    pub async fn check_service_health(&self, name: &str) -> Result<(HealthState, String, u64)> {
-        let service = self
-            .config
-            .services
-            .get(name)
-            .ok_or_else(|| anyhow!("unknown service '{name}'"))?;
-        let Some(check) = service.healthcheck.as_ref() else {
-            return Ok((HealthState::Unchecked, "not configured".to_string(), 0));
-        };
-        let started = std::time::Instant::now();
-        let result = health::check_once(check).await;
-        let duration = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        Ok(match result {
-            Ok(()) => (HealthState::Healthy, "ok".to_string(), duration),
-            Err(detail) => (HealthState::Unhealthy, detail, duration),
-        })
-    }
-
+    #[cfg(test)]
     pub async fn stop_template(&self, template: &str, grace: Duration) -> Result<StopReport> {
         let order = graph::stop_order(&graph::services_for_template(&self.config, template)?);
         self.stop_ordered(&order, grace).await
     }
 
-    pub async fn stop_services(&self, services: &[String], grace: Duration) -> Result<StopReport> {
-        let requested = services.iter().cloned().collect::<HashSet<_>>();
-        let start_order = graph::resolve_start_order(&self.config, services)?;
-        let order = graph::stop_order(
-            &start_order
-                .into_iter()
-                .filter(|name| requested.contains(name))
-                .collect::<Vec<_>>(),
-        );
-        self.stop_ordered(&order, grace).await
-    }
-
-    pub async fn restart_template(&self, template: &str, grace: Duration) -> Result<RestartReport> {
-        let start_order = graph::services_for_template(&self.config, template)?;
-        let stop_order = graph::stop_order(&start_order);
-        self.restart_ordered(&stop_order, &start_order, grace).await
-    }
-
-    pub async fn restart_services(
+    pub async fn stop_services_exact(
         &self,
         services: &[String],
         grace: Duration,
-    ) -> Result<RestartReport> {
-        let start_order = graph::resolve_start_order(&self.config, services)?;
-        let requested = services.iter().cloned().collect::<HashSet<_>>();
-        let stop_order = graph::stop_order(
-            &start_order
-                .iter()
-                .filter(|name| requested.contains(*name))
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        self.restart_ordered(&stop_order, &start_order, grace).await
+    ) -> Result<StopReport> {
+        self.stop_ordered(services, grace).await
     }
 
     pub fn log_paths(&self, service: &str) -> Result<(PathBuf, PathBuf)> {
@@ -243,6 +240,7 @@ impl DetachedRuntime {
         Ok(self.registry.log_paths(service))
     }
 
+    #[cfg(test)]
     async fn start_ordered(&self, order: &[String]) -> Result<StartReport> {
         let registry = self.registry.clone();
         let _lock = tokio::task::spawn_blocking(move || registry.lock())
@@ -251,6 +249,7 @@ impl DetachedRuntime {
         self.start_ordered_locked(order).await
     }
 
+    #[cfg(test)]
     async fn start_ordered_locked(&self, order: &[String]) -> Result<StartReport> {
         let mut report = StartReport::default();
         let mut started_entries = Vec::new();
@@ -520,27 +519,6 @@ impl DetachedRuntime {
         Ok(report)
     }
 
-    async fn restart_ordered(
-        &self,
-        stop_order: &[String],
-        start_order: &[String],
-        grace: Duration,
-    ) -> Result<RestartReport> {
-        let registry = self.registry.clone();
-        let _lock = tokio::task::spawn_blocking(move || registry.lock())
-            .await
-            .context("project lock task failed")??;
-        let stop = self.stop_ordered_locked(stop_order, grace).await?;
-        if !stop.succeeded() {
-            return Ok(RestartReport { stop, start: None });
-        }
-        let start = self.start_ordered_locked(start_order).await?;
-        Ok(RestartReport {
-            stop,
-            start: Some(start),
-        })
-    }
-
     fn observe_port(
         &self,
         port: Option<u16>,
@@ -622,8 +600,14 @@ impl DetachedRuntime {
         }
 
         let cwd = self.service_cwd(name)?;
-        let env =
-            crate::config::environment::resolve_service_env(service, &cwd, &self.env_overrides)?;
+        let env = crate::config::environment::resolve_service_env_with_providers(
+            &self.config,
+            service,
+            &cwd,
+            &self.root_dir,
+            &self.env_overrides,
+        )
+        .await?;
         let (stdout_log, stderr_log) = self.registry.log_paths(name);
         let exit_code_file = self.registry.prepare_exit_code(name)?;
         let runtime_token = new_runtime_token()?;

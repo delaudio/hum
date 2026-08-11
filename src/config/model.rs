@@ -13,8 +13,18 @@ pub struct Config {
     pub project: Option<String>,
     #[serde(default)]
     pub repositories: HashMap<String, RepositoryConfig>,
+    /// Named runtime adapters. Version 1/2 configurations implicitly use the
+    /// built-in process runtime; version 3 services select one explicitly.
+    #[serde(default)]
+    pub runtimes: HashMap<String, RuntimeConfig>,
+    /// Named environment providers. Providers describe how values are
+    /// obtained; service declarations only refer to a provider by name.
+    #[serde(default)]
+    pub environment_providers: HashMap<String, EnvironmentProviderConfig>,
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
+    #[serde(default)]
+    pub tasks: HashMap<String, TaskConfig>,
     #[serde(default, alias = "profiles")]
     pub templates: HashMap<String, TemplateConfig>,
     #[serde(default)]
@@ -69,6 +79,10 @@ pub struct RepositoryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
+    /// Version 3 runtime name. Omitted by legacy process-only configurations.
+    pub runtime: Option<String>,
+    /// Runtime-native service identifier, for example a Compose service name.
+    pub target: Option<String>,
     pub repository: Option<String>,
     pub cwd: Option<PathBuf>,
     pub command: Option<String>,
@@ -78,6 +92,8 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
+    pub env_from: Vec<EnvironmentSourceConfig>,
+    #[serde(default)]
     pub depends_on: Vec<String>,
     pub healthcheck: Option<HealthcheckConfig>,
     #[serde(default)]
@@ -85,6 +101,73 @@ pub struct ServiceConfig {
     /// started | healthy — when a dependent service is allowed to start.
     #[serde(default)]
     pub depends_on_ready: Option<ReadyMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskConfig {
+    /// Direct argv. The first element is the executable; hum never inserts a
+    /// shell around project tasks.
+    pub command: Vec<String>,
+    pub check: Option<Vec<String>>,
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub env_from: Vec<EnvironmentSourceConfig>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default = "default_task_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+fn default_task_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RuntimeConfig {
+    Process {},
+    Compose {
+        project_name: String,
+        files: Vec<PathBuf>,
+        /// Runtime layers created by project tasks. Existing files are passed
+        /// to Compose; absent files are valid before their producer runs.
+        #[serde(default)]
+        generated_files: Vec<PathBuf>,
+        #[serde(default)]
+        profiles: Vec<String>,
+        env_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum EnvironmentProviderConfig {
+    OnePassword { account: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentSourceConfig {
+    pub provider: String,
+    pub reference: String,
+    #[serde(default)]
+    pub format: EnvironmentSourceFormat,
+    #[serde(default)]
+    pub optional: bool,
+    /// Optional key contract for dotenv-shaped provider results.
+    pub schema: Option<PathBuf>,
+    /// Optional owner-only plaintext cache used when the provider is offline.
+    pub cache: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvironmentSourceFormat {
+    #[default]
+    Dotenv,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

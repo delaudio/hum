@@ -1,0 +1,26 @@
+class Hum < Formula
+  desc "Product-neutral local development orchestrator and terminal monitor"
+  homepage "https://github.com/delaudio/hum"
+  version "@VERSION@"
+
+  depends_on :macos
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "@BASE_URL@/hum-#{version}-macos-arm64.tar.gz"
+      sha256 "@ARM64_SHA256@"
+    else
+      url "@BASE_URL@/hum-#{version}-macos-x86_64.tar.gz"
+      sha256 "@X86_64_SHA256@"
+    end
+  end
+
+  def install
+    bin.install "hum"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/hum --version")
+    assert_match "Usage:", shell_output("#{bin}/hum --help")
+  end
+end

@@ -3,6 +3,8 @@ name = "hum"
 version = "0.1.0"
 edition = "2021"
 description = "Keep your local stack humming — a local dev process orchestrator TUI/CLI"
+homepage = "https://github.com/delaudio/hum"
+repository = "https://github.com/delaudio/hum"
 
 [[bin]]
 name = "hum"

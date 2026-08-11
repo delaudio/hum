@@ -32,6 +32,7 @@ impl From<&LogConfig> for LogPolicy {
     }
 }
 
+#[derive(Clone)]
 pub struct Redactor {
     patterns: Vec<regex::Regex>,
 }

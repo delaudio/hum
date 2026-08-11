@@ -1,0 +1,66 @@
+# Product-neutral v3 example: a Compose dependency, a one-shot task, a local
+# process, and a 1Password-backed dotenv source.
+version: 3
+project: sample
+
+runtimes:
+  local:
+    type: process
+  containers:
+    type: compose
+    project_name: hum-sample
+    files:
+      - compose.v3.example.yaml
+
+environment_providers:
+  team-vault:
+    type: one-password
+
+tasks:
+  migrate:
+    command:
+      - docker
+      - compose
+      - --project-name
+      - hum-sample
+      - --file
+      - compose.v3.example.yaml
+      - run
+      - --rm
+      - migrate
+    depends_on:
+      - database
+    timeout: 2m
+
+services:
+  database:
+    runtime: containers
+    target: database
+
+  api:
+    runtime: local
+    command: python3 -m http.server 8080
+    port: 8080
+    url: http://localhost:8080
+    env_file: api.env.example
+    env_from:
+      - provider: team-vault
+        reference: op://Development/sample-api/environment
+        format: dotenv
+        optional: true
+        schema: api.env.example
+        cache: .hum/cache/api.env
+    depends_on:
+      - migrate
+    healthcheck:
+      type: http
+      url: http://localhost:8080
+
+templates:
+  backend:
+    services:
+      - api
+
+  infrastructure:
+    services:
+      - database

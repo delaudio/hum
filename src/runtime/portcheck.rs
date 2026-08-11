@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -111,7 +111,6 @@ fn resolve_addresses(host: &str, port: u16, timeout: Duration) -> Option<Vec<Soc
 /// Information about whatever is occupying a port, when we can determine it
 /// (RF-15). Best-effort: process inspection differs across platforms.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PortOccupant {
     pub pid: Option<u32>,
     pub process_name: Option<String>,
@@ -129,6 +128,20 @@ pub fn check_port(port: u16) -> Option<PortOccupant> {
 }
 
 pub fn identify_occupant(port: u16) -> PortOccupant {
+    identify_occupants(port)
+        .into_iter()
+        .next()
+        .unwrap_or(PortOccupant {
+            pid: None,
+            process_name: None,
+            command: None,
+        })
+}
+
+/// Return every distinct process listening on `port` when the platform can
+/// identify them. Multiple listeners matter on hosts where a loopback-specific
+/// bind can shadow a container runtime's wildcard port forwarder.
+pub fn identify_occupants(port: u16) -> Vec<PortOccupant> {
     // Best-effort: sysinfo does not expose per-socket ownership portably, so
     // we shell out to `lsof` on unix, which is present on macOS and most
     // Linux dev boxes, and fall back to "unknown" if it isn't.
@@ -139,42 +152,47 @@ pub fn identify_occupant(port: u16) -> PortOccupant {
             .output()
         {
             if let Ok(text) = String::from_utf8(output.stdout) {
-                if let Some(pid_str) = text.lines().next() {
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-                        let process_pid = sysinfo::Pid::from_u32(pid);
-                        let mut system = System::new();
-                        system.refresh_processes_specifics(
-                            ProcessesToUpdate::Some(&[process_pid]),
-                            true,
-                            ProcessRefreshKind::everything(),
-                        );
-                        let name = system
-                            .process(sysinfo::Pid::from_u32(pid))
-                            .map(|p| p.name().to_string_lossy().to_string());
-                        let cmd = system.process(sysinfo::Pid::from_u32(pid)).map(|p| {
-                            p.cmd()
-                                .iter()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        });
-                        return PortOccupant {
-                            pid: Some(pid),
-                            process_name: name,
-                            command: cmd,
-                        };
-                    }
+                let pids = text
+                    .lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok())
+                    .collect::<BTreeSet<_>>();
+                if !pids.is_empty() {
+                    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+                    let process_pids = pids
+                        .iter()
+                        .copied()
+                        .map(sysinfo::Pid::from_u32)
+                        .collect::<Vec<_>>();
+                    let mut system = System::new();
+                    system.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&process_pids),
+                        true,
+                        ProcessRefreshKind::everything(),
+                    );
+                    return pids
+                        .into_iter()
+                        .map(|pid| {
+                            let process = system.process(sysinfo::Pid::from_u32(pid));
+                            PortOccupant {
+                                pid: Some(pid),
+                                process_name: process
+                                    .map(|process| process.name().to_string_lossy().to_string()),
+                                command: process.map(|process| {
+                                    process
+                                        .cmd()
+                                        .iter()
+                                        .map(|word| word.to_string_lossy().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                }),
+                            }
+                        })
+                        .collect();
                 }
             }
         }
     }
-
-    PortOccupant {
-        pid: None,
-        process_name: None,
-        command: None,
-    }
+    Vec::new()
 }
 
 pub fn belongs_to_process_tree(pid: u32, root_pid: u32) -> bool {

@@ -1,6 +1,10 @@
+pub mod adapter;
+pub mod compose;
 pub mod detached;
 pub mod health;
 pub mod logs;
 pub mod portcheck;
 pub mod process;
+pub mod project;
 pub mod registry;
+pub mod task;

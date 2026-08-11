@@ -83,6 +83,7 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded, ConfigError> {
     let base_path = discover(explicit)?;
     let root_dir = base_path
         .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
@@ -218,13 +219,35 @@ fn validate_partial_schema(
         "version",
         "project",
         "repositories",
+        "runtimes",
+        "environment_providers",
         "services",
+        "tasks",
         "templates",
         "profiles",
         "logs",
     ];
     const REPOSITORY: &[&str] = &["path"];
+    const RUNTIME: &[&str] = &[
+        "type",
+        "project_name",
+        "files",
+        "generated_files",
+        "profiles",
+        "env_file",
+    ];
+    const ENVIRONMENT_PROVIDER: &[&str] = &["type", "account"];
+    const ENVIRONMENT_SOURCE: &[&str] = &[
+        "provider",
+        "reference",
+        "format",
+        "optional",
+        "schema",
+        "cache",
+    ];
     const SERVICE: &[&str] = &[
+        "runtime",
+        "target",
         "repository",
         "cwd",
         "command",
@@ -232,10 +255,20 @@ fn validate_partial_schema(
         "url",
         "env_file",
         "env",
+        "env_from",
         "depends_on",
         "healthcheck",
         "requires",
         "depends_on_ready",
+    ];
+    const TASK: &[&str] = &[
+        "command",
+        "check",
+        "cwd",
+        "env",
+        "env_from",
+        "depends_on",
+        "timeout",
     ];
     const REQUIREMENTS: &[&str] = &["commands", "files", "env"];
     const HEALTHCHECK: &[&str] = &[
@@ -271,9 +304,23 @@ fn validate_partial_schema(
             check_keys(repository, REPOSITORY, file, source)?;
         }
     }
+    if let Some(runtimes) = root.get("runtimes").and_then(yaml_serde::Value::as_mapping) {
+        for runtime in runtimes.values().filter_map(yaml_serde::Value::as_mapping) {
+            check_keys(runtime, RUNTIME, file, source)?;
+        }
+    }
+    if let Some(providers) = root
+        .get("environment_providers")
+        .and_then(yaml_serde::Value::as_mapping)
+    {
+        for provider in providers.values().filter_map(yaml_serde::Value::as_mapping) {
+            check_keys(provider, ENVIRONMENT_PROVIDER, file, source)?;
+        }
+    }
     if let Some(services) = root.get("services").and_then(yaml_serde::Value::as_mapping) {
         for service in services.values().filter_map(yaml_serde::Value::as_mapping) {
             check_keys(service, SERVICE, file, source)?;
+            check_environment_sources(service, ENVIRONMENT_SOURCE, file, source)?;
             if let Some(requires) = service
                 .get("requires")
                 .and_then(yaml_serde::Value::as_mapping)
@@ -288,6 +335,12 @@ fn validate_partial_schema(
             }
         }
     }
+    if let Some(tasks) = root.get("tasks").and_then(yaml_serde::Value::as_mapping) {
+        for task in tasks.values().filter_map(yaml_serde::Value::as_mapping) {
+            check_keys(task, TASK, file, source)?;
+            check_environment_sources(task, ENVIRONMENT_SOURCE, file, source)?;
+        }
+    }
     for templates_key in ["templates", "profiles"] {
         if let Some(templates) = root
             .get(templates_key)
@@ -300,6 +353,23 @@ fn validate_partial_schema(
     }
     if let Some(logs) = root.get("logs").and_then(yaml_serde::Value::as_mapping) {
         check_keys(logs, LOGS, file, source)?;
+    }
+    Ok(())
+}
+
+fn check_environment_sources(
+    owner: &yaml_serde::Mapping,
+    allowed: &[&str],
+    file: &Path,
+    source: &str,
+) -> Result<(), ConfigError> {
+    if let Some(sources) = owner
+        .get("env_from")
+        .and_then(yaml_serde::Value::as_sequence)
+    {
+        for environment_source in sources.iter().filter_map(yaml_serde::Value::as_mapping) {
+            check_keys(environment_source, allowed, file, source)?;
+        }
     }
     Ok(())
 }
@@ -385,6 +455,52 @@ templates:
     }
 
     #[test]
+    fn parses_and_validates_v3_runtime_and_environment_provider_schema() {
+        let yaml = r#"
+version: 3
+project: demo
+environment_providers:
+  company:
+    type: one-password
+runtimes:
+  local:
+    type: process
+  infra:
+    type: compose
+    project_name: demo_local
+    files: [compose.yaml]
+services:
+  api:
+    runtime: local
+    command: cargo run
+  database:
+    runtime: infra
+    target: postgres
+    env_from:
+      - provider: company
+        reference: op://Development/database/environment
+        format: dotenv
+        optional: true
+        schema: config/database.env.example
+        cache: .hum/cache/database.env
+templates:
+  all:
+    services: [api, database]
+"#;
+        let config = yaml_serde::from_str::<Config>(yaml).unwrap();
+        validate::validate(&config, Path::new("hum.yaml")).unwrap();
+        assert!(matches!(
+            config.runtimes["infra"],
+            crate::config::RuntimeConfig::Compose { .. }
+        ));
+        assert_eq!(
+            config.services["database"].target.as_deref(),
+            Some("postgres")
+        );
+        assert_eq!(config.services["database"].env_from.len(), 1);
+    }
+
+    #[test]
     fn local_values_override_base_values_recursively() {
         let base = yaml_serde::from_str("service:\n  command: base\n  port: 3000\n").unwrap();
         let local = yaml_serde::from_str("service:\n  command: local\n").unwrap();
@@ -392,6 +508,31 @@ templates:
 
         assert_eq!(merged["service"]["command"], "local");
         assert_eq!(merged["service"]["port"], 3000);
+    }
+
+    #[test]
+    fn local_v3_task_environment_override_is_supported() {
+        let root = std::env::temp_dir().join(format!("hum-local-v3-task-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let local = root.join(LOCAL_CONFIG_FILE);
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nruntimes:\n  local:\n    type: process\ntasks:\n  login:\n    command: [\"true\"]\n    env:\n      AWS_PROFILE: default\nservices:\n  api:\n    runtime: local\n    command: \"true\"\n    depends_on: [login]\ntemplates:\n  all:\n    services: [api]\n",
+        )
+        .unwrap();
+        fs::write(
+            &local,
+            "version: 3\ntasks:\n  login:\n    env:\n      AWS_PROFILE: developer\n",
+        )
+        .unwrap();
+
+        let loaded = load(Some(&base)).unwrap();
+        assert_eq!(loaded.config.tasks["login"].env["AWS_PROFILE"], "developer");
+
+        fs::remove_file(base).unwrap();
+        fs::remove_file(local).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

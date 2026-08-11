@@ -4,25 +4,24 @@
 
 **Tagline:** Keep your local stack humming.
 
-**Tipo:** CLI e TUI per avviare e osservare processi locali di sviluppo
+**Tipo:** CLI e TUI per orchestrare runtime locali di sviluppo
 
 **Stack:** Rust, Ratatui, Tokio
 
 **Stato:** Draft
 
-**Versione prodotto:** 0.2
+**Versione prodotto:** 0.3
 
-**Versione configurazione progetto:** 2
+**Versione configurazione progetto:** 3
 
-> Questo documento definisce il contratto target della migrazione v2. Il
-> binario presente su `main` implementa ancora il prototipo v1; le funzionalità
-> diventano operative man mano che vengono completate le issue collegate
-> all'epic #16.
+> La v3 estende senza invalidare i file v1/v2 process-only. Le integrazioni di
+> prodotto appartengono a pack di configurazione esterni al repository `hum`.
 
 ## 1. Sintesi
 
-`hum` avvia, arresta, monitora e diagnostica i processi necessari allo sviluppo
-locale di prodotti composti da più servizi.
+`hum` avvia, arresta, monitora e diagnostica servizi locali attraverso adapter
+generici. Il grafo può includere processi, servizi Docker Compose e task
+one-shot dichiarativi.
 
 Il flusso principale è esplicito:
 
@@ -33,10 +32,10 @@ hum <project> <template> <command>
 Per esempio:
 
 ```bash
-hum compri all-services start
+hum demo all-services start
 ```
 
-`start` avvia i servizi selezionati come processi indipendenti e poi termina.
+`start` avvia i servizi selezionati tramite il rispettivo runtime e poi termina.
 Non rimane un daemon `hum` residente. Una successiva invocazione della CLI o
 della TUI ritrova i servizi tramite un runtime registry persistente e verifica
 il loro stato interrogando il sistema operativo.
@@ -69,10 +68,15 @@ normali processi locali, ispezionabili anche senza `hum`.
 
 ### 3.1 Project
 
-Un prodotto locale registrato con un nome stabile, per esempio `compri`. Il
+Un prodotto locale registrato con un nome stabile, per esempio `demo`. Il
 registry globale associa il nome al file di configurazione del progetto.
 
-### 3.2 Service
+### 3.2 Runtime
+
+Un adapter nominato e configurato dal progetto. La v3 include `process` e
+`compose`; nessun adapter contiene nomi, immagini o policy di prodotto.
+
+### 3.3 Service
 
 Un processo avviabile e monitorabile: frontend, API, worker, Storybook, mock
 server o un database avviato tramite un comando locale.
@@ -80,7 +84,18 @@ server o un database avviato tramite un comando locale.
 L'identità runtime è `<project>/<service>`. Lo stesso servizio incluso in due
 template non viene avviato due volte.
 
-### 3.3 Template
+### 3.4 Task
+
+Unità one-shot trusted-code eseguita come argv diretto, con timeout, dipendenze
+e controllo opzionale di idempotenza. Non è un servizio persistente.
+
+### 3.5 Environment provider
+
+Provider nominato che risolve sorgenti dotenv per il solo child interessato.
+La prima implementazione usa 1Password CLI senza esportare valori nel processo
+globale di `hum`.
+
+### 3.6 Template
 
 Un insieme nominato di servizi per un contesto di lavoro, per esempio
 `frontend`, `backend` o `all-services`. Sostituisce il concetto v1 di `profile`.
@@ -89,7 +104,7 @@ Un template seleziona servizi; non possiede i processi. Fermare un template
 significa richiedere lo stop dei servizi che seleziona, in ordine inverso alle
 dipendenze.
 
-### 3.4 Runtime registry
+### 3.7 Runtime registry
 
 Metadati persistenti che permettono a invocazioni separate di riconoscere un
 processo:
@@ -107,7 +122,7 @@ Il PID da solo non è un'identità sufficiente: prima di inviare un segnale `hum
 deve verificare anche start time e metadati disponibili, così da non colpire un
 PID riutilizzato.
 
-### 3.5 Process, port e health
+### 3.8 Process, port e health
 
 Sono segnali distinti:
 
@@ -133,6 +148,9 @@ essere contemporaneamente `unhealthy`.
 - Diagnosticare configurazione e runtime stale.
 - Consumare risorse trascurabili rispetto ai servizi gestiti.
 - Supportare inizialmente macOS e Linux.
+- Gestire Compose senza sostituirlo e senza duplicarne il modello.
+- Ottenere ambienti da provider dichiarativi senza stampare valori sensibili.
+- Conservare ogni conoscenza di prodotto in pack esterni.
 
 ## 5. Non obiettivi
 
@@ -141,10 +159,10 @@ La prima release non deve:
 - introdurre un daemon centrale `hum` residente;
 - riavviare automaticamente servizi dopo un crash;
 - sostituire Docker Compose, Kubernetes, launchd o systemd;
-- gestire deployment, host remoti, container o repliche;
+- gestire deployment, host remoti o repliche;
 - includere una REST API, autenticazione o plugin;
 - scaricare ed eseguire configurazioni remote;
-- gestire segreti aziendali o sincronizzare file `.env`;
+- diventare un vault o memorizzare segreti nel proprio schema;
 - diventare un package manager o un sistema di scheduling.
 
 I servizi vengono eseguiti in background, ma questa indipendenza non implica
@@ -161,14 +179,29 @@ hum <project> <template> <command> [arguments]
 Comandi iniziali:
 
 ```bash
-hum compri all-services start
-hum compri all-services stop
-hum compri all-services restart
-hum compri all-services status
-hum compri all-services logs api --follow
-hum compri all-services doctor
-hum compri all-services tui
+hum demo all-services start
+hum demo all-services stop
+hum demo all-services restart
+hum demo all-services status
+hum demo all-services plan --json
+hum demo all-services secrets sync
+hum demo all-services logs api --follow
+hum demo all-services reset
+hum demo all-services doctor
+hum demo all-services tui
 ```
+
+`plan`, `start`, `doctor` e `secrets sync` accettano esclusioni ripetibili:
+
+```bash
+hum demo all-services plan --exclude identity
+hum demo all-services start --exclude-service mail
+```
+
+`--exclude` sottrae i root del template indicato, ma una dipendenza necessaria
+può reintrodurli con un warning deterministico. `--exclude-service` è un veto
+forte: se un'unità rimasta dipende dal servizio escluso, la selezione fallisce
+prima di qualsiasi side effect.
 
 Varianti interattive:
 
@@ -238,23 +271,37 @@ Esempio:
 version: 1
 
 projects:
-  compri:
-    config: ~/code/compri/hum.yaml
+  demo:
+    config: ~/code/demo/hum.yaml
 ```
 
 ### 7.2 Configurazione progetto
 
-File condiviso `hum.yaml`, con override locale opzionale `hum.local.yaml`:
+File condiviso `hum.yaml`, con override locale opzionale `hum.local.yaml`. La
+v3 aggiunge runtime, provider e task nominati:
 
 ```yaml
-version: 2
-project: compri
+version: 3
+project: demo
+
+runtimes:
+  local:
+    type: process
+  containers:
+    type: compose
+    project_name: demo-local
+    files: [compose.yaml]
+
+environment_providers:
+  development:
+    type: one-password
 
 repositories:
   applications:
-    path: ./compri-applications
+    path: ./demo-applications
   api:
-    path: ./compri-api
+    runtime: local
+    path: ./demo-api
 
 services:
   api:
@@ -266,6 +313,10 @@ services:
       type: http
       url: http://localhost:3000/health
 
+  database:
+    runtime: containers
+    target: postgres
+
   frontend:
     repository: applications
     cwd: apps/procurement-frontend
@@ -273,6 +324,7 @@ services:
     port: 5173
     depends_on:
       - api
+      - database
 
 templates:
   all-services:
@@ -310,7 +362,7 @@ $XDG_STATE_HOME/hum/<project>/
 Layout indicativo:
 
 ```text
-~/.local/state/hum/compri/
+~/.local/state/hum/demo/
 ├── runtime/
 │   ├── api.json
 │   └── frontend.json
@@ -452,12 +504,16 @@ da un processo non riconosciuto è una diagnosi distinta.
 - Verificare identità e start time prima di segnalare un PID registrato.
 - Usare permessi utente per stato e log.
 - Non stampare valori di variabili sensibili.
+- Non scrivere valori sensibili nei file Compose generati.
+- Scrivere cache provider solo se configurate, atomicamente e con modo `0600`.
+- `doctor` verifica la disponibilità del provider senza leggere item.
 - Mascherare pattern configurati nella visualizzazione dei log.
 - Considerare i comandi locali configurati come codice fidato.
 - Non eseguire configurazioni remote automaticamente.
-- Non copiare o sincronizzare file `.env`.
+- Non modificare file `.env` posseduti dal progetto; le cache provider hanno
+  percorsi distinti, espliciti e gitignored.
 
-## 16. Migrazione dalla configurazione v1
+## 16. Migrazione delle configurazioni
 
 La v1 usava `profiles` e una CLI implicita basata sulla discovery del file. La
 v2 richiede:
@@ -473,14 +529,27 @@ Una configurazione v1 deve produrre un errore di migrazione leggibile. Non viene
 avviata implicitamente in modalità legacy, perché ciò reintrodurrebbe ownership
 e semantiche incompatibili.
 
+La v3 mantiene v1/v2 process-only e richiede che ogni servizio v3 scelga un
+runtime nominato. La migrazione da un CLI di prodotto sposta Compose, immagini,
+vault reference e bootstrap in un repository/pack del prodotto. Il core `hum`
+non importa moduli né manifest specifici di quel pack.
+
+Un runtime Compose può elencare layer `generated_files` prodotti da task del
+pack. I file assenti non invalidano `doctor`; quando esistono vengono aggiunti
+alla CLI Compose senza interpretarne il contenuto nel core.
+
 ## 17. Criteri di accettazione
 
 ### CLI e configurazione
 
-- `hum compri all-services start` funziona da qualunque directory.
+- `hum demo all-services start` funziona da qualunque directory.
 - Project e template sconosciuti hanno errori distinti.
 - Due template sovrapposti non duplicano un servizio.
 - Campi sconosciuti e path errati sono diagnosticati.
+- Lo stesso grafo ordina processi, servizi Compose e task senza cicli.
+- `plan` non contatta Docker o provider e non mostra valori d'ambiente.
+- Le esclusioni di template segnalano le dipendenze reintrodotte; le esclusioni
+  di servizio bloccano dipendenze incompatibili prima di ogni side effect.
 
 ### Lifecycle
 
@@ -501,23 +570,25 @@ e semantiche incompatibili.
 - Test di integrazione coprono invocazioni separate e processi reali fixture.
 - `cargo fmt --check`, Clippy, test e build release sono gate CI.
 - Test e benchmark non lasciano processi o stato residuo.
+- Un test con Docker fake verifica project isolation, start/stop/status/logs,
+  reset, task idempotenti e assenza di segreti nell'override generato.
 
 ## 18. Release iniziale proposta
 
-La release è pronta quando uno sviluppatore può configurare Compri ed eseguire:
+La release è pronta quando uno sviluppatore può configurare Demo ed eseguire:
 
 ```bash
-hum compri all-services doctor
-hum compri all-services start
-hum compri all-services status
-hum compri all-services tui
+hum demo all-services doctor
+hum demo all-services start
+hum demo all-services status
+hum demo all-services tui
 ```
 
 Chiudere la TUI lascia i servizi attivi. In seguito:
 
 ```bash
-hum compri all-services logs api --follow
-hum compri all-services stop
+hum demo all-services logs api --follow
+hum demo all-services stop
 ```
 
 Lo stesso modello deve essere applicabile a un secondo progetto aggiungendo una

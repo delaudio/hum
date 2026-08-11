@@ -335,6 +335,53 @@ templates:
     );
 }
 
+#[test]
+fn v3_status_ignores_tasks_in_the_service_dependency_order() {
+    let _process_guard = process_test_guard();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "hum-cli-v3-task-status-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        process_groups: Vec::new(),
+    };
+    let config = root.join("hum.yaml");
+    let state = root.join("state");
+    fs::write(
+        &config,
+        r#"version: 3
+project: e2e
+runtimes:
+  local:
+    type: process
+tasks:
+  setup:
+    command: ["true"]
+services:
+  worker:
+    runtime: local
+    command: "sleep 300"
+    depends_on: [setup]
+templates:
+  all:
+    services: [worker]
+"#,
+    )
+    .unwrap();
+
+    let status = hum_command(&config, &state, &["status"]).output().unwrap();
+    assert_success(&status);
+    let output = String::from_utf8_lossy(&status.stdout);
+    assert!(output.contains("worker"), "status was: {output}");
+    assert!(!output.contains("setup"), "status was: {output}");
+}
+
 fn hum_command(config: &Path, state: &Path, action: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hum"));
     command

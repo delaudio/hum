@@ -3,5 +3,5 @@
 version: 1
 
 projects:
-  compri:
+  demo:
     config: hum.v2.example.yaml

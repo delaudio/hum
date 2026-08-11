@@ -1,0 +1,182 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Validate tag and package version
+        run: bash scripts/release-guard.sh
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Lints
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Tests and non-empty suite gate
+        run: scripts/verify-test-count.sh 60
+
+  build-macos:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            architecture: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build immutable release archive
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          bash scripts/release-guard.sh
+          version="${GITHUB_REF_NAME#v}"
+          archive="hum-${version}-macos-${ARCHITECTURE}.tar.gz"
+          stage="dist/stage-${ARCHITECTURE}"
+          mkdir -p "$stage" dist/release
+          cargo build --locked --release --target "$TARGET"
+          cp "target/$TARGET/release/hum" "$stage/hum"
+          tar -czf "dist/release/$archive" -C "$stage" hum
+          checksum="$(shasum -a 256 "dist/release/$archive" | awk '{print $1}')"
+          printf '%s  %s\n' "$checksum" "$archive" > "dist/release/$archive.sha256"
+          cat > "dist/release/hum-${ARCHITECTURE}-metadata.json" <<EOF
+          {
+            "version": "$version",
+            "architecture": "$ARCHITECTURE",
+            "target": "$TARGET",
+            "commit": "$GITHUB_SHA",
+            "workflow_run": "$GITHUB_RUN_ID"
+          }
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hum-macos-${{ matrix.architecture }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  package-formula:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: hum-macos-*
+          path: dist/release
+          merge-multiple: true
+      - name: Render checksummed Homebrew formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          arm64_sha256="$(awk '{print $1}' "dist/release/hum-${version}-macos-arm64.tar.gz.sha256")"
+          x86_64_sha256="$(awk '{print $1}' "dist/release/hum-${version}-macos-x86_64.tar.gz.sha256")"
+          bash scripts/render-homebrew-formula.sh \
+            "$version" "$arm64_sha256" "$x86_64_sha256" dist/formula/hum.rb
+          ruby -c dist/formula/hum.rb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: dist/formula/hum.rb
+          if-no-files-found: error
+
+  publish-release:
+    needs: package-formula
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: hum-macos-*
+          path: dist/release
+          merge-multiple: true
+      - uses: actions/download-artifact@v5
+        with:
+          name: homebrew-formula
+          path: dist/release
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            dist/release/*.tar.gz
+            dist/release/*.sha256
+            dist/release/*-metadata.json
+            dist/release/hum.rb
+
+  smoke-homebrew:
+    needs: publish-release
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: homebrew-formula
+          path: dist/formula
+      - name: Install and test the published release through Homebrew
+        run: |
+          set -euo pipefail
+          cleanup() {
+            brew uninstall --formula hum >/dev/null 2>&1 || true
+            brew untap hum/release-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          brew tap-new hum/release-smoke
+          formula_dir="$(brew --repository hum/release-smoke)/Formula"
+          cp dist/formula/hum.rb "$formula_dir/hum.rb"
+          brew install --formula hum/release-smoke/hum
+          hum --version
+          hum --help >/dev/null
+          brew test hum/release-smoke/hum
+
+  update-homebrew-tap:
+    needs: smoke-homebrew
+    if: ${{ vars.HOMEBREW_TAP_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: homebrew-formula
+          path: dist/formula
+      - uses: actions/checkout@v5
+        with:
+          repository: delaudio/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Publish formula to delaudio/tap
+        run: |
+          mkdir -p tap/Formula
+          cp dist/formula/hum.rb tap/Formula/hum.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/hum.rb
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "hum ${GITHUB_REF_NAME#v}"
+          git push

@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::config::{self, RegistryError};
-use crate::runtime::detached::DetachedRuntime;
+use crate::runtime::project::ProjectRuntime;
 use crate::{doctor, tui};
 
 pub const EXIT_OK: i32 = 0;
@@ -45,7 +45,7 @@ pub struct Cli {
     )]
     pub env: Vec<String>,
 
-    /// Registered project name, for example `compri`
+    /// Registered project name, for example `demo`
     pub project: Option<String>,
 
     /// Template name, for example `all-services`
@@ -60,6 +60,8 @@ pub enum Command {
     /// Start the selected template or listed services
     Start {
         services: Vec<String>,
+        #[command(flatten)]
+        exclusions: ExclusionArgs,
         /// Transitional v1 behavior; removed when persistent runtime lands
         #[arg(long)]
         detach: bool,
@@ -78,8 +80,30 @@ pub enum Command {
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         timeout: std::time::Duration,
     },
+    /// Stop the whole project and delete Compose-owned volumes
+    Reset {
+        /// Bypass the interactive project-name confirmation
+        #[arg(long)]
+        yes: bool,
+        /// Grace period for local processes before Compose data is removed
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: std::time::Duration,
+    },
     /// Show status for services in the selected template
     Status,
+    /// Show the resolved service/task order without side effects
+    Plan {
+        services: Vec<String>,
+        #[command(flatten)]
+        exclusions: ExclusionArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Provider-backed environment utilities
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
+    },
     /// Show captured logs for the template or one service
     Logs {
         service: Option<String>,
@@ -89,7 +113,10 @@ pub enum Command {
         lines: usize,
     },
     /// Check the selected local environment for common problems
-    Doctor,
+    Doctor {
+        #[command(flatten)]
+        exclusions: ExclusionArgs,
+    },
     /// Open the TUI in the selected project/template context
     Tui,
     /// Configuration-related utilities
@@ -103,6 +130,31 @@ pub enum Command {
 pub enum ConfigAction {
     /// Validate registry, project configuration, and template selection
     Validate,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct ExclusionArgs {
+    /// Remove root services belonging to a template (repeatable)
+    #[arg(long = "exclude", value_name = "TEMPLATE", action = clap::ArgAction::Append)]
+    pub templates: Vec<String>,
+
+    /// Strictly remove a service; fail if it remains a dependency (repeatable)
+    #[arg(
+        long = "exclude-service",
+        value_name = "SERVICE",
+        action = clap::ArgAction::Append
+    )]
+    pub excluded_services: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsAction {
+    /// Fetch selected environment sources and refresh configured caches
+    Sync {
+        services: Vec<String>,
+        #[command(flatten)]
+        exclusions: ExclusionArgs,
+    },
 }
 
 pub async fn run(cli: Cli) -> i32 {
@@ -149,23 +201,32 @@ pub async fn run(cli: Cli) -> i32 {
             EXIT_OK
         }
 
-        Command::Doctor => {
-            let runtime = match DetachedRuntime::new(project, loaded, env_overrides) {
+        Command::Doctor { exclusions } => {
+            let selection =
+                match resolve_command_selection(&loaded.config, &template, &[], &exclusions) {
+                    Ok(selection) => selection,
+                    Err(code) => return code,
+                };
+            print_selection_warnings(&selection.warnings);
+            let runtime = match ProjectRuntime::new(project, loaded, env_overrides) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     eprintln!("✗ failed to initialize runtime diagnostics: {error}");
                     return EXIT_RUNTIME_INCOHERENT;
                 }
             };
-            let results =
-                match tokio::task::spawn_blocking(move || doctor::run_with_runtime(&runtime)).await
-                {
-                    Ok(results) => results,
-                    Err(error) => {
-                        eprintln!("✗ doctor task failed: {error}");
-                        return EXIT_GENERIC;
-                    }
-                };
+            let order = selection.order;
+            let results = match tokio::task::spawn_blocking(move || {
+                doctor::run_with_project_selection(&runtime, &order)
+            })
+            .await
+            {
+                Ok(results) => results,
+                Err(error) => {
+                    eprintln!("✗ doctor task failed: {error}");
+                    return EXIT_GENERIC;
+                }
+            };
             print_doctor(&results);
             if doctor::all_passed(&results) {
                 EXIT_OK
@@ -175,7 +236,7 @@ pub async fn run(cli: Cli) -> i32 {
         }
 
         Command::Tui => {
-            let runtime = match DetachedRuntime::new(project, loaded, env_overrides) {
+            let runtime = match ProjectRuntime::new(project, loaded, env_overrides) {
                 Ok(runtime) => Arc::new(runtime),
                 Err(error) => {
                     eprintln!("✗ failed to initialize runtime monitor: {error}");
@@ -191,25 +252,29 @@ pub async fn run(cli: Cli) -> i32 {
             }
         }
 
-        Command::Start { services, detach } => {
-            for service in &services {
-                if !loaded.config.services.contains_key(service) {
-                    eprintln!("✗ unknown service '{service}'");
-                    return EXIT_SERVICE_NOT_FOUND;
-                }
-            }
-            let runtime = match DetachedRuntime::new(project, loaded, env_overrides) {
+        Command::Start {
+            services,
+            exclusions,
+            detach,
+        } => {
+            let selection = match resolve_command_selection(
+                &loaded.config,
+                &template,
+                &services,
+                &exclusions,
+            ) {
+                Ok(selection) => selection,
+                Err(code) => return code,
+            };
+            print_selection_warnings(&selection.warnings);
+            let runtime = match ProjectRuntime::new(project, loaded, env_overrides) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     eprintln!("✗ failed to initialize runtime: {error}");
                     return EXIT_START_FAILED;
                 }
             };
-            let result = if services.is_empty() {
-                runtime.start_template(&template).await
-            } else {
-                runtime.start_services(&services).await
-            };
+            let result = runtime.start_selection(&selection.order).await;
             match result {
                 Ok(report) => {
                     if !report.started.is_empty() {
@@ -235,7 +300,7 @@ pub async fn run(cli: Cli) -> i32 {
             if let Err(code) = validate_services(&loaded.config, &services) {
                 return code;
             }
-            let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
+            let runtime = match ProjectRuntime::new(project.clone(), loaded, env_overrides) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     eprintln!("✗ project '{project}' template '{template}': {error}");
@@ -262,7 +327,7 @@ pub async fn run(cli: Cli) -> i32 {
             if let Err(code) = validate_services(&loaded.config, &services) {
                 return code;
             }
-            let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
+            let runtime = match ProjectRuntime::new(project.clone(), loaded, env_overrides) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     eprintln!("✗ project '{project}' template '{template}': {error}");
@@ -309,8 +374,44 @@ pub async fn run(cli: Cli) -> i32 {
             }
         }
 
+        Command::Reset { yes, timeout } => {
+            let runtime = match ProjectRuntime::new(project.clone(), loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ project '{project}' reset initialization failed: {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
+            };
+            if !runtime.has_compose_runtime() {
+                eprintln!("✗ project '{project}' has no Compose runtime to reset");
+                return EXIT_INVALID_CONFIG;
+            }
+            match confirm_reset(&project, yes) {
+                Ok(false) => {
+                    println!("Reset cancelled; no services or volumes were changed.");
+                    return EXIT_OK;
+                }
+                Ok(true) => {}
+                Err(error) => {
+                    eprintln!("✗ {error}");
+                    return EXIT_INVALID_CONFIG;
+                }
+            }
+            match runtime.reset_all(timeout).await {
+                Ok(report) if report.succeeded() => {
+                    println!("✓ reset Compose data owned by project '{project}'");
+                    EXIT_OK
+                }
+                Ok(report) => print_stop_report(&project, &template, report),
+                Err(error) => {
+                    eprintln!("✗ project '{project}' reset failed: {error:#}");
+                    EXIT_STOP_FAILED
+                }
+            }
+        }
+
         Command::Status => {
-            let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
+            let runtime = match ProjectRuntime::new(project.clone(), loaded, env_overrides) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     eprintln!("✗ project '{project}' template '{template}': {error}");
@@ -340,12 +441,74 @@ pub async fn run(cli: Cli) -> i32 {
             }
         }
 
+        Command::Plan {
+            services,
+            exclusions,
+            json,
+        } => {
+            let selection = match resolve_command_selection(
+                &loaded.config,
+                &template,
+                &services,
+                &exclusions,
+            ) {
+                Ok(selection) => selection,
+                Err(code) => return code,
+            };
+            print_selection_warnings(&selection.warnings);
+            print_plan(&loaded.config, &selection.order, json);
+            EXIT_OK
+        }
+
+        Command::Secrets {
+            action:
+                SecretsAction::Sync {
+                    services,
+                    exclusions,
+                },
+        } => {
+            let selection = match resolve_command_selection(
+                &loaded.config,
+                &template,
+                &services,
+                &exclusions,
+            ) {
+                Ok(selection) => selection,
+                Err(code) => return code,
+            };
+            print_selection_warnings(&selection.warnings);
+            let runtime = match ProjectRuntime::new(project.clone(), loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ project '{project}' secret sync initialization failed: {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
+            };
+            let result = runtime.sync_selection_environment(&selection.order).await;
+            match result {
+                Ok(report) => {
+                    println!("✓ refreshed {} environment source(s)", report.refreshed);
+                    if report.fallback > 0 {
+                        println!(
+                            "  {} optional source(s) unavailable; valid cache or empty fallback used",
+                            report.fallback
+                        );
+                    }
+                    EXIT_OK
+                }
+                Err(error) => {
+                    eprintln!("✗ project '{project}' secret sync failed: {error}");
+                    EXIT_START_FAILED
+                }
+            }
+        }
+
         Command::Logs {
             service,
             follow,
             lines,
         } => {
-            let runtime = match DetachedRuntime::new(project.clone(), loaded, env_overrides) {
+            let runtime = match ProjectRuntime::new(project.clone(), loaded, env_overrides) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     eprintln!("✗ project '{project}' template '{template}': {error}");
@@ -368,26 +531,35 @@ pub async fn run(cli: Cli) -> i32 {
                     }
                 }
             };
-            let sources = services
-                .into_iter()
-                .map(|service| {
-                    runtime
-                        .log_paths(&service)
-                        .map(|(stdout, stderr)| PersistentLogSource {
-                            service,
-                            stdout,
-                            stderr,
-                        })
-                })
-                .collect::<anyhow::Result<Vec<_>>>();
-            let sources = match sources {
-                Ok(sources) => sources,
-                Err(error) => {
-                    eprintln!("✗ project '{project}' template '{template}': {error}");
-                    return EXIT_RUNTIME_INCOHERENT;
+            let mut persistent = Vec::new();
+            let mut external = Vec::new();
+            for service in services {
+                match runtime.log_files(&service) {
+                    Ok(Some((stdout, stderr))) => persistent.push(PersistentLogSource {
+                        service,
+                        stdout,
+                        stderr,
+                    }),
+                    Ok(None) => external.push(service),
+                    Err(error) => {
+                        eprintln!("✗ project '{project}' template '{template}': {error}");
+                        return EXIT_RUNTIME_INCOHERENT;
+                    }
                 }
+            }
+            let result = match (persistent.is_empty(), external.is_empty()) {
+                (false, false) => tokio::try_join!(
+                    show_persistent_logs(&persistent, &runtime.config().logs, lines, follow),
+                    runtime.stream_external_logs(&external, lines, follow),
+                )
+                .map(|_| ()),
+                (false, true) => {
+                    show_persistent_logs(&persistent, &runtime.config().logs, lines, follow).await
+                }
+                (true, false) => runtime.stream_external_logs(&external, lines, follow).await,
+                (true, true) => Ok(()),
             };
-            match show_persistent_logs(&sources, &runtime.config().logs, lines, follow).await {
+            match result {
                 Ok(()) => EXIT_OK,
                 Err(error) => {
                     eprintln!(
@@ -398,6 +570,66 @@ pub async fn run(cli: Cli) -> i32 {
                 }
             }
         }
+    }
+}
+
+fn confirm_reset(project: &str, yes: bool) -> anyhow::Result<bool> {
+    use std::io::{IsTerminal, Write};
+
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("reset requires interactive confirmation; use --yes for automation");
+    }
+    eprintln!(
+        "This stops every project service and permanently deletes Compose volumes owned by '{project}'."
+    );
+    eprint!("Type {project} to continue: ");
+    std::io::stderr().flush()?;
+    let mut confirmation = String::new();
+    std::io::stdin().read_line(&mut confirmation)?;
+    Ok(confirmation.trim() == project)
+}
+
+fn print_plan(config: &config::Config, order: &[String], json: bool) {
+    let units = order
+        .iter()
+        .map(|name| {
+            if let Some(task) = config.tasks.get(name) {
+                serde_json::json!({
+                    "name": name,
+                    "kind": "task",
+                    "depends_on": task.depends_on,
+                })
+            } else {
+                let service = &config.services[name];
+                serde_json::json!({
+                    "name": name,
+                    "kind": "service",
+                    "runtime": service.runtime.as_deref().unwrap_or("process"),
+                    "target": service.target,
+                    "depends_on": service.depends_on,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&units).expect("plan serialization")
+        );
+        return;
+    }
+    println!("ORDER  KIND     NAME                     RUNTIME");
+    for (index, unit) in units.iter().enumerate() {
+        println!(
+            "{:<6} {:<8} {:<24} {}",
+            index + 1,
+            unit["kind"].as_str().unwrap_or("-"),
+            unit["name"].as_str().unwrap_or("-"),
+            unit["runtime"].as_str().unwrap_or("-")
+        );
     }
 }
 
@@ -415,7 +647,15 @@ fn required_selection(cli: &Cli) -> Result<(&str, &str), i32> {
     if cli.command.is_none()
         && matches!(
             project,
-            "up" | "down" | "status" | "logs" | "restart" | "doctor" | "config"
+            "up" | "down"
+                | "status"
+                | "plan"
+                | "secrets"
+                | "logs"
+                | "restart"
+                | "reset"
+                | "doctor"
+                | "config"
         )
     {
         eprintln!(
@@ -462,6 +702,42 @@ fn validate_services(config: &config::Config, requested: &[String]) -> Result<()
         }
     }
     Ok(())
+}
+
+fn resolve_command_selection(
+    config: &config::Config,
+    template: &str,
+    requested: &[String],
+    exclusions: &ExclusionArgs,
+) -> Result<crate::core::graph::SelectionPlan, i32> {
+    validate_services(config, requested)?;
+    validate_services(config, &exclusions.excluded_services)?;
+    for excluded in &exclusions.templates {
+        if !config.templates.contains_key(excluded) {
+            eprintln!("✗ unknown excluded template '{excluded}'");
+            return Err(EXIT_TEMPLATE_NOT_FOUND);
+        }
+    }
+    crate::core::graph::resolve_selection(
+        config,
+        template,
+        requested,
+        &exclusions.templates,
+        &exclusions.excluded_services,
+    )
+    .map_err(|error| {
+        eprintln!("✗ selection failed: {error}");
+        EXIT_INVALID_CONFIG
+    })
+}
+
+fn print_selection_warnings(warnings: &[crate::core::graph::SelectionWarning]) {
+    for warning in warnings {
+        eprintln!(
+            "⚠ service '{}' was reintroduced from excluded template '{}' because '{}' depends on it",
+            warning.service, warning.excluded_template, warning.required_by
+        );
+    }
 }
 
 fn print_stop_report(
@@ -837,14 +1113,15 @@ mod tests {
 
     #[test]
     fn parses_project_template_command_contract() {
-        let cli = Cli::try_parse_from(["hum", "compri", "all-services", "start"]).unwrap();
-        assert_eq!(cli.project.as_deref(), Some("compri"));
+        let cli = Cli::try_parse_from(["hum", "demo", "all-services", "start"]).unwrap();
+        assert_eq!(cli.project.as_deref(), Some("demo"));
         assert_eq!(cli.template.as_deref(), Some("all-services"));
         assert!(matches!(
             cli.command,
             Some(Command::Start {
                 services,
-                detach: false
+                detach: false,
+                ..
             }) if services.is_empty()
         ));
     }
@@ -853,7 +1130,7 @@ mod tests {
     fn parses_service_scoped_logs() {
         let cli = Cli::try_parse_from([
             "hum",
-            "compri",
+            "demo",
             "all-services",
             "logs",
             "api",
@@ -874,8 +1151,8 @@ mod tests {
 
     #[test]
     fn parses_template_wide_logs_without_a_service() {
-        let cli = Cli::try_parse_from(["hum", "compri", "all-services", "logs", "--lines", "10"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["hum", "demo", "all-services", "logs", "--lines", "10"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Logs {
@@ -890,7 +1167,7 @@ mod tests {
     fn parses_repeatable_environment_overrides() {
         let cli = Cli::try_parse_from([
             "hum",
-            "compri",
+            "demo",
             "all-services",
             "start",
             "--env",
@@ -909,6 +1186,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_plan_and_secret_sync_without_legacy_side_effects() {
+        let plan = Cli::try_parse_from([
+            "hum",
+            "demo",
+            "all-services",
+            "plan",
+            "api",
+            "--json",
+            "--exclude",
+            "identity",
+            "--exclude-service",
+            "mail",
+        ])
+        .unwrap();
+        assert!(matches!(
+            plan.command,
+            Some(Command::Plan {
+                services,
+                exclusions: ExclusionArgs {
+                    templates,
+                    excluded_services,
+                },
+                json: true,
+            }) if services == ["api"] && templates == ["identity"] && excluded_services == ["mail"]
+        ));
+
+        let sync =
+            Cli::try_parse_from(["hum", "demo", "all-services", "secrets", "sync", "api"]).unwrap();
+        assert!(matches!(
+            sync.command,
+            Some(Command::Secrets {
+                action: SecretsAction::Sync { services, .. }
+            }) if services == ["api"]
+        ));
+    }
+
+    #[test]
     fn reports_missing_selection_parts_with_distinct_exit_codes() {
         let missing_project = Cli::try_parse_from(["hum"]).unwrap();
         assert_eq!(
@@ -916,7 +1230,7 @@ mod tests {
             Err(EXIT_PROJECT_NOT_FOUND)
         );
 
-        let missing_template = Cli::try_parse_from(["hum", "compri"]).unwrap();
+        let missing_template = Cli::try_parse_from(["hum", "demo"]).unwrap();
         assert_eq!(
             required_selection(&missing_template),
             Err(EXIT_TEMPLATE_NOT_FOUND)

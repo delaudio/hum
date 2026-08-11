@@ -1,41 +1,56 @@
 # hum
 
-`hum` is a lightweight launcher and terminal monitor for local multi-service
-development environments.
+`hum` is a product-neutral launcher and terminal monitor for local
+multi-service development environments. Version 3 can coordinate detached
+local processes, Docker Compose services, direct-argv setup tasks, and scoped
+environment sources such as 1Password from one dependency graph.
 
 Current project/template CLI:
 
 ```bash
-hum compri all-services start
+hum demo all-services start
 ```
 
-The command starts the selected services in independent process groups, writes
-their logs and runtime metadata to disk, and exits. There is no resident `hum`
-daemon. Later CLI invocations reconcile that metadata with the operating
-system. The TUI reads the same persistent registry and controls the detached
-runtime without owning service lifetimes.
+The command starts each selected unit through its configured runtime and exits;
+there is no resident `hum` daemon. Product names, images, Compose projects,
+vault references, migrations, and bootstrap commands belong in the project's
+configuration pack, not in the `hum` binary.
 
-> Project/template selection, v2 configuration, detached `start`, and
-> cross-invocation `status`, `stop`, `restart`, and `logs`, plus external-runtime
-> TUI reconciliation, are implemented. Track the remaining work in
-> [epic #16](https://github.com/delaudio/hum/issues/16).
+## Installation
+
+Install the release formula directly from the public Homebrew tap:
+
+```bash
+brew install delaudio/tap/hum
+```
+
+This installs a native binary on Apple Silicon or Intel macOS without requiring
+the Rust toolchain. Release operations and the one-time tap bootstrap are
+documented in [`docs/HOMEBREW.md`](docs/HOMEBREW.md).
 
 ## Concepts
 
-- **Project**: a registered local product, such as `compri`.
+- **Project**: a registered local product, such as `demo`.
 - **Template**: a named service selection, such as `frontend` or
   `all-services`.
-- **Service**: one local process, identified at runtime by `project/service`.
+- **Runtime**: a named generic adapter (`process` or `compose`).
+- **Service**: one runtime-owned long-lived unit.
+- **Task**: a trusted, direct-argv one-shot unit in the same dependency graph.
+- **Environment provider**: a named source of scoped values; currently
+  `one-password` with dotenv payloads.
 
 ## Target CLI
 
 ```bash
-hum <project> <template> start
+hum <project> <template> start [service ...] [--exclude TEMPLATE] [--exclude-service SERVICE]
 hum <project> <template> stop
 hum <project> <template> restart
 hum <project> <template> status
+hum <project> <template> plan [service ...] [--json] [--exclude TEMPLATE] [--exclude-service SERVICE]
+hum <project> <template> secrets sync [service ...] [--exclude TEMPLATE] [--exclude-service SERVICE]
 hum <project> <template> logs [service] [--lines N] [--follow]
-hum <project> <template> doctor
+hum <project> <template> reset [--yes]
+hum <project> <template> doctor [--exclude TEMPLATE] [--exclude-service SERVICE]
 hum <project> <template> tui
 ```
 
@@ -44,7 +59,8 @@ narrower interactive selection, with the final form opening the TUI.
 
 ## Configuration discovery
 
-The binary accepts both the legacy v1 and project/template v2 formats. It discovers
+The binary accepts legacy v1/v2 process configurations and the v3 adapter
+format. It discovers
 `hum.yaml` from the current directory upwards, then at
 `$XDG_CONFIG_HOME/hum/hum.yaml`, falling back to
 `~/.config/hum/hum.yaml`. The runnable example is
@@ -58,15 +74,16 @@ The v2 contract registers projects globally in
 version: 1
 
 projects:
-  compri:
-    config: ~/code/compri/hum.yaml
+  demo:
+    config: ~/code/demo/hum.yaml
 ```
 
 A copyable registry shape is available at
 [`examples/registry.example.yaml`](examples/registry.example.yaml).
 
-Each project owns a versioned `hum.yaml`. A complete example is
-[`examples/hum.v2.example.yaml`](examples/hum.v2.example.yaml). Machine-specific
+Each project owns a versioned `hum.yaml`. See the process-only
+[`examples/hum.v2.example.yaml`](examples/hum.v2.example.yaml) and the v3
+[`examples/hum.v3.example.yaml`](examples/hum.v3.example.yaml). Machine-specific
 values can live in an untracked `hum.local.yaml` beside it.
 
 Relative paths are resolved from the configuration file that declares them.
@@ -75,6 +92,39 @@ repository, and `env_file` is relative to the resulting service working director
 Service environment precedence is `.env` file, `service.env`, inherited process
 environment, then repeatable `--env KEY=VALUE` CLI overrides. Unknown YAML fields
 and invalid names, ports, URLs, durations, commands, or references are rejected.
+
+## Version 3 adapters and providers
+
+A v3 service selects a named runtime. Process services retain the detached
+registry described below. Compose services map a hum name to a runtime-native
+`target`; lifecycle and logs use `docker compose` with the configured project
+name, files, profiles, and env file. Project tasks may produce optional
+`generated_files` layers (for example host-specific network mappings); Compose
+includes each layer only after it exists, while `doctor` reports it as a
+generated artifact. `stop` preserves volumes; `reset` is the
+only volume-deleting operation and requires the project name interactively or
+`--yes` for automation.
+
+Tasks use an argv array and are never wrapped in an implicit shell. An optional
+`check` argv makes a task idempotent. Tasks and services share dependency and
+cycle validation; a failed task rolls back only services started by the current
+invocation. `plan` resolves this graph without contacting providers or Docker.
+
+Selections support repeatable subtractive filters. `--exclude TEMPLATE`
+removes that template's services from the initial roots; if a remaining unit
+still depends on one, it is reintroduced with a warning naming the consumer.
+`--exclude-service SERVICE` is strict: if the service is still required, the
+command fails before Docker, tasks, or providers are contacted. The same
+resolver is used by `plan`, `start`, `doctor`, and `secrets sync`.
+
+An `env_from` entry can read a dotenv item from a named 1Password provider.
+Values are scoped to the child process or Compose invocation and are never
+printed or persisted in generated Compose YAML. Optional `schema` validation
+requires an exact key set. Optional `cache` files are plaintext, atomically
+replaced with mode `0600`, and should live under the gitignored `.hum/`
+directory. Required sources fail closed; optional sources may use a valid
+cache. `secrets sync` refreshes selected sources without starting services, and
+`doctor` checks only that `op` exists—it never reads vault items.
 
 ## Current persistent runtime
 
