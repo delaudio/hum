@@ -30,6 +30,7 @@ fi
 
 mkdir -p "$(dirname "$output")"
 sed \
+  -e "s|@VERSION@|$version|g" \
   -e "s|@BASE_URL@|$base_url|g" \
   -e "s|@ARM64_SHA256@|$arm64_sha256|g" \
   -e "s|@X86_64_SHA256@|$x86_64_sha256|g" \
@@ -37,5 +38,9 @@ sed \
 
 if grep -Eq '@[A-Z0-9_]+@' "$output"; then
   echo "unresolved placeholder in $output" >&2
+  exit 1
+fi
+if ! grep -Fq "version \"$version\"" "$output"; then
+  echo "rendered formula does not declare version $version" >&2
   exit 1
 fi
