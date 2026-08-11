@@ -1,7 +1,6 @@
 class Hum < Formula
   desc "Product-neutral local development orchestrator and terminal monitor"
   homepage "https://github.com/delaudio/hum"
-  version "@VERSION@"
 
   depends_on :macos
 

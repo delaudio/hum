@@ -30,7 +30,6 @@ fi
 
 mkdir -p "$(dirname "$output")"
 sed \
-  -e "s|@VERSION@|$version|g" \
   -e "s|@BASE_URL@|$base_url|g" \
   -e "s|@ARM64_SHA256@|$arm64_sha256|g" \
   -e "s|@X86_64_SHA256@|$x86_64_sha256|g" \
