@@ -19,13 +19,15 @@ pub const EXIT_STOP_FAILED: i32 = 7;
 pub const EXIT_HEALTHCHECK_FAILED: i32 = 8;
 pub const EXIT_DOCTOR_FAILED: i32 = 9;
 pub const EXIT_RUNTIME_INCOHERENT: i32 = 10;
+pub const EXIT_REGISTRY_IO: i32 = 11;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "hum",
     version,
     about = "Keep your local stack humming.",
-    override_usage = "hum [OPTIONS] <PROJECT> <TEMPLATE> [COMMAND]"
+    override_usage = "hum [OPTIONS] <PROJECT> <TEMPLATE> [COMMAND]\n       hum [OPTIONS] project register <NAME> <CONFIG>",
+    subcommand_precedence_over_arg = true
 )]
 pub struct Cli {
     /// Path to the global project registry (default: ~/.config/hum/config.yaml)
@@ -57,6 +59,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Manage machine-local project registrations
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
     /// Start the selected template or listed services
     Start {
         services: Vec<String>,
@@ -127,6 +134,17 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ProjectAction {
+    /// Register or update a project configuration from any checkout path
+    Register {
+        /// Project name used in `hum <PROJECT> ...`
+        name: String,
+        /// Path to the project's hum.yaml
+        config: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ConfigAction {
     /// Validate registry, project configuration, and template selection
     Validate,
@@ -158,6 +176,14 @@ pub enum SecretsAction {
 }
 
 pub async fn run(cli: Cli) -> i32 {
+    if let Some(Command::Project { action }) = &cli.command {
+        if cli.project.is_some() || cli.template.is_some() {
+            eprintln!("✗ project management commands do not take a project/template selection");
+            return EXIT_INVALID_CONFIG;
+        }
+        return run_project_action(action, cli.registry.as_deref());
+    }
+
     let env_overrides = match config::environment::parse_overrides(&cli.env) {
         Ok(overrides) => overrides,
         Err(error) => {
@@ -567,6 +593,44 @@ pub async fn run(cli: Cli) -> i32 {
                         runtime.registry().root().display()
                     );
                     EXIT_RUNTIME_INCOHERENT
+                }
+            }
+        }
+        Command::Project { .. } => unreachable!("project actions return before project resolution"),
+    }
+}
+
+fn run_project_action(action: &ProjectAction, registry: Option<&Path>) -> i32 {
+    match action {
+        ProjectAction::Register { name, config } => {
+            match config::register_project(name, config, registry) {
+                Ok((registry, config)) => {
+                    println!("✓ registered project '{name}'");
+                    println!("  config:   {}", config.display());
+                    println!("  registry: {}", registry.display());
+                    EXIT_OK
+                }
+                Err(error @ RegistryError::ProjectMismatch { .. }) => {
+                    eprintln!("✗ {error}");
+                    EXIT_PROJECT_NOT_FOUND
+                }
+                Err(error @ RegistryError::ReservedProject(_))
+                | Err(error @ RegistryError::InvalidProject(_)) => {
+                    eprintln!("✗ {error}");
+                    EXIT_INVALID_CONFIG
+                }
+                Err(
+                    error @ (RegistryError::Io { .. }
+                    | RegistryError::ConfigPath { .. }
+                    | RegistryError::Write { .. }
+                    | RegistryError::Serialize { .. }),
+                ) => {
+                    eprintln!("✗ {error}");
+                    EXIT_REGISTRY_IO
+                }
+                Err(error) => {
+                    eprintln!("✗ {error}");
+                    EXIT_INVALID_CONFIG
                 }
             }
         }
@@ -1123,6 +1187,28 @@ mod tests {
                 detach: false,
                 ..
             }) if services.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parses_project_registration_without_stack_selection() {
+        let cli = Cli::try_parse_from([
+            "hum",
+            "--registry",
+            "/tmp/hum-registry.yaml",
+            "project",
+            "register",
+            "demo",
+            "./packs/demo/hum.yaml",
+        ])
+        .unwrap();
+        assert!(cli.project.is_none());
+        assert!(cli.template.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(Command::Project {
+                action: ProjectAction::Register { name, config }
+            }) if name == "demo" && config == Path::new("./packs/demo/hum.yaml")
         ));
     }
 

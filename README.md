@@ -66,9 +66,15 @@ format. It discovers
 `~/.config/hum/hum.yaml`. The runnable example is
 [`examples/hum.example.yaml`](examples/hum.example.yaml).
 
-The v2 contract registers projects globally in
-`~/.config/hum/config.yaml` (or
-`$XDG_CONFIG_HOME/hum/config.yaml`):
+Register a project from any checkout path. Hum validates the configuration and
+stores its canonical path in the machine-local registry at
+`~/.config/hum/config.yaml` (or `$XDG_CONFIG_HOME/hum/config.yaml`):
+
+```bash
+hum project register demo ./hum.yaml
+```
+
+The resulting registry uses the v1 registry contract:
 
 ```yaml
 version: 1
