@@ -28,6 +28,7 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 pub struct StartReport {
     pub started: Vec<String>,
     pub already_running: Vec<String>,
+    pub reconciled: Vec<String>,
 }
 
 #[derive(Debug, Default)]

@@ -26,6 +26,7 @@ pub struct ComposeRuntime {
     project: String,
     project_name: String,
     files: Vec<PathBuf>,
+    reconcile: bool,
     generated_files: Vec<PathBuf>,
     profiles: Vec<String>,
     env_file: Option<PathBuf>,
@@ -56,6 +57,7 @@ impl ComposeRuntime {
         let RuntimeConfig::Compose {
             project_name,
             files,
+            reconcile,
             generated_files,
             profiles,
             env_file,
@@ -84,6 +86,7 @@ impl ComposeRuntime {
                 .into_iter()
                 .map(|file| absolute_from(&root_dir, file))
                 .collect(),
+            reconcile,
             generated_files: generated_files
                 .into_iter()
                 .map(|file| absolute_from(&root_dir, file))
@@ -247,13 +250,19 @@ impl ComposeRuntime {
     async fn start_owned(&self, services: &[String]) -> Result<StartReport> {
         let running = self.capture_services(Some("running")).await?;
         let mut report = StartReport::default();
-        let mut targets = Vec::new();
+        let mut targets = Vec::with_capacity(services.len());
         for name in services {
             let target = self.target(name)?;
             if running.contains(target) {
-                report.already_running.push(name.clone());
+                if self.reconcile {
+                    report.reconciled.push(name.clone());
+                } else {
+                    report.already_running.push(name.clone());
+                }
             } else {
                 report.started.push(name.clone());
+            }
+            if self.reconcile || !running.contains(target) {
                 targets.push(target.to_string());
             }
         }

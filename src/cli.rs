@@ -309,6 +309,9 @@ pub async fn run(cli: Cli) -> i32 {
                     if !report.already_running.is_empty() {
                         println!("✓ already running: {}", report.already_running.join(", "));
                     }
+                    if !report.reconciled.is_empty() {
+                        println!("✓ reconciled: {}", report.reconciled.join(", "));
+                    }
                     println!("  runtime: {}", runtime.registry().root().display());
                     if detach {
                         eprintln!("⚠ --detach is no longer needed; start is always detached");
@@ -388,6 +391,9 @@ pub async fn run(cli: Cli) -> i32 {
                     }
                     if !start.already_running.is_empty() {
                         println!("✓ already running: {}", start.already_running.join(", "));
+                    }
+                    if !start.reconciled.is_empty() {
+                        println!("✓ reconciled: {}", start.reconciled.join(", "));
                     }
                     EXIT_OK
                 }

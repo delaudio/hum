@@ -232,6 +232,7 @@ fn validate_partial_schema(
         "type",
         "project_name",
         "files",
+        "reconcile",
         "generated_files",
         "profiles",
         "env_file",
@@ -255,6 +256,7 @@ fn validate_partial_schema(
         "url",
         "env_file",
         "env",
+        "env_overrides",
         "env_from",
         "depends_on",
         "healthcheck",
@@ -264,6 +266,7 @@ fn validate_partial_schema(
     const TASK: &[&str] = &[
         "command",
         "check",
+        "doctor",
         "cwd",
         "env",
         "env_from",

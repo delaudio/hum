@@ -301,12 +301,15 @@ fn validate_v3_contract(config: &Config, file: &Path) -> Result<(), ConfigError>
             ));
         }
         if let Some((name, _)) = config.services.iter().find(|(_, service)| {
-            service.runtime.is_some() || service.target.is_some() || !service.env_from.is_empty()
+            service.runtime.is_some()
+                || service.target.is_some()
+                || !service.env_from.is_empty()
+                || !service.env_overrides.is_empty()
         }) {
             return Err(ConfigError::validation(
                 file,
                 format!("services.{name}"),
-                "runtime, target, and env_from require configuration version 3",
+                "runtime, target, env_from, and env_overrides require configuration version 3",
                 "set `version: 3`, or remove the v3-only service fields",
             ));
         }
@@ -464,6 +467,9 @@ fn validate_v3_contract(config: &Config, file: &Path) -> Result<(), ConfigError>
         validate_argv(file, &format!("tasks.{name}.command"), &task.command)?;
         if let Some(check) = &task.check {
             validate_argv(file, &format!("tasks.{name}.check"), check)?;
+        }
+        if let Some(doctor) = &task.doctor {
+            validate_argv(file, &format!("tasks.{name}.doctor"), doctor)?;
         }
         if task.timeout.is_zero() {
             return Err(ConfigError::validation(
@@ -818,6 +824,7 @@ mod tests {
                     RuntimeConfig::Compose {
                         project_name: "demo_local".to_string(),
                         files: vec!["compose.yaml".into()],
+                        reconcile: false,
                         generated_files: Vec::new(),
                         profiles: vec!["development".to_string()],
                         env_file: None,
@@ -947,6 +954,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("require configuration version 3"), "{error}");
+
+        let mut config = valid_config();
+        config
+            .services
+            .get_mut("api")
+            .unwrap()
+            .env_overrides
+            .insert("API_URL".to_string(), "http://localhost".to_string());
+        let error = validate(&config, Path::new("hum.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("env_overrides"), "{error}");
     }
 
     #[test]

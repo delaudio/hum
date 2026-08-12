@@ -91,6 +91,13 @@ pub struct ServiceConfig {
     pub env_file: Option<PathBuf>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Values applied after provider-backed dotenv sources. This is useful for
+    /// machine-local runtime overlays that must project container endpoints to
+    /// host endpoints without copying or editing provider data. Inherited
+    /// process values and explicit CLI `--env` values still take precedence.
+    /// Requires configuration version 3.
+    #[serde(default)]
+    pub env_overrides: HashMap<String, String>,
     #[serde(default)]
     pub env_from: Vec<EnvironmentSourceConfig>,
     #[serde(default)]
@@ -110,6 +117,9 @@ pub struct TaskConfig {
     /// shell around project tasks.
     pub command: Vec<String>,
     pub check: Option<Vec<String>>,
+    /// Optional read-only direct argv executed only by `hum doctor`. Provider
+    /// values are deliberately unavailable to this diagnostic command.
+    pub doctor: Option<Vec<String>>,
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -132,6 +142,11 @@ pub enum RuntimeConfig {
     Compose {
         project_name: String,
         files: Vec<PathBuf>,
+        /// Reapply selected running targets with `compose up`. Disabled by
+        /// default; product packs opt in when generated layers or provider
+        /// environments must converge on every start.
+        #[serde(default)]
+        reconcile: bool,
         /// Runtime layers created by project tasks. Existing files are passed
         /// to Compose; absent files are valid before their producer runs.
         #[serde(default)]

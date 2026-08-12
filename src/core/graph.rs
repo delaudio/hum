@@ -257,6 +257,7 @@ mod tests {
                 TaskConfig {
                     command: vec!["migrate".to_string()],
                     check: None,
+                    doctor: None,
                     cwd: None,
                     env: HashMap::new(),
                     env_from: Vec::new(),

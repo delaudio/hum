@@ -195,8 +195,48 @@ pub fn run_with_project_selection(
                 &cwd,
             ));
         }
+        if let Some(doctor) = &task.doctor {
+            // `selected` is the resolved dependency graph, so out-of-scope
+            // task hooks never run. Provider values are intentionally skipped:
+            // diagnostics receive only reviewed, literal task environment.
+            results.push(task_doctor_check(name, doctor, &cwd, &task.env));
+        }
     }
     results
+}
+
+fn task_doctor_check(
+    scope: &str,
+    argv: &[String],
+    cwd: &std::path::Path,
+    environment: &HashMap<String, String>,
+) -> DoctorCheck {
+    let Some((program, arguments)) = argv.split_first() else {
+        return DoctorCheck::fail(Some(scope), "Task doctor command", "argv is empty");
+    };
+    match Command::new(program)
+        .args(arguments)
+        .current_dir(cwd)
+        .envs(environment)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            DoctorCheck::ok(Some(scope), "Task doctor command passed")
+        }
+        Ok(status) => DoctorCheck::fail(
+            Some(scope),
+            "Task doctor command",
+            format!("command exited with status {status}"),
+        ),
+        Err(error) => DoctorCheck::fail(
+            Some(scope),
+            "Task doctor command",
+            format!("command could not be started: {error}"),
+        ),
+    }
 }
 
 fn task_command_check(

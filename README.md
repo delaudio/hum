@@ -92,12 +92,20 @@ Each project owns a versioned `hum.yaml`. See the process-only
 [`examples/hum.v3.example.yaml`](examples/hum.v3.example.yaml). Machine-specific
 values can live in an untracked `hum.local.yaml` beside it.
 
+For services that switch between container and host execution, optional
+`env_overrides` values are applied after provider-backed dotenv values. This
+lets a machine-local overlay project dependency URLs to `localhost` without
+editing or duplicating secrets; inherited variables and explicit CLI `--env`
+values still have the final precedence.
+
 Relative paths are resolved from the configuration file that declares them.
 Repository paths are relative to `hum.yaml`; service `cwd` is relative to its
 repository, and `env_file` is relative to the resulting service working directory.
-Service environment precedence is `.env` file, `service.env`, inherited process
-environment, then repeatable `--env KEY=VALUE` CLI overrides. Unknown YAML fields
-and invalid names, ports, URLs, durations, commands, or references are rejected.
+Service environment precedence is `.env` file, `service.env`, provider sources,
+`service.env_overrides`, inherited process environment, then repeatable
+`--env KEY=VALUE` CLI overrides. Hum warns with key names only when declared
+overrides replace provider values. Unknown YAML fields and invalid names, ports,
+URLs, durations, commands, or references are rejected.
 
 ## Version 3 adapters and providers
 
@@ -107,14 +115,21 @@ registry described below. Compose services map a hum name to a runtime-native
 name, files, profiles, and env file. Project tasks may produce optional
 `generated_files` layers (for example host-specific network mappings); Compose
 includes each layer only after it exists, while `doctor` reports it as a
-generated artifact. `stop` preserves volumes; `reset` is the
+generated artifact. A Compose runtime may opt into `reconcile: true` to reapply
+selected running targets when provider values or generated layers change; the
+default preserves the start-only behavior. Reapplied services are reported as
+`reconciled`, separately from untouched `already running` services. `stop`
+preserves volumes; `reset` is the
 only volume-deleting operation and requires the project name interactively or
 `--yes` for automation.
 
 Tasks use an argv array and are never wrapped in an implicit shell. An optional
-`check` argv makes a task idempotent. Tasks and services share dependency and
-cycle validation; a failed task rolls back only services started by the current
-invocation. `plan` resolves this graph without contacting providers or Docker.
+`check` argv makes a task idempotent. An optional read-only `doctor` argv runs
+only during diagnostics, without provider-backed values, so product packs can
+check their own configuration and prerequisites without teaching Hum about the
+product. Tasks and services share dependency and cycle validation; a failed
+task rolls back only services started by the current invocation. `plan` resolves
+this graph without contacting providers or Docker.
 
 Selections support repeatable subtractive filters. `--exclude TEMPLATE`
 removes that template's services from the initial roots; if a remaining unit

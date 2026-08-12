@@ -316,6 +316,7 @@ impl ProjectRuntime {
                     let newly_started = report.started.clone();
                     combined.started.extend(report.started);
                     combined.already_running.extend(report.already_running);
+                    combined.reconciled.extend(report.reconciled);
                     if let Err(error) = adapter.wait_ready(service).await {
                         self.rollback(&started).await;
                         return Err(

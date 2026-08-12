@@ -75,6 +75,41 @@ jobs:
           path: dist/release/*
           if-no-files-found: error
 
+  build-linux:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Build immutable Linux release archive
+        run: |
+          bash scripts/release-guard.sh
+          version="${GITHUB_REF_NAME#v}"
+          archive="hum-${version}-linux-x86_64.tar.gz"
+          mkdir -p dist/stage-linux-x86_64 dist/release
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/release/hum dist/stage-linux-x86_64/hum
+          tar -czf "dist/release/$archive" -C dist/stage-linux-x86_64 hum
+          checksum="$(sha256sum "dist/release/$archive" | awk '{print $1}')"
+          printf '%s  %s\n' "$checksum" "$archive" > "dist/release/$archive.sha256"
+          cat > dist/release/hum-linux-x86_64-metadata.json <<EOF
+          {
+            "version": "$version",
+            "architecture": "x86_64",
+            "target": "x86_64-unknown-linux-gnu",
+            "commit": "$GITHUB_SHA",
+            "workflow_run": "$GITHUB_RUN_ID"
+          }
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hum-linux-x86_64
+          path: dist/release/*
+          if-no-files-found: error
+
   package-formula:
     needs: build-macos
     runs-on: ubuntu-latest
@@ -100,7 +135,7 @@ jobs:
           if-no-files-found: error
 
   publish-release:
-    needs: package-formula
+    needs: [package-formula, build-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
@@ -108,6 +143,10 @@ jobs:
           pattern: hum-macos-*
           path: dist/release
           merge-multiple: true
+      - uses: actions/download-artifact@v5
+        with:
+          name: hum-linux-x86_64
+          path: dist/release
       - uses: actions/download-artifact@v5
         with:
           name: homebrew-formula

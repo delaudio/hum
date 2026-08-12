@@ -32,7 +32,11 @@ fn compose_runtime_start_status_and_stop_use_isolated_project_state() {
         "services:\n  database:\n    image: postgres:17\n",
     )
     .unwrap();
-    fs::write(root.join("database.env.example"), "DATABASE_URL=\n").unwrap();
+    fs::write(
+        root.join("database.env.example"),
+        "DATABASE_URL=\nPROVIDER_ONLY=\n",
+    )
+    .unwrap();
     fs::write(
         &config,
         r#"version: 3
@@ -44,6 +48,7 @@ runtimes:
     type: compose
     project_name: compose_e2e
     files: [compose.yaml]
+    reconcile: true
     generated_files: [runtime.generated.yaml]
   local:
     type: process
@@ -54,11 +59,14 @@ tasks:
   prepare:
     command: [./prepare, "argument with spaces"]
     check: [test, -f, prepared]
+    doctor: [./doctor-probe]
 services:
   database:
     runtime: infra
     target: database
     depends_on: [prepare]
+    env_overrides:
+      DATABASE_URL: postgres://runtime-overlay
     env_from:
       - provider: vault
         reference: op://Development/database/environment
@@ -83,6 +91,13 @@ templates:
     )
     .unwrap();
     fs::set_permissions(&prepare, fs::Permissions::from_mode(0o700)).unwrap();
+    let doctor_probe = root.join("doctor-probe");
+    fs::write(
+        &doctor_probe,
+        "#!/bin/sh\nset -eu\ntest -z \"${DATABASE_URL:-}\"\ntest -f compose.yaml\n",
+    )
+    .unwrap();
+    fs::set_permissions(&doctor_probe, fs::Permissions::from_mode(0o700)).unwrap();
 
     let fake_docker = root.join("bin/docker");
     fs::write(
@@ -118,7 +133,7 @@ esac
     let fake_op = root.join("bin/op");
     fs::write(
         &fake_op,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' 'DATABASE_URL=postgres://private-value'\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' 'DATABASE_URL=postgres://private-value' 'PROVIDER_ONLY=available'\n",
     )
     .unwrap();
     fs::set_permissions(&fake_op, fs::Permissions::from_mode(0o700)).unwrap();
@@ -146,6 +161,14 @@ esac
     let doctor = hum(&root, &config, &["doctor", "--exclude", "infrastructure"]);
     assert_success(&doctor);
     assert!(String::from_utf8_lossy(&doctor.stdout).contains("All checks passed"));
+
+    let selected_doctor = hum(&root, &config, &["doctor"]);
+    assert_success(&selected_doctor);
+    let selected_doctor_output = String::from_utf8_lossy(&selected_doctor.stdout);
+    assert!(selected_doctor_output
+        .lines()
+        .any(|line| { line.split_whitespace().next() == Some("prepare") && line.contains("4/4") }));
+    fs::remove_file(root.join("docker.log")).unwrap();
 
     let excluded_sync = hum(
         &root,
@@ -179,7 +202,28 @@ esac
 
     let repeated = hum(&root, &config, &["start"]);
     assert_success(&repeated);
-    assert!(String::from_utf8_lossy(&repeated.stdout).contains("✓ already running: database"));
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("✓ reconciled: database"));
+    let up_count_before_reconcile = fs::read_to_string(root.join("docker.log"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("up --detach --wait database"))
+        .count();
+    let reconciled = hum_with_env(
+        &root,
+        &config,
+        &["start"],
+        &[("DATABASE_URL", "postgres://updated-private-value")],
+    );
+    assert_success(&reconciled);
+    assert!(String::from_utf8_lossy(&reconciled.stderr)
+        .contains("env_overrides replace provider-backed keys: DATABASE_URL"));
+    assert!(String::from_utf8_lossy(&reconciled.stdout).contains("✓ reconciled: database"));
+    let up_count_after_reconcile = fs::read_to_string(root.join("docker.log"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("up --detach --wait database"))
+        .count();
+    assert_eq!(up_count_after_reconcile, up_count_before_reconcile + 1);
     assert_eq!(
         fs::read_to_string(root.join("task.log")).unwrap(),
         "argument with spaces\n"
@@ -203,7 +247,9 @@ esac
     assert!(generated_contents.contains("HUM_RUNTIME_"));
     assert!(!generated_contents.contains("private-value"));
     let runtime_environment = fs::read_to_string(root.join("docker.env")).unwrap();
-    assert!(runtime_environment.contains("postgres://private-value"));
+    assert!(runtime_environment.contains("postgres://runtime-overlay"));
+    assert!(runtime_environment.contains("postgres://updated-private-value"));
+    assert!(!runtime_environment.contains("postgres://private-value"));
 
     let stop = hum(&root, &config, &["stop"]);
     assert_success(&stop);
@@ -227,6 +273,15 @@ esac
 }
 
 fn hum(root: &Path, config: &Path, arguments: &[&str]) -> Output {
+    hum_with_env(root, config, arguments, &[])
+}
+
+fn hum_with_env(
+    root: &Path,
+    config: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Output {
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let path = format!(
         "{}:{}",
@@ -245,6 +300,7 @@ fn hum(root: &Path, config: &Path, arguments: &[&str]) -> Output {
         .env("HUM_FAKE_DOCKER_STATE", root.join("docker.state"))
         .env("HUM_FAKE_DOCKER_LOG", root.join("docker.log"))
         .env("HUM_FAKE_DOCKER_ENV", root.join("docker.env"));
+    command.envs(environment.iter().copied());
     command.output().unwrap()
 }
 

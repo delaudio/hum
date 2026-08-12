@@ -149,6 +149,7 @@ mod tests {
                         "-f".to_string(),
                         "marker".to_string(),
                     ]),
+                    doctor: None,
                     cwd: None,
                     env: HashMap::new(),
                     env_from: Vec::new(),

@@ -71,7 +71,11 @@ pub async fn resolve_service_env_with_providers(
     cli_overrides: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>> {
     let mut resolved = base_service_env(service, cwd)?;
+    let mut provider_keys = HashSet::new();
     for source in &service.env_from {
+        if provider_source_fully_shadowed(source, project_root, &service.env_overrides)? {
+            continue;
+        }
         let provider = config
             .environment_providers
             .get(&source.provider)
@@ -84,9 +88,28 @@ pub async fn resolve_service_env_with_providers(
         })
         .await
         .context("environment provider task failed")??;
+        provider_keys.extend(values.keys().cloned());
         resolved.extend(values);
     }
+    let mut shadowed = service
+        .env_overrides
+        .keys()
+        .filter(|key| provider_keys.contains(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    shadowed.sort();
+    if !shadowed.is_empty() {
+        eprintln!(
+            "warning: env_overrides replace provider-backed keys: {}",
+            shadowed.join(", ")
+        );
+    }
+    apply_declared_overrides(&mut resolved, service);
     Ok(apply_runtime_overrides(resolved, cli_overrides))
+}
+
+fn apply_declared_overrides(resolved: &mut HashMap<String, String>, service: &ServiceConfig) {
+    resolved.extend(service.env_overrides.clone());
 }
 
 pub async fn resolve_task_env_with_providers(
@@ -292,20 +315,7 @@ fn parse_and_validate_provider_dotenv(
     }
     if let Some(schema) = &source.schema {
         let schema_path = project_root.join(schema);
-        let allowed = dotenvy::from_path_iter(&schema_path)
-            .with_context(|| {
-                format!(
-                    "failed to read environment schema {}",
-                    schema_path.display()
-                )
-            })?
-            .collect::<std::result::Result<HashMap<_, _>, _>>()
-            .map_err(|_| {
-                anyhow!(
-                    "failed to parse environment schema {}",
-                    schema_path.display()
-                )
-            })?;
+        let allowed = read_environment_schema(&schema_path)?;
         let mut actual = values.keys().collect::<Vec<_>>();
         let mut expected = allowed.keys().collect::<Vec<_>>();
         actual.sort();
@@ -318,6 +328,27 @@ fn parse_and_validate_provider_dotenv(
         }
     }
     Ok(values)
+}
+
+fn read_environment_schema(path: &Path) -> Result<HashMap<String, String>> {
+    dotenvy::from_path_iter(path)
+        .with_context(|| format!("failed to read environment schema {}", path.display()))?
+        .collect::<std::result::Result<HashMap<_, _>, _>>()
+        .map_err(|_| anyhow!("failed to parse environment schema {}", path.display()))
+}
+
+fn provider_source_fully_shadowed(
+    source: &EnvironmentSourceConfig,
+    project_root: &Path,
+    overrides: &HashMap<String, String>,
+) -> Result<bool> {
+    let Some(schema) = &source.schema else {
+        return Ok(false);
+    };
+    let keys = read_environment_schema(&project_root.join(schema))?
+        .into_keys()
+        .collect::<Vec<_>>();
+    Ok(!keys.is_empty() && keys.iter().all(|key| overrides.contains_key(key)))
 }
 
 fn read_valid_cache(
@@ -537,10 +568,34 @@ mod tests {
     }
 
     #[test]
+    fn fully_shadowed_provider_schema_does_not_require_provider_resolution() {
+        let temp = std::env::temp_dir().join(format!(
+            "hum-provider-shadow-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("api.env.example"), "PUBLIC_URL=\nSECRET=\n").unwrap();
+        let source = provider_source(false);
+        let all = HashMap::from([
+            ("PUBLIC_URL".to_string(), "http://localhost".to_string()),
+            ("SECRET".to_string(), "local-only".to_string()),
+        ]);
+        assert!(provider_source_fully_shadowed(&source, &temp, &all).unwrap());
+        let partial = HashMap::from([("PUBLIC_URL".to_string(), "http://localhost".to_string())]);
+        assert!(!provider_source_fully_shadowed(&source, &temp, &partial).unwrap());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn v3_provider_resolution_keeps_inherited_and_cli_precedence() {
         let service = ServiceConfig {
             runtime: Some("local".to_string()),
             env: HashMap::from([("SHARED".to_string(), "literal".to_string())]),
+            env_overrides: HashMap::from([("SHARED".to_string(), "runtime-overlay".to_string())]),
             ..ServiceConfig::default()
         };
         let config = Config {
@@ -551,8 +606,11 @@ mod tests {
         let base = base_service_env(&service, Path::new(".")).unwrap();
         assert_eq!(base["SHARED"], "literal");
         assert!(config.runtimes.contains_key("local"));
+        let mut provider_values = HashMap::from([("SHARED".to_string(), "provider".to_string())]);
+        apply_declared_overrides(&mut provider_values, &service);
+        assert_eq!(provider_values["SHARED"], "runtime-overlay");
         let resolved = apply_runtime_overrides(
-            HashMap::from([("SHARED".to_string(), "provider".to_string())]),
+            provider_values,
             &HashMap::from([("SHARED".to_string(), "cli".to_string())]),
         );
         assert_eq!(resolved["SHARED"], "cli");
