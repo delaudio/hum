@@ -83,15 +83,17 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-musl
+      - name: Install static Linux linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build immutable Linux release archive
         run: |
           bash scripts/release-guard.sh
           version="${GITHUB_REF_NAME#v}"
           archive="hum-${version}-linux-x86_64.tar.gz"
           mkdir -p dist/stage-linux-x86_64 dist/release
-          cargo build --locked --release --target x86_64-unknown-linux-gnu
-          cp target/x86_64-unknown-linux-gnu/release/hum dist/stage-linux-x86_64/hum
+          cargo build --locked --release --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/hum dist/stage-linux-x86_64/hum
           tar -czf "dist/release/$archive" -C dist/stage-linux-x86_64 hum
           checksum="$(sha256sum "dist/release/$archive" | awk '{print $1}')"
           printf '%s  %s\n' "$checksum" "$archive" > "dist/release/$archive.sha256"
@@ -99,7 +101,7 @@ jobs:
           {
             "version": "$version",
             "architecture": "x86_64",
-            "target": "x86_64-unknown-linux-gnu",
+            "target": "x86_64-unknown-linux-musl",
             "commit": "$GITHUB_SHA",
             "workflow_run": "$GITHUB_RUN_ID"
           }
@@ -192,8 +194,31 @@ jobs:
           hum --help >/dev/null
           brew test hum/release-smoke/hum
 
+  smoke-linux:
+    needs: publish-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: hum-linux-x86_64
+          path: dist/release
+      - name: Run the static binary on Debian Bookworm
+        run: |
+          set -euo pipefail
+          mkdir -p dist/smoke
+          tar -xzf "dist/release/hum-${GITHUB_REF_NAME#v}-linux-x86_64.tar.gz" -C dist/smoke hum
+          docker run --rm \
+            --volume "$PWD/dist/smoke:/smoke:ro" \
+            debian:bookworm-slim \
+            /smoke/hum --version
+          docker run --rm \
+            --volume "$PWD/dist/smoke:/smoke:ro" \
+            debian:bookworm-slim \
+            /smoke/hum --help >/dev/null
+
   update-homebrew-tap:
-    needs: smoke-homebrew
+    needs: [smoke-homebrew, smoke-linux]
     if: ${{ vars.HOMEBREW_TAP_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     steps:
