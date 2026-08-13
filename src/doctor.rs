@@ -267,6 +267,11 @@ fn run_checks(
 ) -> Vec<DoctorCheck> {
     let mut results = Vec::new();
     let running_compose_targets = inspect_running_compose_targets(config, selected);
+    let docker_port_owners = if running_compose_targets.is_empty() {
+        HashMap::new()
+    } else {
+        inspect_docker_port_owners()
+    };
 
     // Repositories
     let selected_repositories = config
@@ -472,13 +477,23 @@ fn run_checks(
                     .and_then(|runtime_name| running_compose_targets.get(runtime_name))
                     .and_then(Option::as_ref)
                     .and_then(|targets| svc.target.as_ref().map(|target| targets.contains(target)));
-                check_external_runtime_port(name, port, runtime_running, &mut results);
+                check_external_runtime_port(
+                    name,
+                    port,
+                    runtime_running,
+                    docker_port_owners
+                        .get(&port)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    &mut results,
+                );
             }
         }
 
-        // Convention: if this looks like a Node project (package.json
-        // present), node_modules should exist too.
-        if cwd.join("package.json").is_file() {
+        // This convention only applies to processes managed by hum. Compose
+        // services commonly use the project root as their cwd, so a pack-level
+        // package.json must not make every container look like a Node service.
+        if should_check_node_modules(process_owned, cwd.join("package.json").is_file()) {
             if cwd.join("node_modules").is_dir() {
                 results.push(DoctorCheck::ok(Some(name), "node_modules installed"));
             } else {
@@ -497,6 +512,10 @@ fn run_checks(
     results.push(DoctorCheck::ok(None, "No circular dependencies"));
 
     results
+}
+
+fn should_check_node_modules(process_owned: bool, package_json_exists: bool) -> bool {
+    process_owned && package_json_exists
 }
 
 fn inspect_running_compose_targets(
@@ -588,6 +607,7 @@ fn check_external_runtime_port(
     service: &str,
     port: u16,
     runtime_running: Option<bool>,
+    docker_owners: &[DockerPortOwner],
     results: &mut Vec<DoctorCheck>,
 ) {
     let probe = portcheck::probe_port(port);
@@ -602,7 +622,83 @@ fn check_external_runtime_port(
         probe,
         runtime_running,
         &occupants,
+        docker_owners,
     ));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerPortOwner {
+    container: String,
+    project: Option<String>,
+    service: Option<String>,
+}
+
+fn inspect_docker_port_owners() -> HashMap<u16, Vec<DockerPortOwner>> {
+    let Ok(output) = Command::new("docker")
+        .args([
+            "ps",
+            "--format",
+            "{{.Names}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Ports}}",
+        ])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+    let mut owners = HashMap::<u16, Vec<DockerPortOwner>>::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let parsed = (|| {
+            let mut fields = line.splitn(4, '\t');
+            let container = fields.next()?.trim();
+            if container.is_empty() {
+                return None;
+            }
+            let optional = |value: Option<&str>| {
+                value
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            let owner = DockerPortOwner {
+                container: container.to_string(),
+                project: optional(fields.next()),
+                service: optional(fields.next()),
+            };
+            Some((owner, fields.next().unwrap_or_default()))
+        })();
+        let Some((owner, published_ports)) = parsed else {
+            continue;
+        };
+        for port in parse_published_ports(published_ports) {
+            let entries = owners.entry(port).or_default();
+            if !entries.contains(&owner) {
+                entries.push(owner.clone());
+            }
+        }
+    }
+    owners
+}
+
+fn parse_published_ports(value: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for mapping in value.split(',').map(str::trim) {
+        let Some((host, _)) = mapping.split_once("->") else {
+            continue;
+        };
+        let range = host.rsplit(':').next().unwrap_or(host);
+        let parsed = match range.split_once('-') {
+            Some((start, end)) => start
+                .parse::<u16>()
+                .and_then(|start| end.parse::<u16>().map(|end| (start, end))),
+            None => range.parse::<u16>().map(|port| (port, port)),
+        };
+        if let Ok((start, end)) = parsed {
+            ports.extend(start..=end);
+        }
+    }
+    ports
 }
 
 fn classify_external_runtime_port(
@@ -611,6 +707,7 @@ fn classify_external_runtime_port(
     probe: portcheck::PortProbe,
     runtime_running: Option<bool>,
     occupants: &[portcheck::PortOccupant],
+    docker_owners: &[DockerPortOwner],
 ) -> DoctorCheck {
     match probe {
         portcheck::PortProbe::Unknown => DoctorCheck::ok(
@@ -642,7 +739,11 @@ fn classify_external_runtime_port(
                 return DoctorCheck::fail(
                     Some(service),
                     format!("port {port} occupied while Compose service is stopped"),
-                    format_occupants(&occupants.iter().collect::<Vec<_>>()),
+                    if docker_owners.is_empty() {
+                        format_occupants(&occupants.iter().collect::<Vec<_>>())
+                    } else {
+                        format_docker_port_owners(docker_owners)
+                    },
                 );
             }
             DoctorCheck::ok(
@@ -651,6 +752,26 @@ fn classify_external_runtime_port(
             )
         }
     }
+}
+
+fn format_docker_port_owners(owners: &[DockerPortOwner]) -> String {
+    owners
+        .iter()
+        .map(|owner| match (&owner.project, &owner.service) {
+            (Some(project), Some(service)) => format!(
+                "container {} (Compose project {project}, service {service})",
+                owner.container
+            ),
+            (Some(project), None) => {
+                format!("container {} (Compose project {project})", owner.container)
+            }
+            (None, Some(service)) => {
+                format!("container {} (Compose service {service})", owner.container)
+            }
+            _ => format!("container {}", owner.container),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn is_container_port_forwarder(occupant: &portcheck::PortOccupant) -> bool {
@@ -806,6 +927,7 @@ mod tests {
             portcheck::PortProbe::Listening,
             Some(true),
             std::slice::from_ref(&docker),
+            &[],
         );
         assert!(healthy.ok);
 
@@ -815,9 +937,56 @@ mod tests {
             portcheck::PortProbe::Listening,
             Some(true),
             &[docker, host],
+            &[],
         );
         assert!(!shadowed.ok);
         assert!(shadowed.label.contains("shadowed"));
         assert!(shadowed.detail.unwrap().contains("PID 11 (node)"));
+    }
+
+    #[test]
+    fn compose_port_diagnostics_name_competing_docker_project() {
+        let docker = portcheck::PortOccupant {
+            pid: Some(10),
+            process_name: Some("com.docker.backend".to_string()),
+            command: Some("com.docker.backend".to_string()),
+        };
+        let owner = DockerPortOwner {
+            container: "other-redis-1".to_string(),
+            project: Some("other".to_string()),
+            service: Some("redis".to_string()),
+        };
+
+        let occupied = classify_external_runtime_port(
+            "redis",
+            6379,
+            portcheck::PortProbe::Listening,
+            Some(false),
+            &[docker],
+            &[owner],
+        );
+
+        assert!(!occupied.ok);
+        assert_eq!(
+            occupied.detail.as_deref(),
+            Some("container other-redis-1 (Compose project other, service redis)")
+        );
+    }
+
+    #[test]
+    fn docker_port_parser_handles_ipv4_ipv6_and_ranges() {
+        assert_eq!(
+            parse_published_ports(
+                "0.0.0.0:4566->4566/tcp, [::]:4566->4566/tcp, 127.0.0.1:4510-4512->4510-4512/tcp, 5432/tcp"
+            ),
+            vec![4566, 4566, 4510, 4511, 4512]
+        );
+    }
+
+    #[test]
+    fn node_modules_convention_only_applies_to_managed_processes() {
+        assert!(should_check_node_modules(true, true));
+        assert!(!should_check_node_modules(false, true));
+        assert!(!should_check_node_modules(true, false));
     }
 }
