@@ -212,3 +212,7 @@ cargo test --release --test performance_smoke -- --ignored --nocapture
 
 The detailed product contract, lifecycle, security model, migration notes, and
 acceptance criteria are in [`docs/PRD.md`](docs/PRD.md).
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
