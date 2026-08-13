@@ -60,6 +60,11 @@ tasks:
     command: [./prepare, "argument with spaces"]
     check: [test, -f, prepared]
     doctor: [./doctor-probe]
+    env_from:
+      - provider: vault
+        reference: op://Development/database/environment
+        schema: database.env.example
+        cache: .hum/cache/database.env
 services:
   database:
     runtime: infra
@@ -107,6 +112,9 @@ set -eu
 printf '%s\n' "$*" >> "$HUM_FAKE_DOCKER_LOG"
 env | grep '^HUM_RUNTIME_' >> "$HUM_FAKE_DOCKER_ENV" || true
 case "$*" in
+  *"config --format json --no-interpolate"*)
+    printf '%s\n' '{"services":{"database":{"image":"postgres:17","labels":{"source":"${DATABASE_URL}"},"environment":{"DATABASE_URL":"private-value","PUBLIC":"visible"}}}}'
+    ;;
   *"ps --status running --services"*)
     if [ -f "$HUM_FAKE_DOCKER_STATE" ]; then printf '%s\n' database; fi
     ;;
@@ -133,7 +141,7 @@ esac
     let fake_op = root.join("bin/op");
     fs::write(
         &fake_op,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' 'DATABASE_URL=postgres://private-value' 'PROVIDER_ONLY=available'\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' call >> \"$HUM_FAKE_OP_LOG\"\nprintf '%s\\n' 'DATABASE_URL=postgres://private-value' 'PROVIDER_ONLY=available'\n",
     )
     .unwrap();
     fs::set_permissions(&fake_op, fs::Permissions::from_mode(0o700)).unwrap();
@@ -144,10 +152,38 @@ esac
         &["plan", "api", "--json", "--exclude", "infrastructure"],
     );
     assert_success(&plan);
-    assert!(String::from_utf8_lossy(&plan.stdout).contains("\"name\": \"database\""));
+    let plan_json: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(plan_json["roots"], serde_json::json!(["api"]));
+    assert_eq!(
+        plan_json["excluded_templates"],
+        serde_json::json!(["infrastructure"])
+    );
+    let database = plan_json["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|unit| unit["name"] == "database")
+        .unwrap();
+    assert!(database["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "dependency of api"));
     let warning = String::from_utf8_lossy(&plan.stderr);
     assert!(warning.contains("reintroduced from excluded template 'infrastructure'"));
     assert!(!root.join(".hum/cache/database.env").exists());
+
+    let rendered = hum(&root, &config, &["config", "compose", "--format", "json"]);
+    assert_success(&rendered);
+    let rendered = String::from_utf8_lossy(&rendered.stdout);
+    assert!(rendered.contains("postgres:17"));
+    assert!(rendered.contains("<redacted>"));
+    assert!(rendered.contains("${DATABASE_URL}"));
+    assert!(!rendered.contains("private-value"));
+    assert!(!rendered.contains("visible"));
+    assert!(fs::read_to_string(root.join("docker.log"))
+        .unwrap()
+        .contains("config --format json --no-interpolate"));
 
     let blocked = hum(
         &root,
@@ -199,6 +235,14 @@ esac
     let start = hum(&root, &config, &["start"]);
     assert_success(&start);
     assert!(String::from_utf8_lossy(&start.stdout).contains("✓ started: database"));
+    assert_eq!(
+        fs::read_to_string(root.join("op.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "one read occurs in the secrets-sync process; within the later start process the task and service share one memoized read",
+    );
 
     let repeated = hum(&root, &config, &["start"]);
     assert_success(&repeated);
@@ -270,6 +314,26 @@ esac
     assert!(docker_log.contains("stop database"));
     assert!(docker_log.contains("logs --tail 5 database"));
     assert!(docker_log.contains("--profile * down --volumes --remove-orphans"));
+
+    let up_count_before_provider_failure = docker_log
+        .lines()
+        .filter(|line| line.contains("up --detach --wait database"))
+        .count();
+    fs::remove_file(root.join(".hum/cache/database.env")).unwrap();
+    fs::write(&fake_op, "#!/bin/sh\nexit 23\n").unwrap();
+    let provider_failure = hum(&root, &config, &["start"]);
+    assert!(!provider_failure.status.success());
+    assert!(String::from_utf8_lossy(&provider_failure.stderr)
+        .contains("required environment source from provider 'vault' is unavailable"));
+    let up_count_after_provider_failure = fs::read_to_string(root.join("docker.log"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("up --detach --wait database"))
+        .count();
+    assert_eq!(
+        up_count_after_provider_failure, up_count_before_provider_failure,
+        "Compose must not start with an unavailable required provider source",
+    );
 }
 
 fn hum(root: &Path, config: &Path, arguments: &[&str]) -> Output {
@@ -300,6 +364,7 @@ fn hum_with_env(
         .env("HUM_FAKE_DOCKER_STATE", root.join("docker.state"))
         .env("HUM_FAKE_DOCKER_LOG", root.join("docker.log"))
         .env("HUM_FAKE_DOCKER_ENV", root.join("docker.env"));
+    command.env("HUM_FAKE_OP_LOG", root.join("op.log"));
     command.envs(environment.iter().copied());
     command.output().unwrap()
 }

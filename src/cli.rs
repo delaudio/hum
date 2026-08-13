@@ -148,6 +148,15 @@ pub enum ProjectAction {
 pub enum ConfigAction {
     /// Validate registry, project configuration, and template selection
     Validate,
+    /// Render a Compose runtime with service environment values redacted
+    Compose {
+        /// Compose runtime name; required only when the project defines more than one
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Output format
+        #[arg(long, default_value = "yaml", value_parser = ["yaml", "json"])]
+        format: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -225,6 +234,61 @@ pub async fn run(cli: Cli) -> i32 {
                 loaded.config.templates.len()
             );
             EXIT_OK
+        }
+
+        Command::Config {
+            action: ConfigAction::Compose { runtime, format },
+        } => {
+            let names = loaded
+                .config
+                .runtimes
+                .iter()
+                .filter(|(_, config)| {
+                    matches!(config, crate::config::RuntimeConfig::Compose { .. })
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            let selected = match (runtime, names.as_slice()) {
+                (Some(name), _) if names.contains(&name) => name,
+                (Some(name), _) => {
+                    eprintln!("✗ unknown Compose runtime '{name}'");
+                    return EXIT_INVALID_CONFIG;
+                }
+                (None, [name]) => name.clone(),
+                (None, []) => {
+                    eprintln!("✗ project '{project}' has no Compose runtime");
+                    return EXIT_INVALID_CONFIG;
+                }
+                (None, _) => {
+                    eprintln!(
+                        "✗ project '{project}' has multiple Compose runtimes; select one with --runtime"
+                    );
+                    return EXIT_INVALID_CONFIG;
+                }
+            };
+            let compose = match crate::runtime::compose::ComposeRuntime::new(
+                selected,
+                project,
+                loaded.config.clone(),
+                loaded.root_dir.clone(),
+                env_overrides,
+            ) {
+                Ok(compose) => compose,
+                Err(error) => {
+                    eprintln!("✗ failed to initialize Compose rendering: {error}");
+                    return EXIT_RUNTIME_INCOHERENT;
+                }
+            };
+            match compose.render_config_redacted(&format).await {
+                Ok(output) => {
+                    print!("{output}");
+                    EXIT_OK
+                }
+                Err(error) => {
+                    eprintln!("✗ Compose rendering failed: {error}");
+                    EXIT_RUNTIME_INCOHERENT
+                }
+            }
         }
 
         Command::Doctor { exclusions } => {
@@ -488,7 +552,7 @@ pub async fn run(cli: Cli) -> i32 {
                 Err(code) => return code,
             };
             print_selection_warnings(&selection.warnings);
-            print_plan(&loaded.config, &selection.order, json);
+            print_plan(&loaded.config, &template, &selection, &exclusions, json);
             EXIT_OK
         }
 
@@ -516,14 +580,50 @@ pub async fn run(cli: Cli) -> i32 {
                     return EXIT_RUNTIME_INCOHERENT;
                 }
             };
-            let result = runtime.sync_selection_environment(&selection.order).await;
+            let mut result = runtime.sync_selection_environment(&selection.order).await;
+            let should_retry = match &result {
+                Ok(report) => report.unavailable > 0,
+                Err(error) => crate::config::environment::is_one_password_unavailable(error),
+            };
+            if should_retry
+                && std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_none()
+            {
+                match crate::config::environment::one_password_session_available() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!("1Password is not signed in; attempting interactive sign-in…");
+                        match crate::config::environment::sign_in_one_password() {
+                            Ok(true) => {
+                                // Discard the failed pre-sign-in read before retrying.
+                                // ProjectRuntime also starts every lifecycle action
+                                // with a fresh cache; keeping this explicit protects
+                                // the authentication boundary if that API changes.
+                                crate::config::environment::clear_provider_read_cache();
+                                result = runtime.sync_selection_environment(&selection.order).await;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                eprintln!("✗ interactive 1Password sign-in failed: {error}")
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("✗ cannot inspect 1Password session: {error}"),
+                }
+            }
             match result {
                 Ok(report) => {
                     println!("✓ refreshed {} environment source(s)", report.refreshed);
-                    if report.fallback > 0 {
+                    if report.cached > 0 {
                         println!(
-                            "  {} optional source(s) unavailable; valid cache or empty fallback used",
-                            report.fallback
+                            "  {} environment source(s) reused a valid private cache",
+                            report.cached
+                        );
+                    }
+                    if report.unavailable > 0 {
+                        println!(
+                            "  {} optional source(s) unavailable without a cache",
+                            report.unavailable
                         );
                     }
                     EXIT_OK
@@ -662,15 +762,58 @@ fn confirm_reset(project: &str, yes: bool) -> anyhow::Result<bool> {
     Ok(confirmation.trim() == project)
 }
 
-fn print_plan(config: &config::Config, order: &[String], json: bool) {
-    let units = order
+fn print_plan(
+    config: &config::Config,
+    template: &str,
+    selection: &crate::core::graph::SelectionPlan,
+    exclusions: &ExclusionArgs,
+    json: bool,
+) {
+    let selected = selection
+        .order
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut reasons_by_unit = std::collections::HashMap::<String, Vec<String>>::new();
+    for root in &selection.roots {
+        reasons_by_unit
+            .entry(root.clone())
+            .or_default()
+            .push("selected".to_string());
+    }
+    for dependent in &selection.order {
+        let dependencies = config
+            .services
+            .get(dependent)
+            .map(|service| service.depends_on.as_slice())
+            .or_else(|| {
+                config
+                    .tasks
+                    .get(dependent)
+                    .map(|task| task.depends_on.as_slice())
+            });
+        for dependency in dependencies.into_iter().flatten() {
+            if selected.contains(dependency) {
+                reasons_by_unit
+                    .entry(dependency.clone())
+                    .or_default()
+                    .push(format!("dependency of {dependent}"));
+            }
+        }
+    }
+    let units = selection
+        .order
         .iter()
         .map(|name| {
+            let reasons = reasons_by_unit
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| vec!["transitive dependency".to_string()]);
             if let Some(task) = config.tasks.get(name) {
                 serde_json::json!({
                     "name": name,
                     "kind": "task",
                     "depends_on": task.depends_on,
+                    "reasons": reasons,
                 })
             } else {
                 let service = &config.services[name];
@@ -680,14 +823,34 @@ fn print_plan(config: &config::Config, order: &[String], json: bool) {
                     "runtime": service.runtime.as_deref().unwrap_or("process"),
                     "target": service.target,
                     "depends_on": service.depends_on,
+                    "reasons": reasons,
                 })
             }
         })
         .collect::<Vec<_>>();
     if json {
+        let warnings = selection
+            .warnings
+            .iter()
+            .map(|warning| {
+                serde_json::json!({
+                    "excluded_template": warning.excluded_template,
+                    "service": warning.service,
+                    "required_by": warning.required_by,
+                })
+            })
+            .collect::<Vec<_>>();
         println!(
             "{}",
-            serde_json::to_string_pretty(&units).expect("plan serialization")
+            serde_json::to_string_pretty(&serde_json::json!({
+                "template": template,
+                "roots": selection.roots,
+                "excluded_templates": exclusions.templates,
+                "excluded_services": exclusions.excluded_services,
+                "warnings": warnings,
+                "units": units,
+            }))
+            .expect("plan serialization")
         );
         return;
     }
@@ -1252,6 +1415,28 @@ mod tests {
                 follow: false,
                 lines: 10
             })
+        ));
+    }
+
+    #[test]
+    fn parses_redacted_compose_rendering() {
+        let cli = Cli::try_parse_from([
+            "hum",
+            "demo",
+            "all-services",
+            "config",
+            "compose",
+            "--runtime",
+            "infra",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config {
+                action: ConfigAction::Compose { runtime, format }
+            }) if runtime.as_deref() == Some("infra") && format == "json"
         ));
     }
 

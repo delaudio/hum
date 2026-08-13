@@ -13,6 +13,7 @@ pub struct SelectionWarning {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionPlan {
+    pub roots: Vec<String>,
     pub order: Vec<String>,
     pub warnings: Vec<SelectionWarning>,
 }
@@ -158,7 +159,11 @@ pub fn resolve_selection(
         }
     }
 
-    Ok(SelectionPlan { order, warnings })
+    Ok(SelectionPlan {
+        roots,
+        order,
+        warnings,
+    })
 }
 
 fn direct_dependent(config: &Config, order: &[String], dependency: &str) -> Option<String> {

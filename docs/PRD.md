@@ -185,6 +185,7 @@ hum demo all-services restart
 hum demo all-services status
 hum demo all-services plan --json
 hum demo all-services secrets sync
+hum demo all-services config compose --format yaml
 hum demo all-services logs api --follow
 hum demo all-services reset
 hum demo all-services doctor
@@ -202,6 +203,12 @@ hum demo all-services start --exclude-service mail
 può reintrodurli con un warning deterministico. `--exclude-service` è un veto
 forte: se un'unità rimasta dipende dal servizio escluso, la selezione fallisce
 prima di qualsiasi side effect.
+
+`plan --json` restituisce, per i piani risolti, un documento stabile con
+template, root richiesti, esclusioni, warning e unità ordinate con la
+motivazione della loro inclusione. Un piano non risolvibile termina con exit
+code non zero e diagnostica su stderr. `config compose` rende il modello Compose effettivo
+senza leggere provider e sostituisce ogni valore d'ambiente con `<redacted>`.
 
 Varianti interattive:
 
@@ -506,6 +513,10 @@ da un processo non riconosciuto è una diagnosi distinta.
 - Non stampare valori di variabili sensibili.
 - Non scrivere valori sensibili nei file Compose generati.
 - Scrivere cache provider solo se configurate, atomicamente e con modo `0600`.
+- Per una source richiesta, riusare solo una cache valida rispetto allo schema e
+  fallire prima del runtime se provider e cache valida non sono disponibili.
+- Non aprire login interattivi durante `start`; solo `secrets sync` può proporre
+  un singolo `op signin` quando è collegato a un terminale.
 - `doctor` verifica la disponibilità del provider senza leggere item.
 - Mascherare pattern configurati nella visualizzazione dei log.
 - Considerare i comandi locali configurati come codice fidato.
@@ -548,6 +559,8 @@ alla CLI Compose senza interpretarne il contenuto nel core.
 - Campi sconosciuti e path errati sono diagnosticati.
 - Lo stesso grafo ordina processi, servizi Compose e task senza cicli.
 - `plan` non contatta Docker o provider e non mostra valori d'ambiente.
+- `plan --json` espone selezione, esclusioni, warning e ragioni in forma
+  machine-readable; `config compose` non mostra valori d'ambiente reali.
 - Le esclusioni di template segnalano le dipendenze reintrodotte; le esclusioni
   di servizio bloccano dipendenze incompatibili prima di ogni side effect.
 

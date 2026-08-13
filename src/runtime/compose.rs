@@ -217,6 +217,128 @@ impl ComposeRuntime {
         Ok(())
     }
 
+    /// Render the effective Compose model without resolving provider sources.
+    /// Every service environment value is replaced before the model is printed.
+    pub async fn render_config_redacted(&self, format: &str) -> Result<String> {
+        let mut arguments = self.base_arguments(true);
+        arguments.extend([
+            "config".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--no-interpolate".to_string(),
+        ]);
+        let output = Command::new("docker")
+            .args(&arguments)
+            .env("COMPOSE_IGNORE_ORPHANS", "true")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("failed to render Docker Compose configuration")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Docker Compose config failed with status {}; stderr was withheld to preserve the redacted-output contract. Run Docker Compose config directly from {} when full trusted-terminal diagnostics are required",
+                output.status,
+                self.root_dir.display()
+            ));
+        }
+        let mut model: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .context("Docker Compose returned invalid JSON")?;
+        if let Some(services) = model
+            .get_mut("services")
+            .and_then(|value| value.as_object_mut())
+        {
+            // Providers are deliberately not read by this command. Insert all
+            // keys declared in Hum so the rendered contract remains complete
+            // even when Compose itself could not see a value for them.
+            for service in self
+                .config
+                .services
+                .values()
+                .filter(|service| service.runtime.as_deref() == Some(self.name.as_str()))
+            {
+                let Some(target) = service.target.as_deref() else {
+                    continue;
+                };
+                let Some(rendered) = services
+                    .get_mut(target)
+                    .and_then(|value| value.as_object_mut())
+                else {
+                    continue;
+                };
+                let environment = rendered
+                    .entry("environment")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        anyhow!("Compose service '{target}' has a non-object environment")
+                    })?;
+                for key in self.declared_environment_keys(service)? {
+                    environment.insert(key, serde_json::Value::String("<redacted>".to_string()));
+                }
+            }
+        }
+        if let Some(services) = model
+            .get_mut("services")
+            .and_then(|value| value.as_object_mut())
+        {
+            // Compose may also merge values from interpolation or its own env
+            // files. Redact every value it rendered, including keys Hum did not
+            // declare, as a final no-secret-output boundary.
+            for service in services.values_mut() {
+                if let Some(environment) = service
+                    .get_mut("environment")
+                    .and_then(|value| value.as_object_mut())
+                {
+                    for value in environment.values_mut() {
+                        *value = serde_json::Value::String("<redacted>".to_string());
+                    }
+                }
+            }
+        }
+        match format {
+            "json" => serde_json::to_string_pretty(&model)
+                .map(|output| format!("{output}\n"))
+                .context("failed to serialize redacted Compose JSON"),
+            "yaml" => {
+                yaml_serde::to_string(&model).context("failed to serialize redacted Compose YAML")
+            }
+            _ => Err(anyhow!("unsupported Compose output format '{format}'")),
+        }
+    }
+
+    fn declared_environment_keys(
+        &self,
+        service: &crate::config::ServiceConfig,
+    ) -> Result<HashSet<String>> {
+        let mut keys = service.env.keys().cloned().collect::<HashSet<_>>();
+        keys.extend(service.env_overrides.keys().cloned());
+        let mut read_dotenv_keys = |path: &Path| -> Result<()> {
+            let values = dotenvy::from_path_iter(path).with_context(|| {
+                format!("failed to read environment declaration {}", path.display())
+            })?;
+            for value in values {
+                keys.insert(
+                    value
+                        .with_context(|| {
+                            format!("failed to parse environment declaration {}", path.display())
+                        })?
+                        .0,
+                );
+            }
+            Ok(())
+        };
+        if let Some(file) = &service.env_file {
+            read_dotenv_keys(&absolute_from(&self.root_dir, file.clone()))?;
+        }
+        for source in &service.env_from {
+            if let Some(schema) = &source.schema {
+                read_dotenv_keys(&absolute_from(&self.root_dir, schema.clone()))?;
+            }
+        }
+        Ok(keys)
+    }
+
     async fn capture_services(&self, status: Option<&str>) -> Result<HashSet<String>> {
         let mut arguments = self.base_arguments(true);
         arguments.push("ps".to_string());

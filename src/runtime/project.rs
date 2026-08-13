@@ -110,11 +110,13 @@ impl ProjectRuntime {
     }
 
     pub async fn start_services(&self, services: &[String]) -> Result<StartReport> {
+        crate::config::environment::clear_provider_read_cache();
         let order = graph::resolve_start_order(self.config(), services)?;
         self.start_ordered(&order).await
     }
 
     pub async fn start_selection(&self, order: &[String]) -> Result<StartReport> {
+        crate::config::environment::clear_provider_read_cache();
         self.start_ordered(order).await
     }
 
@@ -122,6 +124,7 @@ impl ProjectRuntime {
         &self,
         order: &[String],
     ) -> Result<crate::config::environment::EnvironmentSyncReport> {
+        crate::config::environment::clear_provider_read_cache();
         self.sync_ordered_environment(order).await
     }
 
@@ -135,6 +138,7 @@ impl ProjectRuntime {
     }
 
     pub async fn restart_template(&self, template: &str, grace: Duration) -> Result<RestartReport> {
+        crate::config::environment::clear_provider_read_cache();
         let start_order = graph::services_for_template(self.config(), template)?;
         let stop_order = graph::stop_order(&start_order);
         self.restart_ordered(&stop_order, &start_order, grace).await
@@ -145,6 +149,7 @@ impl ProjectRuntime {
         services: &[String],
         grace: Duration,
     ) -> Result<RestartReport> {
+        crate::config::environment::clear_provider_read_cache();
         let start_order = graph::resolve_start_order(self.config(), services)?;
         let requested = services.iter().collect::<std::collections::HashSet<_>>();
         let stop_order = graph::stop_order(

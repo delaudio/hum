@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -15,13 +16,31 @@ use super::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EnvironmentSyncReport {
     pub refreshed: usize,
-    pub fallback: usize,
+    pub cached: usize,
+    pub unavailable: usize,
 }
 
+#[derive(Clone)]
 enum ProviderSourceOutcome {
     Fetched(HashMap<String, String>),
     Cached(HashMap<String, String>),
     Unavailable,
+}
+
+#[derive(Clone)]
+enum ProviderReadOutcome {
+    Fetched(String),
+    Unavailable,
+}
+
+static PROVIDER_READ_CACHE: OnceLock<Mutex<HashMap<String, ProviderReadOutcome>>> = OnceLock::new();
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "required environment source from provider '{provider}' is unavailable and has no valid cache"
+)]
+struct OnePasswordProviderUnavailable {
+    provider: String,
 }
 
 impl ProviderSourceOutcome {
@@ -136,6 +155,11 @@ pub async fn sync_environment_sources(
 ) -> Result<EnvironmentSyncReport> {
     let mut report = EnvironmentSyncReport::default();
     let mut seen = HashSet::new();
+    let mut sources = sources.iter().collect::<Vec<_>>();
+    // A task and service may declare the same reference with different
+    // optionality. Process required declarations first so de-duplication keeps
+    // the fail-closed contract for the whole selection.
+    sources.sort_by_key(|source| source.optional);
     for source in sources {
         let identity = (
             source.provider.clone(),
@@ -160,9 +184,8 @@ pub async fn sync_environment_sources(
         .context("environment provider sync task failed")??;
         match outcome {
             ProviderSourceOutcome::Fetched(_) => report.refreshed += 1,
-            ProviderSourceOutcome::Cached(_) | ProviderSourceOutcome::Unavailable => {
-                report.fallback += 1;
-            }
+            ProviderSourceOutcome::Cached(_) => report.cached += 1,
+            ProviderSourceOutcome::Unavailable => report.unavailable += 1,
         }
     }
     Ok(report)
@@ -228,13 +251,80 @@ fn resolve_provider_source_outcome(
     source: &EnvironmentSourceConfig,
     project_root: &Path,
 ) -> Result<ProviderSourceOutcome> {
-    resolve_provider_source_outcome_with(provider, source, project_root, |provider, reference| {
-        match provider {
-            EnvironmentProviderConfig::OnePassword { account } => {
-                read_one_password_reference(reference, account.as_deref())
+    let outcome = read_provider_reference_cached(provider, &source.reference);
+    resolve_provider_source_outcome_from_read(source, project_root, outcome)
+}
+
+fn provider_cache_key(provider: &EnvironmentProviderConfig, reference: &str) -> String {
+    match provider {
+        EnvironmentProviderConfig::OnePassword { account } => {
+            format!(
+                "one-password\0{}\0{reference}",
+                account.as_deref().unwrap_or("")
+            )
+        }
+    }
+}
+
+fn read_provider_reference_cached(
+    provider: &EnvironmentProviderConfig,
+    reference: &str,
+) -> ProviderReadOutcome {
+    let key = provider_cache_key(provider, reference);
+    let cache = PROVIDER_READ_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(outcome) = cache.get(&key) {
+        return outcome.clone();
+    }
+    let outcome = match provider {
+        EnvironmentProviderConfig::OnePassword { account } => {
+            match read_one_password_reference(reference, account.as_deref()) {
+                Ok(contents) => ProviderReadOutcome::Fetched(contents),
+                Err(_) => ProviderReadOutcome::Unavailable,
             }
         }
-    })
+    };
+    cache.insert(key, outcome.clone());
+    outcome
+}
+
+pub fn clear_provider_read_cache() {
+    if let Some(cache) = PROVIDER_READ_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+pub fn is_one_password_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<OnePasswordProviderUnavailable>())
+}
+
+pub fn sign_in_one_password() -> Result<bool> {
+    let status = Command::new("op")
+        .arg("signin")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|_| anyhow!("1Password CLI is unavailable or could not be started"))?;
+    Ok(status.success())
+}
+
+pub fn one_password_session_available() -> Result<bool> {
+    let status = Command::new("op")
+        .arg("whoami")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| anyhow!("1Password CLI is unavailable or could not be started"))?;
+    Ok(status.success())
 }
 
 #[cfg(test)]
@@ -247,41 +337,43 @@ fn resolve_provider_source_with<F>(
 where
     F: FnOnce(&EnvironmentProviderConfig, &str) -> Result<String>,
 {
-    resolve_provider_source_outcome_with(provider, source, project_root, read)
-        .map(|outcome| outcome.into_values())
+    let outcome = match read(provider, &source.reference) {
+        Ok(contents) => ProviderReadOutcome::Fetched(contents),
+        Err(_) => ProviderReadOutcome::Unavailable,
+    };
+    resolve_provider_source_outcome_from_read(source, project_root, outcome)
+        .map(ProviderSourceOutcome::into_values)
 }
 
-fn resolve_provider_source_outcome_with<F>(
-    provider: &EnvironmentProviderConfig,
+fn resolve_provider_source_outcome_from_read(
     source: &EnvironmentSourceConfig,
     project_root: &Path,
-    read: F,
-) -> Result<ProviderSourceOutcome>
-where
-    F: FnOnce(&EnvironmentProviderConfig, &str) -> Result<String>,
-{
-    let fetched = read(provider, &source.reference);
-
-    match fetched {
-        Ok(contents) => match parse_and_validate_provider_dotenv(&contents, source, project_root) {
-            Ok(values) => {
-                if let Some(cache) = &source.cache {
-                    write_private_cache_atomic(&project_root.join(cache), &contents)?;
+    outcome: ProviderReadOutcome,
+) -> Result<ProviderSourceOutcome> {
+    match outcome {
+        ProviderReadOutcome::Fetched(contents) => {
+            match parse_and_validate_provider_dotenv(&contents, source, project_root) {
+                Ok(values) => {
+                    if let Some(cache) = &source.cache {
+                        write_private_cache_atomic(&project_root.join(cache), &contents)?;
+                    }
+                    Ok(ProviderSourceOutcome::Fetched(values))
                 }
-                Ok(ProviderSourceOutcome::Fetched(values))
+                Err(error) => match read_valid_cache(source, project_root) {
+                    Ok(values) => Ok(ProviderSourceOutcome::Cached(values)),
+                    Err(_) if source.optional => Ok(ProviderSourceOutcome::Unavailable),
+                    Err(_) => Err(error),
+                },
             }
-            Err(_) if source.optional => Ok(read_valid_cache(source, project_root)
-                .map(ProviderSourceOutcome::Cached)
-                .unwrap_or(ProviderSourceOutcome::Unavailable)),
-            Err(error) => Err(error),
+        }
+        ProviderReadOutcome::Unavailable => match read_valid_cache(source, project_root) {
+            Ok(values) => Ok(ProviderSourceOutcome::Cached(values)),
+            Err(_) if source.optional => Ok(ProviderSourceOutcome::Unavailable),
+            Err(_) => Err(OnePasswordProviderUnavailable {
+                provider: source.provider.clone(),
+            }
+            .into()),
         },
-        Err(_) if source.optional => Ok(read_valid_cache(source, project_root)
-            .map(ProviderSourceOutcome::Cached)
-            .unwrap_or(ProviderSourceOutcome::Unavailable)),
-        Err(_) => Err(anyhow!(
-            "required environment source from provider '{}' is unavailable",
-            source.provider
-        )),
     }
 }
 
@@ -564,6 +656,47 @@ mod tests {
             })
             .unwrap();
         assert!(values.is_empty());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn required_provider_failure_reuses_a_valid_cache_but_fails_without_one() {
+        let temp = std::env::temp_dir().join(format!(
+            "hum-required-provider-cache-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(temp.join(".hum/cache")).unwrap();
+        fs::write(temp.join("api.env.example"), "PUBLIC_URL=\nSECRET=\n").unwrap();
+        fs::write(
+            temp.join(".hum/cache/api.env"),
+            "PUBLIC_URL=http://cached\nSECRET=cached\n",
+        )
+        .unwrap();
+        let provider = EnvironmentProviderConfig::OnePassword { account: None };
+        let source = provider_source(false);
+        let values = resolve_provider_source_with(&provider, &source, &temp, |_, _| {
+            Err(anyhow!("provider unavailable"))
+        })
+        .unwrap();
+        assert_eq!(values["SECRET"], "cached");
+
+        fs::write(temp.join(".hum/cache/api.env"), "UNDECLARED=value\n").unwrap();
+        let error = resolve_provider_source_with(&provider, &source, &temp, |_, _| {
+            Err(anyhow!("provider unavailable"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("no valid cache"));
+        assert!(is_one_password_unavailable(&error));
+
+        let validation_error = resolve_provider_source_with(&provider, &source, &temp, |_, _| {
+            Ok("UNDECLARED=fetched\n".to_string())
+        })
+        .unwrap_err();
+        assert!(!is_one_password_unavailable(&validation_error));
         fs::remove_dir_all(temp).unwrap();
     }
 

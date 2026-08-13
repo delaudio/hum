@@ -51,6 +51,7 @@ hum <project> <template> secrets sync [service ...] [--exclude TEMPLATE] [--excl
 hum <project> <template> logs [service] [--lines N] [--follow]
 hum <project> <template> reset [--yes]
 hum <project> <template> doctor [--exclude TEMPLATE] [--exclude-service SERVICE]
+hum <project> <template> config compose [--format yaml|json] [--runtime NAME]
 hum <project> <template> tui
 ```
 
@@ -143,9 +144,18 @@ Values are scoped to the child process or Compose invocation and are never
 printed or persisted in generated Compose YAML. Optional `schema` validation
 requires an exact key set. Optional `cache` files are plaintext, atomically
 replaced with mode `0600`, and should live under the gitignored `.hum/`
-directory. Required sources fail closed; optional sources may use a valid
-cache. `secrets sync` refreshes selected sources without starting services, and
-`doctor` checks only that `op` exists—it never reads vault items.
+directory. Required sources fail closed only when neither the provider nor a
+schema-valid cache is available; optional sources may continue empty. Provider
+references are read once per lifecycle action and reused across tasks/services;
+each later TUI action starts with a fresh provider-read cache.
+`secrets sync` refreshes selected sources without starting services and may
+attempt interactive `op signin`; normal startup never prompts. `doctor` checks
+only that `op` exists—it never reads vault items.
+
+`config compose` renders the effective Compose model without contacting
+environment providers. Service environment values are replaced with
+`<redacted>` in both YAML and JSON output, while interpolation outside service
+environment maps remains as `${NAME}` placeholders.
 
 ## Current persistent runtime
 
