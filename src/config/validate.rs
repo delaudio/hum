@@ -4,6 +4,13 @@ use std::path::{Component, Path};
 use super::error::ConfigError;
 use super::model::{Config, EnvironmentProviderConfig, HealthcheckConfig, RuntimeConfig};
 
+const MAX_REDACT_PATTERNS: usize = 128;
+const MAX_REDACT_PATTERN_BYTES: usize = 256 * 1024;
+const MAX_LOG_EXPORTERS: usize = 16;
+const MAX_LOG_EXPORT_ENDPOINT_BYTES: usize = 8 * 1024;
+const MAX_LOG_EXPORT_HEADERS: usize = 16;
+const MAX_LOG_EXPORT_HEADER_BYTES: usize = 8 * 1024;
+
 /// Validate a fully-merged configuration. Catches everything that can be
 /// checked statically: version, dangling references and dependency cycles.
 pub fn validate(config: &Config, file: &Path) -> Result<(), ConfigError> {
@@ -219,6 +226,29 @@ fn validate_logs(config: &Config, file: &Path) -> Result<(), ConfigError> {
             "set max_line_bytes to a bounded positive value, for example 65536",
         ));
     }
+    if config.logs.redact_patterns.len() > MAX_REDACT_PATTERNS {
+        return Err(ConfigError::validation(
+            file,
+            "logs.redact_patterns",
+            format!("at most {MAX_REDACT_PATTERNS} redaction patterns are supported"),
+            "remove redundant patterns or combine them into bounded expressions",
+        ));
+    }
+    let redact_pattern_bytes = config
+        .logs
+        .redact_patterns
+        .iter()
+        .fold(0_usize, |total, pattern| {
+            total.saturating_add(pattern.len())
+        });
+    if redact_pattern_bytes > MAX_REDACT_PATTERN_BYTES {
+        return Err(ConfigError::validation(
+            file,
+            "logs.redact_patterns",
+            "redaction patterns exceed the 256 KiB aggregate safety limit",
+            "shorten or remove redundant redaction expressions",
+        ));
+    }
     for (index, pattern) in config.logs.redact_patterns.iter().enumerate() {
         if pattern.is_empty() {
             return Err(ConfigError::validation(
@@ -235,6 +265,141 @@ fn validate_logs(config: &Config, file: &Path) -> Result<(), ConfigError> {
                 format!("invalid redaction regular expression: {error}"),
                 "fix the regular expression syntax",
             ));
+        }
+    }
+    if config.logs.exporters.len() > MAX_LOG_EXPORTERS {
+        return Err(ConfigError::validation(
+            file,
+            "logs.exporters",
+            format!("at most {MAX_LOG_EXPORTERS} log exporters are supported"),
+            "remove duplicate exporters or route through one local collector",
+        ));
+    }
+    for (index, exporter) in config.logs.exporters.iter().enumerate() {
+        match exporter {
+            crate::config::LogExporterConfig::Http {
+                endpoint,
+                timeout,
+                headers,
+            } => {
+                if endpoint.len() > MAX_LOG_EXPORT_ENDPOINT_BYTES {
+                    return Err(ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.endpoint"),
+                        "HTTP log exporter endpoint exceeds the 8 KiB safety limit",
+                        "use a shorter collector URL",
+                    ));
+                }
+                let parsed = reqwest::Url::parse(endpoint).map_err(|error| {
+                    ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.endpoint"),
+                        format!("invalid HTTP log exporter endpoint: {error}"),
+                        "use an absolute http:// or https:// URL",
+                    )
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+                    return Err(ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.endpoint"),
+                        "HTTP log exporter endpoint must use http or https and include a host",
+                        "use an absolute URL such as http://127.0.0.1:8687/events",
+                    ));
+                }
+                let host = parsed.host_str().unwrap_or_default();
+                let normalized_host = host.strip_suffix('.').unwrap_or(host);
+                // reqwest::Url 0.12 retains brackets in host_str() for IPv6
+                // literals (covered by the ::1 validation test below).
+                let ip_host = normalized_host
+                    .strip_prefix('[')
+                    .and_then(|host| host.strip_suffix(']'))
+                    .unwrap_or(normalized_host);
+                // This is a syntactic configuration-safety check. Hum does
+                // not resolve arbitrary hostnames to make trust decisions.
+                let loopback_ip = ip_host.parse::<std::net::IpAddr>().is_ok_and(|address| {
+                    address.is_loopback()
+                        || matches!(
+                            address,
+                            std::net::IpAddr::V6(address)
+                                if address
+                                    .to_ipv4_mapped()
+                                    .is_some_and(|address| address.is_loopback())
+                        )
+                });
+                let loopback = normalized_host.eq_ignore_ascii_case("localhost")
+                    || normalized_host.to_ascii_lowercase().ends_with(".localhost")
+                    || loopback_ip;
+                if parsed.scheme() == "http" && !loopback {
+                    return Err(ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.endpoint"),
+                        "non-loopback HTTP log exporter endpoints are not allowed",
+                        "use HTTPS for remote collectors or a loopback HTTP endpoint for local tools",
+                    ));
+                }
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    return Err(ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.endpoint"),
+                        "HTTP log exporter endpoint must not embed credentials",
+                        "use a credential-free local endpoint",
+                    ));
+                }
+                if parsed.query().is_some() || parsed.fragment().is_some() {
+                    return Err(ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.endpoint"),
+                        "HTTP log exporter endpoint must not include a query or fragment",
+                        "put routing information in the URL path and keep credentials out of configuration",
+                    ));
+                }
+                if timeout.is_zero() || *timeout > std::time::Duration::from_secs(10) {
+                    return Err(ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.timeout"),
+                        "HTTP log exporter timeout must be greater than zero and at most 10 seconds",
+                        "use a short best-effort timeout such as 750ms",
+                    ));
+                }
+                if headers.len() > MAX_LOG_EXPORT_HEADERS {
+                    return Err(ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.headers"),
+                        format!("at most {MAX_LOG_EXPORT_HEADERS} HTTP headers are supported"),
+                        "remove unnecessary exporter headers",
+                    ));
+                }
+                let mut header_bytes = 0_usize;
+                for (name, value) in headers {
+                    header_bytes = header_bytes
+                        .saturating_add(name.len())
+                        .saturating_add(value.len());
+                    if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                        return Err(ConfigError::validation(
+                            file,
+                            format!("logs.exporters.{index}.headers.{name}"),
+                            "invalid HTTP header name",
+                            "use an RFC-compliant HTTP header name",
+                        ));
+                    }
+                    if reqwest::header::HeaderValue::from_str(value).is_err() {
+                        return Err(ConfigError::validation(
+                            file,
+                            format!("logs.exporters.{index}.headers.{name}"),
+                            "invalid HTTP header value",
+                            "remove control characters from the header value",
+                        ));
+                    }
+                }
+                if header_bytes > MAX_LOG_EXPORT_HEADER_BYTES {
+                    return Err(ConfigError::validation(
+                        file,
+                        format!("logs.exporters.{index}.headers"),
+                        "HTTP log exporter headers exceed the aggregate 8 KiB safety limit",
+                        "use smaller header values",
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -888,6 +1053,106 @@ mod tests {
         config.logs.max_file_bytes = 1024;
         config.logs.redact_patterns = vec!["(".to_string()];
         assert!(validate(&config, file).is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_log_export_configuration() {
+        let file = Path::new("hum.yaml");
+        let mut config = valid_config();
+        config.logs.redact_patterns = vec!["x".to_string(); MAX_REDACT_PATTERNS + 1];
+        assert!(validate(&config, file).is_err());
+
+        config.logs.redact_patterns = vec!["x".repeat(MAX_REDACT_PATTERN_BYTES + 1)];
+        assert!(validate(&config, file).is_err());
+
+        config.logs.redact_patterns.clear();
+        config.logs.exporters = vec![
+            crate::config::LogExporterConfig::Http {
+                endpoint: "https://collector.example/events".to_string(),
+                timeout: std::time::Duration::from_millis(750),
+                headers: HashMap::new(),
+            };
+            MAX_LOG_EXPORTERS + 1
+        ];
+        assert!(validate(&config, file).is_err());
+    }
+
+    #[test]
+    fn validates_best_effort_http_log_exporters() {
+        let file = Path::new("hum.yaml");
+        let mut config = valid_config();
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "http://127.0.0.1:8687/events".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::from([(
+                "Authorization".to_string(),
+                "Basic machine-local-token".to_string(),
+            )]),
+        }];
+        assert!(validate(&config, file).is_ok());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "http://127.0.0.1:8687/events".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::from([("bad header".to_string(), "value".to_string())]),
+        }];
+        assert!(validate(&config, file).is_err());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "http://[::1]:8687/events".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::new(),
+        }];
+        assert!(validate(&config, file).is_ok());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "http://collector.localhost.:8687/events".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::new(),
+        }];
+        assert!(validate(&config, file).is_ok());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "http://[::ffff:127.0.0.1]:8687/events".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::new(),
+        }];
+        assert!(validate(&config, file).is_ok());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "file:///tmp/logs".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::new(),
+        }];
+        assert!(validate(&config, file).is_err());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "http://user:secret@127.0.0.1:8687/events".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::new(),
+        }];
+        assert!(validate(&config, file).is_err());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "http://127.0.0.1:8687/events?token=secret".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::new(),
+        }];
+        assert!(validate(&config, file).is_err());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "http://collector.example/events".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::new(),
+        }];
+        assert!(validate(&config, file).is_err());
+
+        config.logs.exporters = vec![crate::config::LogExporterConfig::Http {
+            endpoint: "https://collector.example/events".to_string(),
+            timeout: std::time::Duration::from_millis(750),
+            headers: HashMap::new(),
+        }];
+        assert!(validate(&config, file).is_ok());
     }
 
     #[test]

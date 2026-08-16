@@ -1,11 +1,13 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use sysinfo::System;
@@ -281,6 +283,124 @@ templates:
         .unwrap();
     assert_success(&after_crash);
     assert!(String::from_utf8_lossy(&after_crash.stdout).contains("[REDACTED]"));
+}
+
+#[test]
+fn detached_sink_reads_export_configuration_from_inherited_fd4() {
+    let _process_guard = process_test_guard();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "hum-cli-fd4-export-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let mut cleanup = Cleanup {
+        root: root.clone(),
+        process_groups: Vec::new(),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/events", listener.local_addr().unwrap());
+    let (body_sender, body_receiver) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= Duration::from_secs(3) {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break None,
+            }
+        };
+        let Some(mut stream) = stream.take() else {
+            body_sender.send(None).unwrap();
+            return;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut content_length = 0;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).is_err() || header.is_empty() {
+                body_sender.send(None).unwrap();
+                return;
+            }
+            if header == "\r\n" {
+                break;
+            }
+            if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut body = vec![0; content_length];
+        if reader.read_exact(&mut body).is_err() {
+            body_sender.send(None).unwrap();
+            return;
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        body_sender.send(Some(body)).unwrap();
+    });
+    let config = root.join("hum.yaml");
+    let state = root.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"version: 2
+project: e2e
+logs:
+  redact_patterns: ["token=[^ ]+"]
+  exporters:
+    - type: http
+      endpoint: {endpoint}
+      timeout: 750ms
+services:
+  worker:
+    command: "echo token=secret fd4-export-ok; sleep 300"
+templates:
+  all:
+    services: [worker]
+"#
+        ),
+    )
+    .unwrap();
+
+    let started = hum_command(&config, &state, &["start"]).output().unwrap();
+    assert_success(&started);
+    let entry_path = state.join("hum/e2e/runtime/worker.json");
+    let entry = read_entry(&entry_path);
+    cleanup
+        .process_groups
+        .push(entry["pgid"].as_i64().unwrap() as i32);
+    let body = body_receiver
+        .recv_timeout(Duration::from_secs(4))
+        .unwrap()
+        .expect("real sink did not send an exported event");
+    let event = body
+        .split(|byte| *byte == b'\n')
+        .find(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+        .unwrap();
+    assert_eq!(event["message"], "[REDACTED] fd4-export-ok");
+    assert_eq!(event["service"]["name"], "worker");
+    assert_eq!(event["hum"]["project"], "e2e");
+    assert!(!String::from_utf8_lossy(&body).contains("token=secret"));
+
+    let stopped = hum_command(&config, &state, &["stop", "--timeout", "1s"])
+        .output()
+        .unwrap();
+    assert_success(&stopped);
+    server.join().unwrap();
 }
 
 #[test]

@@ -291,6 +291,7 @@ fn validate_partial_schema(
         "max_line_bytes",
         "retention",
         "redact_patterns",
+        "exporters",
     ];
 
     let root = mapping(value, file)?;
@@ -532,6 +533,34 @@ templates:
 
         let loaded = load(Some(&base)).unwrap();
         assert_eq!(loaded.config.tasks["login"].env["AWS_PROFILE"], "developer");
+
+        fs::remove_file(base).unwrap();
+        fs::remove_file(local).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn local_log_exporter_override_is_supported() {
+        let root =
+            std::env::temp_dir().join(format!("hum-local-log-exporter-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let local = root.join(LOCAL_CONFIG_FILE);
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+        fs::write(
+            &local,
+            "version: 3\nlogs:\n  exporters:\n    - type: http\n      endpoint: http://127.0.0.1:8687/events\n      headers:\n        Authorization: Basic-local-token\n",
+        )
+        .unwrap();
+
+        let loaded = load(Some(&base)).unwrap();
+        let crate::config::LogExporterConfig::Http { headers, .. } =
+            &loaded.config.logs.exporters[0];
+        assert_eq!(headers["Authorization"], "Basic-local-token");
 
         fs::remove_file(base).unwrap();
         fs::remove_file(local).unwrap();

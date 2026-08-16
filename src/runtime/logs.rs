@@ -3,17 +3,54 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-use crate::config::LogConfig;
+use crate::config::{LogConfig, LogExporterConfig};
 
 pub const INTERNAL_SINK_ARG: &str = "__log-sink";
+#[cfg(unix)]
+pub(crate) const INTERNAL_SINK_STDERR_FD: libc::c_int = 3;
+#[cfg(unix)]
+pub(crate) const INTERNAL_SINK_EXPORT_FD: libc::c_int = 4;
+#[cfg(unix)]
+pub(crate) const INTERNAL_SINK_EXPORT_READY: u8 = 0xA5;
+#[cfg(unix)]
+pub(crate) const INTERNAL_SINK_READY_FD: libc::c_int = 5;
 const FOLLOW_READ_CHUNK: usize = 64 * 1024;
 const TAIL_READ_CHUNK: usize = 64 * 1024;
 const MAX_TAIL_BYTES: usize = 512 * 1024;
 const BOUNDARY_MARKER_BYTES: u64 = 17;
+const EXPORT_TOTAL_QUEUE_EVENTS: usize = 256;
+const EXPORT_TOTAL_BATCH_EVENTS: usize = 64;
+const EXPORT_CANCEL_GRACE: Duration = Duration::from_millis(50);
+const EXPORT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_EXPORT_EVENT_BYTES: usize = 60 * 1024;
+const MAX_EXPORT_PAYLOAD_BYTES: usize = 19 * 1024 * 1024;
+// Aggregate payload memory is bounded by 256 queued events plus 64 events in
+// in-flight batches: (256 + 64) * 60 KiB = 18.75 MiB. Arc queue entries and
+// fixed HTTP/runtime allocations are additional bounded overhead.
+const _: () = assert!(
+    (EXPORT_TOTAL_QUEUE_EVENTS + EXPORT_TOTAL_BATCH_EVENTS) * MAX_EXPORT_EVENT_BYTES
+        <= MAX_EXPORT_PAYLOAD_BYTES
+);
+pub(crate) const MAX_EXPORT_SPEC_BYTES: usize = 1024 * 1024;
+const INVALID_EXPORT_CONFIG_DIAGNOSTIC: &[u8] =
+    b"[hum] log export disabled: missing or invalid inherited configuration\n";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogExportSpec {
+    pub project: String,
+    pub service: String,
+    pub max_line_bytes: usize,
+    pub redact_patterns: Vec<String>,
+    pub exporters: Vec<LogExporterConfig>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct LogPolicy {
@@ -63,7 +100,6 @@ impl Redactor {
     }
 }
 
-#[cfg(not(test))]
 pub fn internal_sink_args(
     stdout_path: &Path,
     stderr_path: &Path,
@@ -85,19 +121,21 @@ pub fn internal_sink_args(
 }
 
 /// Handle the private log-sink process before Clap and Tokio are initialized.
-pub fn try_run_internal_sink(args: &[OsString]) -> Option<i32> {
+pub fn exit_if_internal_sink(args: &[OsString]) {
     if args.get(1).and_then(|arg| arg.to_str()) != Some(INTERNAL_SINK_ARG) {
-        return None;
+        return;
     }
-    Some(
-        match parse_internal_sink_args(args).and_then(run_internal_sink) {
-            Ok(()) => 0,
-            Err(error) => {
-                eprintln!("hum internal log sink failed: {error:#}");
-                1
-            }
-        },
-    )
+    let code = match parse_internal_sink_args(args).and_then(run_internal_sink) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("hum internal log sink failed: {error:#}");
+            1
+        }
+    };
+    // Cooperative exporter shutdown has a fixed deadline. Process exit is the
+    // hard boundary that reaps a worker if an OS HTTP primitive ignores
+    // cancellation after persistent stdout/stderr have already been drained.
+    std::process::exit(code);
 }
 
 fn parse_internal_sink_args(args: &[OsString]) -> Result<(PathBuf, PathBuf, LogPolicy)> {
@@ -133,17 +171,110 @@ fn parse_internal_sink_args(args: &[OsString]) -> Result<(PathBuf, PathBuf, LogP
     ))
 }
 
+fn read_export_spec(reader: impl Read) -> Result<LogExportSpec> {
+    let mut serialized = Vec::new();
+    reader
+        .take((MAX_EXPORT_SPEC_BYTES + 1) as u64)
+        .read_to_end(&mut serialized)
+        .context("read log export configuration")?;
+    if serialized.len() > MAX_EXPORT_SPEC_BYTES {
+        anyhow::bail!("log export configuration exceeds safety limit");
+    }
+    serde_json::from_slice(&serialized).context("invalid serialized log export configuration")
+}
+
+#[cfg(unix)]
+fn validate_inherited_export_socket(fd: std::os::fd::RawFd) -> Result<()> {
+    let mut socket_type: libc::c_int = 0;
+    let mut socket_type_len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    let type_result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(socket_type).cast(),
+            &mut socket_type_len,
+        )
+    };
+    if type_result < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inherited log export descriptor is not a socket");
+    }
+    if socket_type != libc::SOCK_STREAM {
+        anyhow::bail!("inherited log export descriptor is not a stream socket");
+    }
+
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut address_len = std::mem::size_of_val(&address) as libc::socklen_t;
+    let address_result =
+        unsafe { libc::getsockname(fd, std::ptr::addr_of_mut!(address).cast(), &mut address_len) };
+    if address_result < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect inherited log export socket");
+    }
+    if libc::c_int::from(address.ss_family) != libc::AF_UNIX {
+        anyhow::bail!("inherited log export descriptor is not a Unix socket");
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn run_internal_sink(
     (stdout_path, stderr_path, policy): (PathBuf, PathBuf, LogPolicy),
 ) -> Result<()> {
     use std::os::fd::FromRawFd;
 
-    // SAFETY: this private process is started with stream pipes on fd 0 and 3,
-    // and takes sole ownership of both descriptors.
+    // SAFETY: this private process is started with stream pipes on fd 0 and 3
+    // plus bounded anonymous configuration and readiness sockets on centralized
+    // descriptors, and takes sole ownership of all four descriptors. Unit tests exercise the sink through
+    // spawn_test_sink and never enter this private CLI path.
     let mut stdout = unsafe { File::from_raw_fd(0) };
-    let mut stderr = unsafe { File::from_raw_fd(3) };
-    pump_streams(&mut stdout, &mut stderr, stdout_path, stderr_path, policy)
+    let mut stderr = unsafe { File::from_raw_fd(INTERNAL_SINK_STDERR_FD) };
+    let export_result = match validate_inherited_export_socket(INTERNAL_SINK_EXPORT_FD) {
+        Ok(()) => {
+            let mut export_channel =
+                unsafe { std::os::unix::net::UnixStream::from_raw_fd(INTERNAL_SINK_EXPORT_FD) };
+            read_export_spec(&mut export_channel)
+        }
+        Err(error) => Err(error),
+    };
+    let (export, startup_diagnostic) = export_spec_or_disabled(export_result);
+    validate_inherited_export_socket(INTERNAL_SINK_READY_FD)
+        .context("invalid inherited log sink readiness descriptor")?;
+    let mut ready_channel =
+        unsafe { std::os::unix::net::UnixStream::from_raw_fd(INTERNAL_SINK_READY_FD) };
+    ready_channel
+        .write_all(&[INTERNAL_SINK_EXPORT_READY])
+        .context("acknowledge log sink readiness")?;
+    drop(ready_channel);
+    pump_streams(
+        &mut stdout,
+        &mut stderr,
+        stdout_path,
+        stderr_path,
+        policy,
+        export,
+        startup_diagnostic,
+    )
+}
+
+fn export_spec_or_disabled(
+    result: Result<LogExportSpec>,
+) -> (LogExportSpec, Option<&'static [u8]>) {
+    match result {
+        Ok(export) => (export, None),
+        Err(_) => (
+            LogExportSpec {
+                project: String::new(),
+                service: String::new(),
+                // Exporters are empty, so this field is intentionally inert.
+                max_line_bytes: usize::MAX,
+                redact_patterns: Vec::new(),
+                exporters: Vec::new(),
+            },
+            Some(INVALID_EXPORT_CONFIG_DIAGNOSTIC),
+        ),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -153,13 +284,22 @@ pub fn spawn_test_sink(
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     policy: LogPolicy,
+    export: LogExportSpec,
 ) -> std::thread::JoinHandle<()> {
     use std::os::fd::OwnedFd;
 
     std::thread::spawn(move || {
         let mut stdout = File::from(OwnedFd::from(stdout));
         let mut stderr = File::from(OwnedFd::from(stderr));
-        let _ = pump_streams(&mut stdout, &mut stderr, stdout_path, stderr_path, policy);
+        let _ = pump_streams(
+            &mut stdout,
+            &mut stderr,
+            stdout_path,
+            stderr_path,
+            policy,
+            export,
+            None,
+        );
     })
 }
 
@@ -170,14 +310,49 @@ fn pump_streams(
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     policy: LogPolicy,
+    export: LogExportSpec,
+    startup_diagnostic: Option<&[u8]>,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
 
     let mut stdout_writer = RotatingWriter::new(stdout_path, policy).ok();
     let mut stderr_writer = RotatingWriter::new(stderr_path, policy).ok();
+    if let (Some(diagnostic), Some(writer)) = (startup_diagnostic, &mut stderr_writer) {
+        if writer.write_bounded(diagnostic).is_err() {
+            stderr_writer = None;
+        }
+    }
+    // Configuration validation rejects invalid expressions before startup.
+    // Keep the sink fail-safe as well: an invalid internal spec disables only
+    // optional export, never persistent log capture and stream draining.
+    let (fanout, redactor) = match Redactor::new(&export.redact_patterns) {
+        Ok(redactor) => (ExportFanout::new(&export.exporters), redactor),
+        Err(_) => {
+            if let Some(writer) = &mut stderr_writer {
+                if writer
+                    .write_bounded(
+                        b"[hum] log export disabled: invalid internal redaction configuration\n",
+                    )
+                    .is_err()
+                {
+                    stderr_writer = None;
+                }
+            }
+            (
+                ExportFanout::new(&[]),
+                Redactor {
+                    patterns: Vec::new(),
+                },
+            )
+        }
+    };
+    let mut stdout_exporter = StreamExporter::new("stdout", &export, redactor.clone(), &fanout);
+    let mut stderr_exporter = StreamExporter::new("stderr", &export, redactor, &fanout);
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut buffer = vec![0_u8; FOLLOW_READ_CHUNK];
+    let mut diagnostic_reporter = ExportDiagnosticReporter::new();
+    diagnostic_reporter.report(&fanout, &mut stderr_writer, false);
 
     while stdout_open || stderr_open {
         let mut descriptors = [
@@ -201,12 +376,29 @@ fn pump_streams(
             return Err(error.into());
         }
         if stdout_open && descriptors[0].revents != 0 {
-            stdout_open = drain_once(stdout, &mut stdout_writer, &mut buffer)?;
+            stdout_open = drain_once(
+                stdout,
+                &mut stdout_writer,
+                &mut stdout_exporter,
+                &mut buffer,
+            )?;
         }
         if stderr_open && descriptors[1].revents != 0 {
-            stderr_open = drain_once(stderr, &mut stderr_writer, &mut buffer)?;
+            stderr_open = drain_once(
+                stderr,
+                &mut stderr_writer,
+                &mut stderr_exporter,
+                &mut buffer,
+            )?;
         }
+        diagnostic_reporter.report(&fanout, &mut stderr_writer, false);
     }
+    stdout_exporter.finish();
+    stderr_exporter.finish();
+    drop(stdout_exporter);
+    drop(stderr_exporter);
+    diagnostic_reporter.report(&fanout, &mut stderr_writer, true);
+    fanout.shutdown();
     Ok(())
 }
 
@@ -218,6 +410,7 @@ fn run_internal_sink(_: (PathBuf, PathBuf, LogPolicy)) -> Result<()> {
 fn drain_once(
     reader: &mut File,
     writer: &mut Option<RotatingWriter>,
+    exporter: &mut StreamExporter<'_>,
     buffer: &mut [u8],
 ) -> Result<bool> {
     match reader.read(buffer) {
@@ -230,10 +423,543 @@ fn drain_once(
                     *writer = None;
                 }
             }
+            exporter.push(&buffer[..count]);
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(true),
         Err(error) => Err(error.into()),
+    }
+}
+
+struct ExportFanout {
+    workers: Vec<ExporterWorker>,
+    completed: Receiver<()>,
+    shutdown_wait: Duration,
+    oversized_events: AtomicU64,
+    initialization_failures: std::sync::Mutex<Vec<usize>>,
+}
+
+struct ExporterWorker {
+    index: usize,
+    sender: SyncSender<Arc<[u8]>>,
+    cancel: tokio::sync::watch::Sender<bool>,
+    health: Arc<ExporterHealth>,
+    dropped: AtomicU64,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct ExporterHealth {
+    failed: AtomicBool,
+    failure_pending: AtomicBool,
+    delivery_failures: AtomicU64,
+}
+
+impl ExporterHealth {
+    fn record_failure(&self) {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            self.failure_pending.store(true, Ordering::Release);
+        }
+    }
+
+    fn take_pending_failure(&self) -> bool {
+        self.failure_pending.swap(false, Ordering::AcqRel)
+    }
+
+    fn record_delivery_failure(&self) {
+        self.delivery_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn take_delivery_failures(&self) -> u64 {
+        self.delivery_failures.swap(0, Ordering::Relaxed)
+    }
+}
+
+impl ExportFanout {
+    fn new(exporters: &[LogExporterConfig]) -> Self {
+        let mut shutdown_wait = Duration::ZERO;
+        let (completion_sender, completed) = std::sync::mpsc::channel();
+        let mut initialization_failures = Vec::new();
+        let mut prepared_exporters = Vec::new();
+        for (index, exporter) in exporters.iter().enumerate() {
+            match exporter {
+                LogExporterConfig::Http {
+                    endpoint,
+                    timeout,
+                    headers,
+                } => match prepare_http_exporter(endpoint.clone(), *timeout, headers.clone()) {
+                    Ok(prepared) => {
+                        shutdown_wait = shutdown_wait
+                            .max(timeout.saturating_mul(2).min(Duration::from_secs(2)));
+                        prepared_exporters.push((index, prepared));
+                    }
+                    Err(_) => {
+                        initialization_failures.push(index);
+                    }
+                },
+            }
+        }
+        let worker_count = prepared_exporters.len().max(1);
+        let (queue_capacity, batch_events) = export_worker_budgets(worker_count);
+        let workers = prepared_exporters
+            .into_iter()
+            .map(|(index, prepared)| {
+                spawn_http_exporter(
+                    index,
+                    prepared,
+                    queue_capacity,
+                    batch_events,
+                    completion_sender.clone(),
+                )
+            })
+            .collect();
+        drop(completion_sender);
+        Self {
+            workers,
+            completed,
+            shutdown_wait,
+            oversized_events: AtomicU64::new(0),
+            initialization_failures: std::sync::Mutex::new(initialization_failures),
+        }
+    }
+
+    fn send(&self, mut event: Vec<u8>) {
+        event.push(b'\n');
+        let event: Arc<[u8]> = event.into();
+        for worker in &self.workers {
+            if worker.health.failed.load(Ordering::Acquire) {
+                continue;
+            }
+            // Export is deliberately lossy: a slow or unavailable observer
+            // must never backpressure a service's stdout/stderr pipes.
+            match worker.sender.try_send(Arc::clone(&event)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    worker.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    if !worker.health.failed.load(Ordering::Acquire) {
+                        worker.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    fn take_dropped_by_worker(&self) -> Vec<(usize, u64)> {
+        self.workers
+            .iter()
+            .filter_map(|worker| {
+                let dropped = worker.dropped.swap(0, Ordering::Relaxed);
+                (dropped > 0).then_some((worker.index, dropped))
+            })
+            .collect()
+    }
+
+    fn record_oversized_event(&self) {
+        self.oversized_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn take_oversized_events(&self) -> u64 {
+        self.oversized_events.swap(0, Ordering::Relaxed)
+    }
+
+    fn take_initialization_failures(&self) -> Vec<usize> {
+        let mut failures = self
+            .initialization_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *failures)
+    }
+
+    fn take_worker_failures(&self) -> Vec<usize> {
+        self.workers
+            .iter()
+            .filter_map(|worker| worker.health.take_pending_failure().then_some(worker.index))
+            .collect()
+    }
+
+    fn take_delivery_failures(&self) -> Vec<(usize, u64)> {
+        self.workers
+            .iter()
+            .filter_map(|worker| {
+                let failures = worker.health.take_delivery_failures();
+                (failures > 0).then_some((worker.index, failures))
+            })
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    fn shutdown(self) {
+        let mut workers = self.workers;
+        let worker_count = workers.len();
+        let cancellations = workers
+            .iter()
+            .map(|worker| worker.cancel.clone())
+            .collect::<Vec<_>>();
+        let handles = workers
+            .iter_mut()
+            .filter_map(|worker| worker.handle.take())
+            .collect::<Vec<_>>();
+        drop(workers);
+        // All workers share one wall-clock deadline, so the loop cannot turn
+        // the grace period into a per-exporter wait.
+        let deadline = Instant::now() + self.shutdown_wait;
+        // When the entire shutdown budget is no larger than the cancellation
+        // reserve, intentionally skip natural draining and cancel immediately;
+        // the same single wall-clock deadline still bounds all workers.
+        let drain_deadline = deadline
+            .checked_sub(EXPORT_CANCEL_GRACE.min(self.shutdown_wait))
+            .unwrap_or(deadline);
+        let mut completed = 0;
+        while completed < worker_count {
+            let Some(remaining) = drain_deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if self.completed.recv_timeout(remaining).is_err() {
+                break;
+            }
+            completed += 1;
+        }
+        if completed < worker_count {
+            for cancel in cancellations {
+                let _ = cancel.send(true);
+            }
+        }
+        while completed < worker_count {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if self.completed.recv_timeout(remaining).is_err() {
+                break;
+            }
+            completed += 1;
+        }
+        if completed == worker_count {
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
+        // If a platform HTTP primitive ignores cooperative cancellation, any
+        // unfinished handles detach here rather than extending the deadline.
+        // This code runs only in the private sink process; main exits that
+        // process immediately after pump_streams returns and reaps all threads.
+    }
+}
+
+struct ExportDiagnosticReporter {
+    next_report: Instant,
+}
+
+impl ExportDiagnosticReporter {
+    fn new() -> Self {
+        Self {
+            next_report: Instant::now(),
+        }
+    }
+
+    fn report(&mut self, fanout: &ExportFanout, writer: &mut Option<RotatingWriter>, force: bool) {
+        let now = Instant::now();
+        if !force && now < self.next_report {
+            return;
+        }
+        self.next_report = now + EXPORT_DIAGNOSTIC_INTERVAL;
+
+        // Once persistent stderr is unavailable it is disabled for the rest of
+        // this sink's lifetime, so retaining counters could never make them
+        // observable and would only allow unbounded counter growth.
+        let initialization_failures = fanout.take_initialization_failures();
+        let worker_failures = fanout.take_worker_failures();
+        let delivery_failures = fanout.take_delivery_failures();
+        let oversized_events = fanout.take_oversized_events();
+        let dropped_by_worker = fanout.take_dropped_by_worker();
+        if initialization_failures.is_empty()
+            && worker_failures.is_empty()
+            && delivery_failures.is_empty()
+            && oversized_events == 0
+            && dropped_by_worker.is_empty()
+        {
+            return;
+        }
+        let mut diagnostic = String::new();
+        for worker_index in initialization_failures {
+            diagnostic.push_str(&format!(
+                "[hum] log exporter worker {} disabled: invalid internal worker configuration\n",
+                worker_index + 1
+            ));
+        }
+        for worker_index in worker_failures {
+            diagnostic.push_str(&format!(
+                "[hum] log exporter worker {} disabled: worker terminated unexpectedly\n",
+                worker_index + 1
+            ));
+        }
+        for (worker_index, failures) in delivery_failures {
+            diagnostic.push_str(&format!(
+                "[hum] log exporter worker {} failed {failures} HTTP batch(es): delivery was not retried\n",
+                worker_index + 1
+            ));
+        }
+        if oversized_events > 0 {
+            diagnostic.push_str(&format!(
+                "[hum] log exporter rejected {oversized_events} event(s): serialized metadata exceeded the safety limit\n"
+            ));
+        }
+        for (worker_index, dropped) in dropped_by_worker {
+            diagnostic.push_str(&format!(
+                "[hum] log exporter worker {} dropped {dropped} event(s): observer queue unavailable or full\n",
+                worker_index + 1
+            ));
+        }
+        if let Some(active) = writer {
+            if active.write_bounded(diagnostic.as_bytes()).is_err() {
+                *writer = None;
+            }
+        }
+    }
+}
+
+fn divided_export_budget(total: usize, workers: usize) -> usize {
+    (total / workers.max(1)).max(1)
+}
+
+fn export_worker_budgets(successful_workers: usize) -> (usize, usize) {
+    (
+        divided_export_budget(EXPORT_TOTAL_QUEUE_EVENTS, successful_workers),
+        divided_export_budget(EXPORT_TOTAL_BATCH_EVENTS, successful_workers),
+    )
+}
+
+struct PreparedHttpExporter {
+    endpoint: String,
+    runtime: tokio::runtime::Runtime,
+    client: reqwest::Client,
+    request_headers: reqwest::header::HeaderMap,
+}
+
+fn prepare_http_exporter(
+    endpoint: String,
+    timeout: Duration,
+    headers: std::collections::HashMap<String, String>,
+) -> Result<PreparedHttpExporter> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize HTTP log exporter runtime")?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to initialize HTTP log exporter client")?;
+    let mut request_headers = reqwest::header::HeaderMap::new();
+    let mut headers = headers.into_iter().collect::<Vec<_>>();
+    headers.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, value) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .context("invalid internal HTTP log exporter header name")?;
+        let value = reqwest::header::HeaderValue::from_str(&value)
+            .context("invalid internal HTTP log exporter header value")?;
+        request_headers.insert(name, value);
+    }
+    Ok(PreparedHttpExporter {
+        endpoint,
+        runtime,
+        client,
+        request_headers,
+    })
+}
+
+fn spawn_http_exporter(
+    index: usize,
+    prepared: PreparedHttpExporter,
+    queue_capacity: usize,
+    batch_events: usize,
+    done_sender: std::sync::mpsc::Sender<()>,
+) -> ExporterWorker {
+    let PreparedHttpExporter {
+        endpoint,
+        runtime,
+        client,
+        request_headers,
+    } = prepared;
+    let (sender, receiver) = sync_channel::<Arc<[u8]>>(queue_capacity);
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+    let health = Arc::new(ExporterHealth::default());
+    let thread_health = Arc::clone(&health);
+    let handle = std::thread::spawn(move || {
+        struct NotifyOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let _completion = NotifyOnDrop(Some(done_sender));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            while let Ok(first) = receiver.recv() {
+                let body = build_export_batch(first, &receiver, batch_events);
+                let delivery = runtime.block_on(async {
+                    tokio::select! {
+                        _ = cancelled.changed() => None,
+                        result = async {
+                            client
+                                .post(&endpoint)
+                                .headers(request_headers.clone())
+                                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+                            .body(body)
+                            .send()
+                            .await?
+                            .error_for_status()?;
+                            Ok::<(), reqwest::Error>(())
+                        } => Some(result),
+                    }
+                });
+                let Some(delivery) = delivery else {
+                    break;
+                };
+                if delivery.is_err() {
+                    thread_health.record_delivery_failure();
+                    // Delivery is intentionally best-effort. A failed batch is
+                    // dropped rather than requeued; subsequent batches provide a
+                    // bounded opportunity to observe endpoint recovery.
+                    let cancelled_during_backoff = runtime.block_on(async {
+                        tokio::select! {
+                            _ = cancelled.changed() => true,
+                            _ = tokio::time::sleep(Duration::from_millis(250)) => false,
+                        }
+                    });
+                    if cancelled_during_backoff {
+                        break;
+                    }
+                }
+            }
+        }));
+        if result.is_err() {
+            thread_health.record_failure();
+        }
+    });
+    ExporterWorker {
+        index,
+        sender,
+        cancel,
+        health,
+        dropped: AtomicU64::new(0),
+        handle: Some(handle),
+    }
+}
+
+fn build_export_batch(
+    first: Arc<[u8]>,
+    receiver: &Receiver<Arc<[u8]>>,
+    batch_events: usize,
+) -> Vec<u8> {
+    let mut body = Vec::from(first.as_ref());
+    for _ in 1..batch_events {
+        let Ok(next) = receiver.try_recv() else {
+            break;
+        };
+        body.extend_from_slice(&next);
+    }
+    body
+}
+
+struct StreamExporter<'a> {
+    stream: &'static str,
+    project: &'a str,
+    service: &'a str,
+    max_line_bytes: usize,
+    redactor: Redactor,
+    fanout: &'a ExportFanout,
+    line: Vec<u8>,
+    oversized: bool,
+}
+
+impl<'a> StreamExporter<'a> {
+    fn new(
+        stream: &'static str,
+        export: &'a LogExportSpec,
+        redactor: Redactor,
+        fanout: &'a ExportFanout,
+    ) -> Self {
+        Self {
+            stream,
+            project: &export.project,
+            service: &export.service,
+            max_line_bytes: export.max_line_bytes,
+            redactor,
+            fanout,
+            line: Vec::new(),
+            oversized: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.fanout.is_empty() {
+            return;
+        }
+        for byte in bytes {
+            if *byte == b'\n' {
+                self.emit();
+                continue;
+            }
+            if self.oversized {
+                continue;
+            }
+            if self.line.len() >= self.max_line_bytes {
+                self.line.clear();
+                self.oversized = true;
+            } else {
+                self.line.push(*byte);
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.fanout.is_empty() {
+            return;
+        }
+        if self.oversized || !self.line.is_empty() {
+            self.emit();
+        }
+    }
+
+    fn emit(&mut self) {
+        let message = if self.oversized {
+            "… [oversized log line omitted]".to_string()
+        } else {
+            if self.line.last() == Some(&b'\r') {
+                self.line.pop();
+            }
+            self.redactor.redact(&String::from_utf8_lossy(&self.line))
+        };
+        self.line.clear();
+        self.oversized = false;
+        let mut event = serde_json::json!({
+            "@timestamp": chrono::Utc::now().to_rfc3339(),
+            "message": message,
+            "stream": self.stream,
+            "service": { "name": self.service },
+            "hum": {
+                "project": self.project,
+                "runtime": "process"
+            }
+        });
+        let mut serialized = serde_json::to_vec(&event).ok();
+        if serialized
+            .as_ref()
+            .is_some_and(|event| event.len() > MAX_EXPORT_EVENT_BYTES)
+        {
+            event["message"] =
+                serde_json::Value::String("… [log event exceeded export safety limit]".to_string());
+            serialized = serde_json::to_vec(&event).ok();
+        }
+        match serialized.filter(|event| event.len() <= MAX_EXPORT_EVENT_BYTES) {
+            Some(serialized) => self.fanout.send(serialized),
+            None => self.fanout.record_oversized_event(),
+        }
     }
 }
 
@@ -1211,6 +1937,9 @@ fn verified_rotation_successors(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::sync::mpsc::RecvTimeoutError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1232,6 +1961,629 @@ mod tests {
             rotated_files,
             retention: None,
         }
+    }
+
+    fn export_spec(max_line_bytes: usize) -> LogExportSpec {
+        LogExportSpec {
+            project: "demo".to_string(),
+            service: "api".to_string(),
+            max_line_bytes,
+            redact_patterns: vec!["token=[^ ]+".to_string()],
+            exporters: Vec::new(),
+        }
+    }
+
+    fn capturing_fanout(capacity: usize) -> (ExportFanout, Receiver<Arc<[u8]>>) {
+        let (sender, receiver) = sync_channel(capacity);
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let (completion, completed) = std::sync::mpsc::channel();
+        drop(completion);
+        (
+            ExportFanout {
+                workers: vec![ExporterWorker {
+                    index: 0,
+                    sender,
+                    cancel,
+                    health: Arc::new(ExporterHealth::default()),
+                    dropped: AtomicU64::new(0),
+                    handle: None,
+                }],
+                completed,
+                shutdown_wait: Duration::ZERO,
+                oversized_events: AtomicU64::new(0),
+                initialization_failures: std::sync::Mutex::new(Vec::new()),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn internal_sink_arguments_do_not_expose_export_configuration() {
+        let sink_args = internal_sink_args(
+            Path::new("stdout.log"),
+            Path::new("stderr.log"),
+            policy(64, 2),
+        );
+        let rendered = sink_args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let args = std::iter::once(OsString::from("hum"))
+            .chain(sink_args)
+            .collect::<Vec<_>>();
+        let (stdout, stderr, parsed_policy) = parse_internal_sink_args(&args).unwrap();
+
+        assert_eq!(stdout, Path::new("stdout.log"));
+        assert_eq!(stderr, Path::new("stderr.log"));
+        assert_eq!(parsed_policy.max_file_bytes, 64);
+        assert_eq!(parsed_policy.rotated_files, 2);
+        assert_eq!(parsed_policy.retention, None);
+        assert!(!rendered.contains("endpoint"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn inherited_export_configuration_is_bounded_and_round_trips() {
+        let spec = export_spec(64);
+        let encoded = serde_json::to_vec(&spec).unwrap();
+        let decoded = read_export_spec(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.project, spec.project);
+        assert_eq!(decoded.service, spec.service);
+
+        let oversized = vec![b'x'; MAX_EXPORT_SPEC_BYTES + 1];
+        assert!(read_export_spec(oversized.as_slice()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_export_descriptor_requires_a_unix_stream_socket() {
+        use std::os::fd::AsRawFd;
+
+        let (unix_stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(validate_inherited_export_socket(unix_stream.as_raw_fd()).is_ok());
+
+        let path = temp_path("not-an-export-socket");
+        let file = File::create(&path).unwrap();
+        assert!(validate_inherited_export_socket(file.as_raw_fd()).is_err());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        assert!(validate_inherited_export_socket(tcp_stream.as_raw_fd()).is_err());
+        remove_if_exists(&path).unwrap();
+    }
+
+    #[test]
+    fn invalid_inherited_export_configuration_degrades_to_disabled_export() {
+        let (spec, diagnostic) =
+            export_spec_or_disabled(Err(anyhow::anyhow!("simulated missing fd4")));
+
+        assert!(spec.exporters.is_empty());
+        assert!(spec.redact_patterns.is_empty());
+        assert_eq!(diagnostic, Some(INVALID_EXPORT_CONFIG_DIAGNOSTIC));
+    }
+
+    #[test]
+    fn truncated_inherited_export_configuration_degrades_to_disabled_export() {
+        let truncated = br#"{"project":"demo","service":"api""#;
+
+        let (spec, diagnostic) = export_spec_or_disabled(read_export_spec(&truncated[..]));
+
+        assert!(spec.exporters.is_empty());
+        assert_eq!(diagnostic, Some(INVALID_EXPORT_CONFIG_DIAGNOSTIC));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_internal_redaction_spec_does_not_disable_persistent_logs() {
+        let stdout_path = temp_path("invalid-redactor-stdout");
+        let stderr_path = temp_path("invalid-redactor-stderr");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (stdout_reader, mut stdout_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (stderr_reader, stderr_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut spec = export_spec(64);
+        spec.redact_patterns = vec!["(".to_string()];
+        spec.exporters = vec![LogExporterConfig::Http {
+            endpoint: format!("http://{}/events", listener.local_addr().unwrap()),
+            timeout: Duration::from_millis(25),
+            headers: std::collections::HashMap::new(),
+        }];
+        let sink = spawn_test_sink(
+            stdout_reader,
+            stderr_reader,
+            stdout_path.clone(),
+            stderr_path.clone(),
+            policy(1024, 0),
+            spec,
+        );
+
+        stdout_writer.write_all(b"still persisted\n").unwrap();
+        drop(stdout_writer);
+        drop(stderr_writer);
+        sink.join().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&stdout_path).unwrap(),
+            "still persisted\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&stderr_path).unwrap(),
+            "[hum] log export disabled: invalid internal redaction configuration\n"
+        );
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        remove_if_exists(&stdout_path).unwrap();
+        remove_if_exists(&stderr_path).unwrap();
+        remove_if_exists(&boundary_path(&stdout_path)).unwrap();
+        remove_if_exists(&boundary_path(&stderr_path)).unwrap();
+    }
+
+    #[test]
+    fn process_export_frames_redacts_and_labels_lines() {
+        let (fanout, receiver) = capturing_fanout(4);
+        let spec = export_spec(64);
+        let mut stream = StreamExporter::new(
+            "stderr",
+            &spec,
+            Redactor::new(&spec.redact_patterns).unwrap(),
+            &fanout,
+        );
+
+        stream.push(b"first token=private\npartial");
+        stream.finish();
+
+        let first = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
+        assert_eq!(first["message"], "first [REDACTED]");
+        assert_eq!(first["stream"], "stderr");
+        assert_eq!(first["service"]["name"], "api");
+        assert_eq!(first["hum"]["project"], "demo");
+        assert_eq!(first["hum"]["runtime"], "process");
+        assert_eq!(second["message"], "partial");
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn process_export_has_no_per_line_work_without_exporters() {
+        let fanout = ExportFanout::new(&[]);
+        let spec = export_spec(4);
+        let mut stream = StreamExporter::new(
+            "stdout",
+            &spec,
+            Redactor::new(&spec.redact_patterns).unwrap(),
+            &fanout,
+        );
+
+        stream.push(b"a noisy token=private service line\n");
+        stream.finish();
+
+        assert!(stream.line.is_empty());
+        assert!(!stream.oversized);
+    }
+
+    #[test]
+    fn process_export_bounds_oversized_lines() {
+        let (fanout, receiver) = capturing_fanout(2);
+        let spec = export_spec(4);
+        let mut stream = StreamExporter::new(
+            "stdout",
+            &spec,
+            Redactor::new(&spec.redact_patterns).unwrap(),
+            &fanout,
+        );
+
+        stream.push(b"oversized\nok\n");
+
+        let omitted: serde_json::Value = serde_json::from_slice(&receiver.recv().unwrap()).unwrap();
+        let normal: serde_json::Value = serde_json::from_slice(&receiver.recv().unwrap()).unwrap();
+        assert_eq!(omitted["message"], "… [oversized log line omitted]");
+        assert_eq!(normal["message"], "ok");
+    }
+
+    #[test]
+    fn process_export_bounds_serialized_event_size() {
+        let (fanout, receiver) = capturing_fanout(2);
+        let spec = export_spec(MAX_EXPORT_EVENT_BYTES);
+        let mut stream = StreamExporter::new(
+            "stdout",
+            &spec,
+            Redactor::new(&spec.redact_patterns).unwrap(),
+            &fanout,
+        );
+
+        stream.push(&vec![b'x'; MAX_EXPORT_EVENT_BYTES]);
+        stream.finish();
+
+        let event = receiver.recv().unwrap();
+        assert!(event.len() <= MAX_EXPORT_EVENT_BYTES + 1);
+        let event: serde_json::Value = serde_json::from_slice(&event).unwrap();
+        assert_eq!(
+            event["message"],
+            "… [log event exceeded export safety limit]"
+        );
+    }
+
+    #[test]
+    fn process_export_reports_events_with_oversized_metadata() {
+        let (fanout, receiver) = capturing_fanout(2);
+        let mut spec = export_spec(64);
+        spec.project = "x".repeat(MAX_EXPORT_EVENT_BYTES);
+        let mut stream = StreamExporter::new(
+            "stdout",
+            &spec,
+            Redactor::new(&spec.redact_patterns).unwrap(),
+            &fanout,
+        );
+
+        stream.push(b"small message\n");
+        let path = temp_path("export-oversized-metadata-diagnostic");
+        let mut writer = Some(RotatingWriter::new(path.clone(), policy(1024, 0)).unwrap());
+        ExportDiagnosticReporter::new().report(&fanout, &mut writer, true);
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[hum] log exporter rejected 1 event(s): serialized metadata exceeded the safety limit\n"
+        );
+        remove_if_exists(&path).unwrap();
+        remove_if_exists(&boundary_path(&path)).unwrap();
+    }
+
+    #[test]
+    fn http_exporter_posts_newline_delimited_json() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/events", listener.local_addr().unwrap());
+        let (body_sender, body_receiver) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0;
+            let mut authorization = None;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+                if let Some(value) = header.strip_prefix("authorization:") {
+                    authorization = Some(value.trim().to_string());
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            body_sender.send((body, authorization)).unwrap();
+        });
+
+        let fanout = ExportFanout::new(&[LogExporterConfig::Http {
+            endpoint,
+            timeout: Duration::from_secs(1),
+            headers: std::collections::HashMap::from([(
+                "authorization".to_string(),
+                "Basic local-token".to_string(),
+            )]),
+        }]);
+        fanout.send(b"{\"message\":\"hello\"}".to_vec());
+        let shutdown_started = Instant::now();
+        fanout.shutdown();
+        assert!(shutdown_started.elapsed() < Duration::from_secs(1));
+
+        let (body, authorization) = body_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(body, b"{\"message\":\"hello\"}\n");
+        assert_eq!(authorization.as_deref(), Some("Basic local-token"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_http_batch_emits_a_worker_attributed_diagnostic() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/events", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let fanout = ExportFanout::new(&[LogExporterConfig::Http {
+            endpoint,
+            timeout: Duration::from_secs(1),
+            headers: std::collections::HashMap::new(),
+        }]);
+        fanout.send(b"{\"message\":\"hello\"}".to_vec());
+        server.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while fanout.workers[0]
+            .health
+            .delivery_failures
+            .load(Ordering::Relaxed)
+            == 0
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let path = temp_path("export-delivery-diagnostic");
+        let mut writer = Some(RotatingWriter::new(path.clone(), policy(2048, 0)).unwrap());
+
+        ExportDiagnosticReporter::new().report(&fanout, &mut writer, true);
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[hum] log exporter worker 1 failed 1 HTTP batch(es): delivery was not retried\n"
+        );
+        fanout.shutdown();
+        remove_if_exists(&path).unwrap();
+        remove_if_exists(&boundary_path(&path)).unwrap();
+    }
+
+    #[test]
+    fn http_exporter_cancels_an_in_flight_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/events", listener.local_addr().unwrap());
+        let (accepted_sender, accepted_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            accepted_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let prepared = prepare_http_exporter(
+            endpoint,
+            Duration::from_secs(10),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let mut worker = spawn_http_exporter(0, prepared, 4, 4, done_sender);
+        let handle = worker.handle.take().unwrap();
+        worker.sender.send(Arc::<[u8]>::from(&b"{}\n"[..])).unwrap();
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        worker.cancel.send(true).unwrap();
+        drop(worker);
+
+        done_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
+        release_sender.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exporter_shutdown_handles_a_grace_period_below_cancellation_reserve() {
+        let fanout = ExportFanout::new(&[LogExporterConfig::Http {
+            endpoint: "http://127.0.0.1:9/events".to_string(),
+            timeout: Duration::from_millis(10),
+            headers: std::collections::HashMap::new(),
+        }]);
+        let started = Instant::now();
+
+        fanout.shutdown();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn export_batches_remain_bounded_while_a_queue_is_drained() {
+        let (sender, receiver) = sync_channel(EXPORT_TOTAL_QUEUE_EVENTS);
+        for _ in 0..=EXPORT_TOTAL_BATCH_EVENTS {
+            sender.send(Arc::<[u8]>::from(&b"{}\n"[..])).unwrap();
+        }
+        let first = receiver.recv().unwrap();
+
+        let body = build_export_batch(first, &receiver, EXPORT_TOTAL_BATCH_EVENTS);
+
+        assert_eq!(body.len(), EXPORT_TOTAL_BATCH_EVENTS * 3);
+        assert_eq!(receiver.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn queue_and_batch_budgets_are_aggregate_across_all_exporters() {
+        for workers in 1..=16 {
+            let queue = divided_export_budget(EXPORT_TOTAL_QUEUE_EVENTS, workers);
+            let batch = divided_export_budget(EXPORT_TOTAL_BATCH_EVENTS, workers);
+            assert!(queue * workers <= EXPORT_TOTAL_QUEUE_EVENTS);
+            assert!(batch * workers <= EXPORT_TOTAL_BATCH_EVENTS);
+            assert!(queue > 0);
+            assert!(batch > 0);
+        }
+    }
+
+    #[test]
+    fn aggregate_export_payload_budget_stays_below_nineteen_mebibytes() {
+        let maximum_payload =
+            (EXPORT_TOTAL_QUEUE_EVENTS + EXPORT_TOTAL_BATCH_EVENTS) * MAX_EXPORT_EVENT_BYTES;
+
+        assert_eq!(maximum_payload, 18 * 1024 * 1024 + 768 * 1024);
+        assert!(maximum_payload <= MAX_EXPORT_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn full_export_queue_emits_a_persistent_drop_diagnostic() {
+        let (fanout, _receiver) = capturing_fanout(1);
+        fanout.send(b"first".to_vec());
+        fanout.send(b"second".to_vec());
+        let path = temp_path("export-drop-diagnostic");
+        let mut writer = Some(RotatingWriter::new(path.clone(), policy(1024, 0)).unwrap());
+
+        ExportDiagnosticReporter::new().report(&fanout, &mut writer, true);
+
+        assert!(fanout.take_dropped_by_worker().is_empty());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[hum] log exporter worker 1 dropped 1 event(s): observer queue unavailable or full\n"
+        );
+        remove_if_exists(&path).unwrap();
+        remove_if_exists(&boundary_path(&path)).unwrap();
+    }
+
+    #[test]
+    fn invalid_worker_headers_emit_a_persistent_diagnostic() {
+        let fanout = ExportFanout::new(&[LogExporterConfig::Http {
+            endpoint: "http://127.0.0.1:9/events".to_string(),
+            timeout: Duration::from_millis(50),
+            headers: std::collections::HashMap::from([(
+                "invalid header name".to_string(),
+                "value".to_string(),
+            )]),
+        }]);
+        let path = temp_path("export-init-diagnostic");
+        let mut writer = Some(RotatingWriter::new(path.clone(), policy(1024, 0)).unwrap());
+
+        ExportDiagnosticReporter::new().report(&fanout, &mut writer, true);
+
+        assert!(fanout.take_initialization_failures().is_empty());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[hum] log exporter worker 1 disabled: invalid internal worker configuration\n"
+        );
+        remove_if_exists(&path).unwrap();
+        remove_if_exists(&boundary_path(&path)).unwrap();
+    }
+
+    #[test]
+    fn failed_initialization_does_not_reduce_surviving_worker_budget() {
+        let fanout = ExportFanout::new(&[
+            LogExporterConfig::Http {
+                endpoint: "http://127.0.0.1:9/invalid".to_string(),
+                timeout: Duration::from_millis(50),
+                headers: std::collections::HashMap::from([(
+                    "invalid header name".to_string(),
+                    "value".to_string(),
+                )]),
+            },
+            LogExporterConfig::Http {
+                endpoint: "http://127.0.0.1:9/valid".to_string(),
+                timeout: Duration::from_millis(50),
+                headers: std::collections::HashMap::new(),
+            },
+        ]);
+
+        assert_eq!(fanout.workers.len(), 1);
+        assert_eq!(fanout.workers[0].index, 1);
+        assert_eq!(
+            export_worker_budgets(fanout.workers.len()),
+            (EXPORT_TOTAL_QUEUE_EVENTS, EXPORT_TOTAL_BATCH_EVENTS)
+        );
+        fanout.shutdown();
+    }
+
+    #[test]
+    fn recorded_export_worker_failure_emits_one_distinct_persistent_diagnostic() {
+        let (fanout, receiver) = capturing_fanout(1);
+        fanout.workers[0].health.record_failure();
+        drop(receiver);
+        fanout.send(b"first".to_vec());
+        fanout.send(b"second".to_vec());
+        let path = temp_path("export-worker-diagnostic");
+        let mut writer = Some(RotatingWriter::new(path.clone(), policy(1024, 0)).unwrap());
+        let mut reporter = ExportDiagnosticReporter::new();
+
+        reporter.report(&fanout, &mut writer, true);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents.matches("worker terminated unexpectedly").count(),
+            1
+        );
+        assert!(!contents.contains("dropped"));
+        assert_eq!(fanout.workers[0].dropped.load(Ordering::Relaxed), 0);
+        reporter.report(&fanout, &mut writer, true);
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        remove_if_exists(&path).unwrap();
+        remove_if_exists(&boundary_path(&path)).unwrap();
+    }
+
+    #[test]
+    fn export_diagnostics_are_coalesced_until_the_interval_or_forced_flush() {
+        let (fanout, _receiver) = capturing_fanout(1);
+        fanout.send(b"first".to_vec());
+        fanout.send(b"second".to_vec());
+        let path = temp_path("export-coalesced-diagnostic");
+        let mut writer = Some(RotatingWriter::new(path.clone(), policy(2048, 0)).unwrap());
+        let mut reporter = ExportDiagnosticReporter::new();
+        reporter.report(&fanout, &mut writer, false);
+        let first = fs::read_to_string(&path).unwrap();
+
+        fanout.send(b"third".to_vec());
+        reporter.report(&fanout, &mut writer, false);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+        assert_eq!(fanout.workers[0].dropped.load(Ordering::Relaxed), 1);
+        reporter.report(&fanout, &mut writer, true);
+        assert!(fs::read_to_string(&path).unwrap().ends_with(
+            "[hum] log exporter worker 1 dropped 1 event(s): observer queue unavailable or full\n"
+        ));
+        remove_if_exists(&path).unwrap();
+        remove_if_exists(&boundary_path(&path)).unwrap();
+    }
+
+    #[test]
+    fn export_drop_diagnostics_identify_each_configuration_order_worker() {
+        let (first_sender, _first_receiver) = sync_channel(1);
+        let (second_sender, _second_receiver) = sync_channel(2);
+        let (first_cancel, _) = tokio::sync::watch::channel(false);
+        let (second_cancel, _) = tokio::sync::watch::channel(false);
+        let (completion, completed) = std::sync::mpsc::channel();
+        drop(completion);
+        let fanout = ExportFanout {
+            workers: vec![
+                ExporterWorker {
+                    index: 0,
+                    sender: first_sender,
+                    cancel: first_cancel,
+                    health: Arc::new(ExporterHealth::default()),
+                    dropped: AtomicU64::new(0),
+                    handle: None,
+                },
+                ExporterWorker {
+                    index: 1,
+                    sender: second_sender,
+                    cancel: second_cancel,
+                    health: Arc::new(ExporterHealth::default()),
+                    dropped: AtomicU64::new(0),
+                    handle: None,
+                },
+            ],
+            completed,
+            shutdown_wait: Duration::ZERO,
+            oversized_events: AtomicU64::new(0),
+            initialization_failures: std::sync::Mutex::new(Vec::new()),
+        };
+        for event in [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()] {
+            fanout.send(event);
+        }
+        let path = temp_path("export-worker-attribution");
+        let mut writer = Some(RotatingWriter::new(path.clone(), policy(2048, 0)).unwrap());
+
+        ExportDiagnosticReporter::new().report(&fanout, &mut writer, true);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("worker 1 dropped 2 event(s)"));
+        assert!(contents.contains("worker 2 dropped 1 event(s)"));
+        remove_if_exists(&path).unwrap();
+        remove_if_exists(&boundary_path(&path)).unwrap();
     }
 
     #[test]

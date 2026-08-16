@@ -44,6 +44,10 @@ pub struct LogConfig {
     pub retention: Option<Duration>,
     #[serde(default)]
     pub redact_patterns: Vec<String>,
+    /// Optional best-effort copies of process-runtime logs. Persistent Hum
+    /// logs remain authoritative and exporters never gate service execution.
+    #[serde(default)]
+    pub exporters: Vec<LogExporterConfig>,
 }
 
 impl Default for LogConfig {
@@ -54,8 +58,27 @@ impl Default for LogConfig {
             max_line_bytes: default_log_line_bytes(),
             retention: None,
             redact_patterns: Vec::new(),
+            exporters: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum LogExporterConfig {
+    Http {
+        endpoint: String,
+        #[serde(default = "default_log_export_timeout", with = "humantime_serde")]
+        timeout: Duration,
+        /// Static request headers. Values commonly contain machine-local
+        /// credentials, so callers should keep them in untracked overrides.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+}
+
+fn default_log_export_timeout() -> Duration {
+    Duration::from_millis(750)
 }
 
 fn default_log_file_bytes() -> u64 {

@@ -623,6 +623,13 @@ impl DetachedRuntime {
                 stdout_path: &stdout_log,
                 stderr_path: &stderr_log,
                 log_policy: super::logs::LogPolicy::from(&self.config.logs),
+                log_export: super::logs::LogExportSpec {
+                    project: self.project.clone(),
+                    service: name.to_string(),
+                    max_line_bytes: self.config.logs.max_line_bytes,
+                    redact_patterns: self.config.logs.redact_patterns.clone(),
+                    exporters: self.config.logs.exporters.clone(),
+                },
             },
         )?;
         let start_time = match process_start_time(process.pid) {

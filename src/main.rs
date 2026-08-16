@@ -9,9 +9,7 @@ use clap::Parser;
 
 fn main() {
     let args = std::env::args_os().collect::<Vec<_>>();
-    if let Some(code) = runtime::logs::try_run_internal_sink(&args) {
-        std::process::exit(code);
-    }
+    runtime::logs::exit_if_internal_sink(&args);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

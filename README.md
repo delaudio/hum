@@ -179,7 +179,13 @@ Each detached service streams stdout and stderr to a small native sink that
 rotates by byte count and exits automatically when both streams close. Defaults
 are 10 MiB per file, three rotated files, and 64 KiB per displayed line/chunk;
 all are configurable under `logs`. Raw files stay faithful to process output,
-while configured regular expressions are masked in CLI/TUI views. See
+while configured regular expressions are masked in CLI/TUI views. Optional
+HTTP exporters receive a redacted, line-framed NDJSON copy with project,
+service, runtime, stream, and timestamp metadata. Export queues are bounded and
+best-effort: an unavailable observer never blocks or stops the service. Static
+request headers are supported for generic collector authentication; credential
+values belong in an untracked, owner-readable `hum.local.yaml`. Compose
+runtimes retain their native logging and can be collected independently. See
 [`docs/LOGGING.md`](docs/LOGGING.md) for retention, disk bounds, search, and
 failure behavior.
 

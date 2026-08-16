@@ -18,6 +18,11 @@ logs:
   retention: 7d
   redact_patterns:
     - "(?i)(token|password)=[^ ]+"
+  exporters:
+    - type: http
+      endpoint: http://127.0.0.1:8687/events
+      timeout: 750ms
+      headers: {} # Put credential-bearing values in untracked hum.local.yaml.
 
 repositories:
   applications:
