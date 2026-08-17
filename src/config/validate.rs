@@ -556,6 +556,8 @@ fn validate_v3_contract(config: &Config, file: &Path) -> Result<(), ConfigError>
         }
     }
 
+    validate_environment_providers(config, file)?;
+
     let mut compose_targets = HashSet::new();
     for (name, service) in &config.services {
         let runtime_name = service.runtime.as_deref().ok_or_else(|| {
@@ -715,13 +717,15 @@ fn validate_environment_sources(
                     "define the provider under `environment_providers`, or fix the reference",
                 )
             })?;
-        if source.reference.trim().is_empty() {
-            return Err(ConfigError::validation(
-                file,
-                format!("{field}.{index}.reference"),
-                "environment source reference cannot be empty",
-                "set the provider-specific item reference",
-            ));
+        if let Some(reference) = &source.reference {
+            if reference.trim().is_empty() {
+                return Err(ConfigError::validation(
+                    file,
+                    format!("{field}.{index}.reference"),
+                    "environment source reference cannot be empty",
+                    "set the provider-specific item reference, or omit the field",
+                ));
+            }
         }
         for (path_field, path) in [("schema", &source.schema), ("cache", &source.cache)] {
             if let Some(path) = path {
@@ -741,7 +745,10 @@ fn validate_environment_sources(
         }
         match provider {
             EnvironmentProviderConfig::OnePassword { .. }
-                if !source.reference.starts_with("op://") =>
+                if !source
+                    .reference
+                    .as_deref()
+                    .is_some_and(|reference| reference.starts_with("op://")) =>
             {
                 return Err(ConfigError::validation(
                     file,
@@ -751,6 +758,19 @@ fn validate_environment_sources(
                 ));
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_environment_providers(config: &Config, file: &Path) -> Result<(), ConfigError> {
+    for (name, provider) in &config.environment_providers {
+        if let EnvironmentProviderConfig::Exec { command } = provider {
+            validate_argv(
+                file,
+                &format!("environment_providers.{name}.command"),
+                command,
+            )?;
         }
     }
     Ok(())
@@ -1016,11 +1036,12 @@ mod tests {
                         target: Some("postgres".to_string()),
                         env_from: vec![EnvironmentSourceConfig {
                             provider: "company".to_string(),
-                            reference: "op://Development/database/environment".to_string(),
+                            reference: Some("op://Development/database/environment".to_string()),
                             format: EnvironmentSourceFormat::Dotenv,
                             optional: true,
                             schema: Some("config/database.env.example".into()),
                             cache: Some(".hum/cache/database.env".into()),
+                            args: Vec::new(),
                         }],
                         ..ServiceConfig::default()
                     },
@@ -1252,10 +1273,55 @@ mod tests {
 
         let mut config = valid_v3_config();
         config.services.get_mut("database").unwrap().env_from[0].reference =
-            "Development/database/environment".to_string();
+            Some("Development/database/environment".to_string());
         let error = validate(&config, Path::new("hum.yaml"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("must start with op://"), "{error}");
+    }
+
+    #[test]
+    fn accepts_exec_provider_and_rejects_empty_command() {
+        let mut config = valid_v3_config();
+        config.environment_providers.insert(
+            "shell".to_string(),
+            EnvironmentProviderConfig::Exec {
+                command: vec!["compri".to_string(), "env".to_string()],
+            },
+        );
+        validate(&config, Path::new("hum.yaml")).unwrap();
+
+        config.environment_providers.insert(
+            "shell".to_string(),
+            EnvironmentProviderConfig::Exec { command: vec![] },
+        );
+        let error = validate(&config, Path::new("hum.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("argv must contain a non-empty executable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exec_provider_sources_do_not_require_a_reference() {
+        let mut config = valid_v3_config();
+        config.environment_providers.insert(
+            "shell".to_string(),
+            EnvironmentProviderConfig::Exec {
+                command: vec!["compri".to_string(), "env".to_string()],
+            },
+        );
+        config.services.get_mut("database").unwrap().env_from = vec![EnvironmentSourceConfig {
+            provider: "shell".to_string(),
+            reference: None,
+            format: EnvironmentSourceFormat::Dotenv,
+            optional: true,
+            schema: Some("config/database.env.example".into()),
+            cache: Some(".hum/cache/database.env".into()),
+            args: vec!["compri-applications".to_string()],
+        }];
+        validate(&config, Path::new("hum.yaml")).unwrap();
     }
 }

@@ -184,13 +184,14 @@ pub enum RuntimeConfig {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum EnvironmentProviderConfig {
     OnePassword { account: Option<String> },
+    Exec { command: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentSourceConfig {
     pub provider: String,
-    pub reference: String,
+    pub reference: Option<String>,
     #[serde(default)]
     pub format: EnvironmentSourceFormat,
     #[serde(default)]
@@ -199,6 +200,10 @@ pub struct EnvironmentSourceConfig {
     pub schema: Option<PathBuf>,
     /// Optional owner-only plaintext cache used when the provider is offline.
     pub cache: Option<PathBuf>,
+    /// Extra argv appended after an `Exec` provider's base command, letting a
+    /// single provider be parameterized per `env_from` entry.
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]

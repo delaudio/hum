@@ -164,6 +164,7 @@ pub async fn sync_environment_sources(
         let identity = (
             source.provider.clone(),
             source.reference.clone(),
+            source.args.clone(),
             source.schema.clone(),
             source.cache.clone(),
         );
@@ -251,16 +252,30 @@ fn resolve_provider_source_outcome(
     source: &EnvironmentSourceConfig,
     project_root: &Path,
 ) -> Result<ProviderSourceOutcome> {
-    let outcome = read_provider_reference_cached(provider, &source.reference);
+    let outcome =
+        read_provider_reference_cached(provider, source.reference.as_deref(), &source.args);
     resolve_provider_source_outcome_from_read(source, project_root, outcome)
 }
 
-fn provider_cache_key(provider: &EnvironmentProviderConfig, reference: &str) -> String {
+fn provider_cache_key(
+    provider: &EnvironmentProviderConfig,
+    reference: Option<&str>,
+    args: &[String],
+) -> String {
     match provider {
         EnvironmentProviderConfig::OnePassword { account } => {
             format!(
-                "one-password\0{}\0{reference}",
-                account.as_deref().unwrap_or("")
+                "one-password\0{}\0{}",
+                account.as_deref().unwrap_or(""),
+                reference.unwrap_or("")
+            )
+        }
+        EnvironmentProviderConfig::Exec { command } => {
+            format!(
+                "exec\0{}\0{}\0{}",
+                command.join("\u{1f}"),
+                reference.unwrap_or(""),
+                args.join("\u{1f}")
             )
         }
     }
@@ -268,9 +283,10 @@ fn provider_cache_key(provider: &EnvironmentProviderConfig, reference: &str) -> 
 
 fn read_provider_reference_cached(
     provider: &EnvironmentProviderConfig,
-    reference: &str,
+    reference: Option<&str>,
+    args: &[String],
 ) -> ProviderReadOutcome {
-    let key = provider_cache_key(provider, reference);
+    let key = provider_cache_key(provider, reference, args);
     let cache = PROVIDER_READ_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
@@ -280,11 +296,16 @@ fn read_provider_reference_cached(
     }
     let outcome = match provider {
         EnvironmentProviderConfig::OnePassword { account } => {
+            let reference = reference.unwrap_or_default();
             match read_one_password_reference(reference, account.as_deref()) {
                 Ok(contents) => ProviderReadOutcome::Fetched(contents),
                 Err(_) => ProviderReadOutcome::Unavailable,
             }
         }
+        EnvironmentProviderConfig::Exec { command } => match read_exec_command(command, args) {
+            Ok(contents) => ProviderReadOutcome::Fetched(contents),
+            Err(_) => ProviderReadOutcome::Unavailable,
+        },
     };
     cache.insert(key, outcome.clone());
     outcome
@@ -335,9 +356,9 @@ fn resolve_provider_source_with<F>(
     read: F,
 ) -> Result<HashMap<String, String>>
 where
-    F: FnOnce(&EnvironmentProviderConfig, &str) -> Result<String>,
+    F: FnOnce(&EnvironmentProviderConfig, Option<&str>) -> Result<String>,
 {
-    let outcome = match read(provider, &source.reference) {
+    let outcome = match read(provider, source.reference.as_deref()) {
         Ok(contents) => ProviderReadOutcome::Fetched(contents),
         Err(_) => ProviderReadOutcome::Unavailable,
     };
@@ -392,6 +413,26 @@ fn read_one_password_reference(reference: &str, account: Option<&str>) -> Result
     }
     String::from_utf8(output.stdout)
         .map_err(|_| anyhow!("1Password returned a non-UTF-8 environment"))
+}
+
+fn read_exec_command(command: &[String], args: &[String]) -> Result<String> {
+    let (program, base_args) = command
+        .split_first()
+        .ok_or_else(|| anyhow!("exec environment provider has an empty command"))?;
+    let output = Command::new(program)
+        .args(base_args)
+        .args(args)
+        .output()
+        .map_err(|_| {
+            anyhow!("exec environment provider command is unavailable or could not be started")
+        })?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Err(anyhow!(
+            "exec environment provider command did not resolve any output"
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| anyhow!("exec environment provider returned a non-UTF-8 environment"))
 }
 
 fn parse_and_validate_provider_dotenv(
@@ -586,11 +627,12 @@ mod tests {
     fn provider_source(optional: bool) -> EnvironmentSourceConfig {
         EnvironmentSourceConfig {
             provider: "company".to_string(),
-            reference: "op://Development/api/environment".to_string(),
+            reference: Some("op://Development/api/environment".to_string()),
             format: EnvironmentSourceFormat::Dotenv,
             optional,
             schema: Some("api.env.example".into()),
             cache: Some(".hum/cache/api.env".into()),
+            args: Vec::new(),
         }
     }
 
@@ -721,6 +763,57 @@ mod tests {
         let partial = HashMap::from([("PUBLIC_URL".to_string(), "http://localhost".to_string())]);
         assert!(!provider_source_fully_shadowed(&source, &temp, &partial).unwrap());
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn exec_provider_captures_command_stdout() {
+        let command = vec![
+            "/bin/echo".to_string(),
+            "-n".to_string(),
+            "GREETING=hello".to_string(),
+        ];
+        let contents = read_exec_command(&command, &[]).unwrap();
+        assert_eq!(contents, "GREETING=hello");
+    }
+
+    #[test]
+    fn exec_provider_appends_source_args_to_base_command() {
+        let command = vec!["/bin/echo".to_string(), "-n".to_string()];
+        let args = vec!["REPO=compri-applications".to_string()];
+        let contents = read_exec_command(&command, &args).unwrap();
+        assert_eq!(contents, "REPO=compri-applications");
+    }
+
+    #[test]
+    fn exec_provider_failure_is_unavailable() {
+        let command = vec!["/usr/bin/false".to_string()];
+        assert!(read_exec_command(&command, &[]).is_err());
+    }
+
+    #[test]
+    fn exec_provider_cache_key_distinguishes_args() {
+        let provider = EnvironmentProviderConfig::Exec {
+            command: vec!["/bin/echo".to_string()],
+        };
+        let with_repo_a = provider_cache_key(&provider, None, &["repo-a".to_string()]);
+        let with_repo_b = provider_cache_key(&provider, None, &["repo-b".to_string()]);
+        assert_ne!(with_repo_a, with_repo_b);
+    }
+
+    #[test]
+    fn exec_provider_read_is_cached_per_args() {
+        let provider = EnvironmentProviderConfig::Exec {
+            command: vec!["/bin/echo".to_string(), "-n".to_string()],
+        };
+        let a = read_provider_reference_cached(&provider, None, &["VALUE=a".to_string()]);
+        let b = read_provider_reference_cached(&provider, None, &["VALUE=b".to_string()]);
+        match (a, b) {
+            (ProviderReadOutcome::Fetched(a), ProviderReadOutcome::Fetched(b)) => {
+                assert_eq!(a, "VALUE=a");
+                assert_eq!(b, "VALUE=b");
+            }
+            _ => panic!("expected both exec provider reads to succeed"),
+        }
     }
 
     #[test]

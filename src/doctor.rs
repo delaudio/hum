@@ -162,6 +162,24 @@ pub fn run_with_project_selection(
                     ));
                 }
             }
+            EnvironmentProviderConfig::Exec { command } => match command.first() {
+                Some(program) => {
+                    let check = task_command_check(
+                        name,
+                        "exec provider command available (not run)",
+                        program,
+                        process.root_dir(),
+                    );
+                    results.push(check);
+                }
+                None => {
+                    results.push(DoctorCheck::fail(
+                        Some(name),
+                        "exec provider command available (not run)",
+                        "provider has no command configured",
+                    ));
+                }
+            },
         }
     }
     let mut tasks = config.tasks.iter().collect::<Vec<_>>();

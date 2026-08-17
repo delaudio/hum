@@ -237,7 +237,7 @@ fn validate_partial_schema(
         "profiles",
         "env_file",
     ];
-    const ENVIRONMENT_PROVIDER: &[&str] = &["type", "account"];
+    const ENVIRONMENT_PROVIDER: &[&str] = &["type", "account", "command"];
     const ENVIRONMENT_SOURCE: &[&str] = &[
         "provider",
         "reference",
@@ -245,6 +245,7 @@ fn validate_partial_schema(
         "optional",
         "schema",
         "cache",
+        "args",
     ];
     const SERVICE: &[&str] = &[
         "runtime",
@@ -502,6 +503,44 @@ templates:
             Some("postgres")
         );
         assert_eq!(config.services["database"].env_from.len(), 1);
+    }
+
+    #[test]
+    fn parses_and_validates_v3_exec_environment_provider_schema() {
+        let yaml = r#"
+version: 3
+project: demo
+environment_providers:
+  compri:
+    type: exec
+    command: [compri, env]
+runtimes:
+  local:
+    type: process
+services:
+  api:
+    runtime: local
+    command: cargo run
+    env_from:
+      - provider: compri
+        args: [compri-applications]
+        format: dotenv
+        optional: true
+templates:
+  all:
+    services: [api]
+"#;
+        let config = yaml_serde::from_str::<Config>(yaml).unwrap();
+        validate::validate(&config, Path::new("hum.yaml")).unwrap();
+        assert!(matches!(
+            config.environment_providers["compri"],
+            crate::config::EnvironmentProviderConfig::Exec { .. }
+        ));
+        assert_eq!(config.services["api"].env_from[0].reference, None);
+        assert_eq!(
+            config.services["api"].env_from[0].args,
+            vec!["compri-applications".to_string()]
+        );
     }
 
     #[test]

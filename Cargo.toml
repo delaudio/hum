@@ -1,6 +1,6 @@
 [package]
 name = "hum"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Keep your local stack humming — a local dev process orchestrator TUI/CLI"
 license = "MIT"
