@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 
 use super::{
-    Config, EnvironmentProviderConfig, EnvironmentSourceConfig, ServiceConfig, TaskConfig,
+    Config, EnvironmentProviderConfig, EnvironmentSourceConfig, EnvironmentSourceFormat,
+    ServiceConfig, TaskConfig,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -373,7 +374,7 @@ fn resolve_provider_source_outcome_from_read(
 ) -> Result<ProviderSourceOutcome> {
     match outcome {
         ProviderReadOutcome::Fetched(contents) => {
-            match parse_and_validate_provider_dotenv(&contents, source, project_root) {
+            match parse_and_validate_provider_contents(&contents, source, project_root) {
                 Ok(values) => {
                     if let Some(cache) = &source.cache {
                         write_private_cache_atomic(&project_root.join(cache), &contents)?;
@@ -435,16 +436,37 @@ fn read_exec_command(command: &[String], args: &[String]) -> Result<String> {
         .map_err(|_| anyhow!("exec environment provider returned a non-UTF-8 environment"))
 }
 
-fn parse_and_validate_provider_dotenv(
+fn parse_and_validate_provider_contents(
     contents: &str,
     source: &EnvironmentSourceConfig,
     project_root: &Path,
 ) -> Result<HashMap<String, String>> {
-    let values = dotenvy::from_read_iter(contents.as_bytes())
+    let values = match source.format {
+        EnvironmentSourceFormat::Dotenv => parse_provider_dotenv(contents)?,
+        EnvironmentSourceFormat::Json => parse_provider_json(contents)?,
+    };
+    validate_provider_values(values, source, project_root)
+}
+
+fn parse_provider_dotenv(contents: &str) -> Result<HashMap<String, String>> {
+    dotenvy::from_read_iter(contents.as_bytes())
         .collect::<std::result::Result<HashMap<_, _>, _>>()
-        .map_err(|_| anyhow!("environment provider returned invalid dotenv"))?;
+        .map_err(|_| anyhow!("environment provider returned invalid dotenv"))
+}
+
+fn parse_provider_json(contents: &str) -> Result<HashMap<String, String>> {
+    let values: HashMap<String, String> = serde_json::from_str(contents)
+        .map_err(|_| anyhow!("environment provider returned invalid JSON"))?;
+    Ok(values)
+}
+
+fn validate_provider_values(
+    values: HashMap<String, String>,
+    source: &EnvironmentSourceConfig,
+    project_root: &Path,
+) -> Result<HashMap<String, String>> {
     if values.is_empty() {
-        return Err(anyhow!("environment provider returned an empty dotenv"));
+        return Err(anyhow!("environment provider returned no values"));
     }
     if let Some(schema) = &source.schema {
         let schema_path = project_root.join(schema);
@@ -494,7 +516,7 @@ fn read_valid_cache(
         .ok_or_else(|| anyhow!("no environment provider cache is configured"))?;
     let contents = fs::read_to_string(project_root.join(cache))
         .map_err(|_| anyhow!("environment provider cache is unavailable"))?;
-    parse_and_validate_provider_dotenv(&contents, source, project_root)
+    parse_and_validate_provider_contents(&contents, source, project_root)
 }
 
 fn write_private_cache_atomic(path: &Path, contents: &str) -> Result<()> {
@@ -605,6 +627,48 @@ mod tests {
         let resolved = resolve_service_env(&service, Path::new("."), &HashMap::new()).unwrap();
         assert_eq!(resolved[&key], "inherited");
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn json_format_accepts_keys_that_are_not_valid_dotenv_identifiers() {
+        // npm's per-registry auth config keys contain `/` and `:`, which the
+        // dotenv grammar cannot express as a variable name — this is exactly
+        // why the `json` format exists alongside `dotenv`.
+        let temp = std::env::temp_dir().join(format!(
+            "hum-provider-json-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let provider = EnvironmentProviderConfig::Exec {
+            command: vec!["/bin/true".to_string()],
+        };
+        let source = EnvironmentSourceConfig {
+            provider: "package-registry".to_string(),
+            reference: None,
+            format: EnvironmentSourceFormat::Json,
+            optional: false,
+            schema: None,
+            cache: None,
+            args: Vec::new(),
+        };
+        let json = r#"{"NPM_TOKEN":"secret","npm_config_//example.com/npm/:_authToken":"secret"}"#;
+        let values =
+            resolve_provider_source_with(&provider, &source, &temp, |_, _| Ok(json.to_string()))
+                .unwrap();
+        assert_eq!(values["NPM_TOKEN"], "secret");
+        assert_eq!(values["npm_config_//example.com/npm/:_authToken"], "secret");
+
+        // Confirm the same key genuinely cannot round-trip through dotenv,
+        // which is the whole reason this format exists.
+        assert!(
+            parse_provider_dotenv("npm_config_//example.com/npm/:_authToken=secret\n").is_err()
+        );
+
+        fs::remove_dir_all(&temp).unwrap();
     }
 
     #[test]

@@ -211,6 +211,11 @@ pub struct EnvironmentSourceConfig {
 pub enum EnvironmentSourceFormat {
     #[default]
     Dotenv,
+    /// A flat JSON object of string values. Unlike `Dotenv`, keys are not
+    /// restricted to identifier syntax (e.g. keys containing `/` or `:`),
+    /// which some providers need to emit (npm registry auth config keys,
+    /// for instance).
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
