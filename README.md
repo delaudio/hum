@@ -36,8 +36,8 @@ documented in [`docs/HOMEBREW.md`](docs/HOMEBREW.md).
 - **Runtime**: a named generic adapter (`process` or `compose`).
 - **Service**: one runtime-owned long-lived unit.
 - **Task**: a trusted, direct-argv one-shot unit in the same dependency graph.
-- **Environment provider**: a named source of scoped values; currently
-  `one-password` with dotenv payloads.
+- **Environment provider**: a named source of scoped values; supports
+  `one-password` or generic `exec` commands with `dotenv` or `json` payloads.
 
 ## Target CLI
 
@@ -129,8 +129,9 @@ Tasks use an argv array and are never wrapped in an implicit shell. An optional
 only during diagnostics, without provider-backed values, so product packs can
 check their own configuration and prerequisites without teaching Hum about the
 product. Tasks and services share dependency and cycle validation; a failed
-task rolls back only services started by the current invocation. `plan` resolves
-this graph without contacting providers or Docker.
+task rolls back only services started by the current invocation. Services can set
+`depends_on_ready: started | listening | healthy` to control when dependent units
+are unblocked. `plan` resolves this graph without contacting providers or Docker.
 
 Selections support repeatable subtractive filters. `--exclude TEMPLATE`
 removes that template's services from the initial roots; if a remaining unit
@@ -139,18 +140,21 @@ still depends on one, it is reintroduced with a warning naming the consumer.
 command fails before Docker, tasks, or providers are contacted. The same
 resolver is used by `plan`, `start`, `doctor`, and `secrets sync`.
 
-An `env_from` entry can read a dotenv item from a named 1Password provider.
-Values are scoped to the child process or Compose invocation and are never
-printed or persisted in generated Compose YAML. Optional `schema` validation
-requires an exact key set. Optional `cache` files are plaintext, atomically
-replaced with mode `0600`, and should live under the gitignored `.hum/`
-directory. Required sources fail closed only when neither the provider nor a
+An `env_from` entry can read environment items from a named 1Password or `exec`
+provider. Sources specify `format: dotenv` (default) or `format: json` (for flat
+JSON string maps, supporting key names with characters like `/` or `:` that standard
+dotenv grammar rejects). An `exec` provider executes a configured `command` and
+supports per-source `args` parameterization. Values are scoped to the child process
+or Compose invocation and are never printed or persisted in generated Compose YAML.
+Optional `schema` validation requires an exact key set. Optional `cache` files are
+plaintext, atomically replaced with mode `0600`, and should live under the gitignored
+`.hum/` directory. Required sources fail closed only when neither the provider nor a
 schema-valid cache is available; optional sources may continue empty. Provider
 references are read once per lifecycle action and reused across tasks/services;
-each later TUI action starts with a fresh provider-read cache.
-`secrets sync` refreshes selected sources without starting services and may
-attempt interactive `op signin`; normal startup never prompts. `doctor` checks
-only that `op` exists—it never reads vault items.
+each later TUI action starts with a fresh provider-read cache. `secrets sync`
+refreshes selected sources without starting services and may attempt interactive
+`op signin`; normal startup never prompts. `doctor` checks that `op` or `exec`
+executables exist—it never reads vault items.
 
 `config compose` renders the effective Compose model without contacting
 environment providers. Service environment values are replaced with

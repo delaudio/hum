@@ -1,5 +1,5 @@
 # Product-neutral v3 example: a Compose dependency, a one-shot task, a local
-# process, and a 1Password-backed dotenv source.
+# process, custom exec and 1Password environment sources, and readiness controls.
 version: 3
 project: sample
 
@@ -9,12 +9,18 @@ runtimes:
   containers:
     type: compose
     project_name: hum-sample
+    reconcile: true
     files:
       - compose.v3.example.yaml
 
 environment_providers:
   team-vault:
     type: one-password
+  generic-exec:
+    type: exec
+    command:
+      - echo
+      - '{"PORT":"8080"}'
 
 tasks:
   migrate:
@@ -50,8 +56,14 @@ services:
         optional: true
         schema: api.env.example
         cache: .hum/cache/api.env
+      - provider: generic-exec
+        args:
+          - --json
+        format: json
+        optional: true
     depends_on:
       - migrate
+    depends_on_ready: healthy
     healthcheck:
       type: http
       url: http://localhost:8080
@@ -64,3 +76,4 @@ templates:
   infrastructure:
     services:
       - database
+

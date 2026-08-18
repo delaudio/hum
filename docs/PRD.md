@@ -1,130 +1,105 @@
 # PRD — hum: local development process launcher and monitor
 
-**Nome prodotto:** `hum`
+**Product Name:** `hum`
 
 **Tagline:** Keep your local stack humming.
 
-**Tipo:** CLI e TUI per orchestrare runtime locali di sviluppo
+**Type:** CLI and TUI for orchestrating local development runtimes
 
 **Stack:** Rust, Ratatui, Tokio
 
-**Stato:** Draft
+**Status:** Draft
 
-**Versione prodotto:** 0.3
+**Product Version:** 0.6.1
 
-**Versione configurazione progetto:** 3
+**Project Configuration Version:** 3
 
-> La v3 estende senza invalidare i file v1/v2 process-only. Le integrazioni di
-> prodotto appartengono a pack di configurazione esterni al repository `hum`.
+> Version 3 extends without invalidating process-only v1/v2 files. Product integrations belong in configuration packs external to the `hum` repository.
 
-## 1. Sintesi
+## 1. Summary
 
-`hum` avvia, arresta, monitora e diagnostica servizi locali attraverso adapter
-generici. Il grafo può includere processi, servizi Docker Compose e task
-one-shot dichiarativi.
+`hum` starts, stops, monitors, and diagnoses local services through generic adapters. The graph can include processes, Docker Compose services, and declarative one-shot tasks.
 
-Il flusso principale è esplicito:
+The main flow is explicit:
 
 ```bash
 hum <project> <template> <command>
 ```
 
-Per esempio:
+For example:
 
 ```bash
 hum demo all-services start
 ```
 
-`start` avvia i servizi selezionati tramite il rispettivo runtime e poi termina.
-Non rimane un daemon `hum` residente. Una successiva invocazione della CLI o
-della TUI ritrova i servizi tramite un runtime registry persistente e verifica
-il loro stato interrogando il sistema operativo.
+`start` launches selected services via their respective runtime and then exits. No resident `hum` daemon remains. Subsequent CLI or TUI invocations discover running services through a persistent runtime registry and verify their state with the operating system.
 
-La TUI è un osservatore e controller del runtime, non il proprietario del
-lifetime dei servizi. Aprirla o chiuderla non avvia né arresta implicitamente
-i processi.
+The TUI is a runtime observer and controller, not the owner of service lifetimes. Opening or closing it does not implicitly start or stop processes.
 
-## 2. Problema
+## 2. Problem
 
-Lo sviluppo locale di un prodotto multi-servizio richiede di ricordare:
+Local development of a multi-service product requires remembering:
 
-- repository e working directory;
-- comandi e variabili d'ambiente;
-- servizi necessari per una specifica attività;
-- ordine delle dipendenze;
-- porte e health check;
-- PID, stato e log dei processi avviati;
-- procedure di arresto e recupero dopo un crash.
+- repository checkout paths and working directories;
+- commands and environment variables;
+- services required for a specific task;
+- dependency order;
+- ports and health checks;
+- PIDs, status, and logs of launched processes;
+- shutdown and recovery procedures after a crash.
 
-Un orchestratore che conserva tutto solo nella memoria della sessione non può
-supportare comandi separati come `start`, `status`, `logs` e `stop`. Inoltre
-costringe la TUI a rimanere aperta e lega i servizi alle sue pipe di output.
+An orchestrator that retains everything only in session memory cannot support separate commands like `start`, `status`, `logs`, and `stop`. It also forces the TUI to remain open and couples services to its output pipes.
 
-`hum` risolve il problema mantenendo dichiarativa la configurazione e
-persistendo soltanto i metadati runtime minimi. I processi applicativi restano
-normali processi locali, ispezionabili anche senza `hum`.
+`hum` solves this problem by keeping configuration declarative and persisting only minimal runtime metadata. Application processes remain standard local processes, inspectable even without `hum`.
 
-## 3. Concetti
+## 3. Concepts
 
 ### 3.1 Project
 
-Un prodotto locale registrato con un nome stabile, per esempio `demo`. Il
-registry globale associa il nome al file di configurazione del progetto.
+A registered local product with a stable name, for example `demo`. The global registry maps the name to the project configuration file.
 
 ### 3.2 Runtime
 
-Un adapter nominato e configurato dal progetto. La v3 include `process` e
-`compose`; nessun adapter contiene nomi, immagini o policy di prodotto.
+A named adapter configured by the project. Version 3 includes `process` and `compose`; no adapter contains product names, images, or policies.
 
 ### 3.3 Service
 
-Un processo avviabile e monitorabile: frontend, API, worker, Storybook, mock
-server o un database avviato tramite un comando locale.
+A launchable and monitorable process: frontend, API, worker, Storybook, mock server, or a database started via a local command.
 
-L'identità runtime è `<project>/<service>`. Lo stesso servizio incluso in due
-template non viene avviato due volte.
+The runtime identity is `<project>/<service>`. The same service included in two templates is never started twice.
 
 ### 3.4 Task
 
-Unità one-shot trusted-code eseguita come argv diretto, con timeout, dipendenze
-e controllo opzionale di idempotenza. Non è un servizio persistente.
+A trusted-code one-shot unit executed as a direct argv, with timeout, dependencies, and optional idempotency check. It is not a persistent service.
 
 ### 3.5 Environment provider
 
-Provider nominato che risolve sorgenti dotenv per il solo child interessato.
-La prima implementazione usa 1Password CLI senza esportare valori nel processo
-globale di `hum`.
+A named provider that resolves environment sources for the target child process only. Supported adapters include `one-password` (via 1Password CLI) and `exec` (via a generic command returning `dotenv` or `json` payloads), without ever exporting values into `hum`'s global process.
 
 ### 3.6 Template
 
-Un insieme nominato di servizi per un contesto di lavoro, per esempio
-`frontend`, `backend` o `all-services`. Sostituisce il concetto v1 di `profile`.
+A named selection of services for a workflow context, for example `frontend`, `backend`, or `all-services`. Replaces the v1 concept of `profile`.
 
-Un template seleziona servizi; non possiede i processi. Fermare un template
-significa richiedere lo stop dei servizi che seleziona, in ordine inverso alle
-dipendenze.
+A template selects services; it does not own processes. Stopping a template requests stopping its selected services in reverse dependency order.
 
 ### 3.7 Runtime registry
 
-Metadati persistenti che permettono a invocazioni separate di riconoscere un
-processo:
+Persistent metadata allowing separate invocations to recognize a process:
 
-- project e service;
-- PID e process group ID;
-- process start time o identificatore equivalente;
-- comando/config hash;
+- project and service;
+- PID and process group ID;
+- process start time or equivalent identifier;
+- command/config hash;
 - working directory;
-- timestamp di avvio;
-- porta attesa;
-- percorsi dei log.
+- launch timestamp;
+- expected port;
+- log file paths.
 
-Il PID da solo non è un'identità sufficiente: prima di inviare un segnale `hum`
-deve verificare anche start time e metadati disponibili, così da non colpire un
-PID riutilizzato.
+The PID alone is not sufficient identity: before sending a signal, `hum` verifies start time and available metadata to avoid signaling a reused PID.
 
-### 3.8 Process, port e health
+### 3.8 Process, port, and health
 
-Sono segnali distinti:
+These are distinct signals:
 
 ```text
 Process  starting | running | exited | missing | stopping
@@ -132,51 +107,48 @@ Port     listening | closed | unknown | occupied-by-other
 Health   unchecked | checking | healthy | unhealthy
 ```
 
-La UI può derivare un'etichetta sintetica, ma non deve perdere i tre valori
-sottostanti. Un processo può essere `running`, avere la porta `listening` ed
-essere contemporaneamente `unhealthy`.
+The UI may derive a summary label, but must retain the three underlying values. A process can be `running`, have its port `listening`, and be `unhealthy` simultaneously.
 
-## 4. Obiettivi
+## 4. Goals
 
-- Avviare un ambiente locale con un solo comando non interattivo.
-- Lasciare attivi i servizi dopo l'uscita di CLI e TUI.
-- Rendere funzionanti `status`, `stop`, `restart` e `logs` fra invocazioni.
-- Selezionare esplicitamente project e template.
-- Gestire dipendenze acicliche e readiness configurabile.
-- Conservare log persistenti con limiti di spazio.
-- Monitorare PID, porte e health con polling leggero.
-- Diagnosticare configurazione e runtime stale.
-- Consumare risorse trascurabili rispetto ai servizi gestiti.
-- Supportare inizialmente macOS e Linux.
-- Gestire Compose senza sostituirlo e senza duplicarne il modello.
-- Ottenere ambienti da provider dichiarativi senza stampare valori sensibili.
-- Conservare ogni conoscenza di prodotto in pack esterni.
+- Start a local environment with a single non-interactive command.
+- Keep services running after CLI and TUI exit.
+- Make `status`, `stop`, `restart`, and `logs` work across independent invocations.
+- Explicitly select project and template.
+- Manage acyclic dependencies and configurable readiness.
+- Retain persistent logs with bounded disk usage.
+- Monitor PID, ports, and health with lightweight polling.
+- Diagnose configuration and stale runtime state.
+- Consume negligible resources relative to managed services.
+- Initially support macOS and Linux.
+- Manage Compose without replacing it or duplicating its model.
+- Obtain environments from declarative providers without printing sensitive values.
+- Keep all product-specific knowledge in external configuration packs.
 
-## 5. Non obiettivi
+## 5. Non-Goals
 
-La prima release non deve:
+Initial releases must not:
 
-- introdurre un daemon centrale `hum` residente;
-- riavviare automaticamente servizi dopo un crash;
-- sostituire Docker Compose, Kubernetes, launchd o systemd;
-- gestire deployment, host remoti o repliche;
-- includere una REST API, autenticazione o plugin;
-- scaricare ed eseguire configurazioni remote;
-- diventare un vault o memorizzare segreti nel proprio schema;
-- diventare un package manager o un sistema di scheduling.
+- introduce a resident central `hum` daemon;
+- automatically restart services after a crash;
+- replace Docker Compose, Kubernetes, launchd, or systemd;
+- manage deployments, remote hosts, or replicas;
+- include a REST API, authentication, or plugins;
+- download and execute remote configurations automatically;
+- act as a secret vault or store secrets in its own schema;
+- become a package manager or job scheduler.
 
-I servizi vengono eseguiti in background, ma questa indipendenza non implica
-l'esistenza di un processo supervisore `hum`.
+Services run in the background, but this independence does not imply a supervisor process.
 
 ## 6. CLI
 
-### 6.1 Grammatica
+### 6.1 Grammar
 
 ```text
 hum <project> <template> <command> [arguments]
 ```
 
-Comandi iniziali:
+Commands:
 
 ```bash
 hum demo all-services start
@@ -192,87 +164,75 @@ hum demo all-services doctor
 hum demo all-services tui
 ```
 
-`plan`, `start`, `doctor` e `secrets sync` accettano esclusioni ripetibili:
+`plan`, `start`, `doctor`, and `secrets sync` accept repeatable exclusions:
 
 ```bash
 hum demo all-services plan --exclude identity
 hum demo all-services start --exclude-service mail
 ```
 
-`--exclude` sottrae i root del template indicato, ma una dipendenza necessaria
-può reintrodurli con un warning deterministico. `--exclude-service` è un veto
-forte: se un'unità rimasta dipende dal servizio escluso, la selezione fallisce
-prima di qualsiasi side effect.
+`--exclude` subtracts root services of the specified template, but a remaining unit can reintroduce a dependency with a deterministic warning. `--exclude-service` is a strict veto: if a remaining unit depends on the excluded service, selection fails before any side effect.
 
-`plan --json` restituisce, per i piani risolti, un documento stabile con
-template, root richiesti, esclusioni, warning e unità ordinate con la
-motivazione della loro inclusione. Un piano non risolvibile termina con exit
-code non zero e diagnostica su stderr. `config compose` rende il modello Compose effettivo
-senza leggere provider e sostituisce ogni valore d'ambiente con `<redacted>`.
+`plan --json` returns a stable machine-readable document for resolved plans containing template, required roots, exclusions, warnings, and ordered units with inclusion rationale. An unresolvable plan exits with a non-zero exit code and diagnostic stderr. `config compose` renders the effective Compose model without contacting providers, replacing service environment values with `<redacted>`.
 
-Varianti interattive:
+Interactive entry points:
 
-- `hum` apre il selettore di project e template;
-- `hum <project>` apre il selettore dei template del progetto;
-- `hum <project> <template>` apre la TUI nel contesto selezionato;
-- `tui` rende esplicito lo stesso comportamento per script e documentazione.
+- `hum` opens project and template selection;
+- `hum <project>` opens template selection for the project;
+- `hum <project> <template>` opens the TUI in the selected context;
+- `tui` explicitly invokes the TUI for scripts and documentation.
 
-### 6.2 Semantica
+### 6.2 Semantics
 
 `start`:
 
-1. carica registry e configurazione;
-2. risolve template e dipendenze;
-3. acquisisce un lock per progetto;
-4. riconcilia eventuale stato persistito;
-5. avvia i servizi mancanti in process group/sessioni indipendenti;
-6. redirige stdin, stdout e stderr prima di restituire;
-7. persiste atomicamente i metadati runtime;
-8. termina senza lasciare un processo `hum` residente.
+1. loads registry and configuration;
+2. resolves template and dependencies;
+3. acquires a project lock;
+4. reconciles existing persisted state;
+5. starts missing services in independent process groups/sessions;
+6. redirects stdin, stdout, and stderr before returning;
+7. persists runtime metadata atomically;
+8. exits without leaving a resident `hum` process.
 
-`stop` invia `SIGTERM` al process group, attende il timeout configurato e usa
-`SIGKILL` solo se necessario. Verifica l'identità del processo prima di inviare
-segnali e arresta i servizi in ordine inverso alle dipendenze.
+`stop` sends `SIGTERM` to the process group, waits for the configured timeout, and uses `SIGKILL` only if necessary. It verifies process identity before sending signals and stops services in reverse dependency order.
 
-`restart` opera sul processo realmente registrato e non equivale a uno start
-cieco da un Manager vuoto.
+`restart` operates on the registered process and is not an uncoordinated start.
 
-`status` riconcilia registry e sistema operativo. Non considera il contenuto
-del registry una prova sufficiente che il processo sia vivo.
+`status` reconciles registry and operating system. It does not treat registry entries alone as proof that a process is alive.
 
-`logs` legge file persistenti e supporta almeno tail e follow.
+`logs` reads persistent files and supports tailing and live follow.
 
-### 6.3 Exit code
+### 6.3 Exit Codes
 
 ```text
-0   operazione completata
-1   errore generico
-2   configurazione non valida
-3   project non trovato
-4   template non trovato
-5   servizio non trovato
-6   avvio fallito o parziale
-7   arresto fallito o parziale
-8   health/readiness fallita
-9   doctor non superato
-10  runtime registry incoerente
+0   operation completed successfully
+1   generic error
+2   invalid configuration
+3   project not found
+4   template not found
+5   service not found
+6   start failed or partial
+7   stop failed or partial
+8   health/readiness failed
+9   doctor failed
+10  runtime registry incoherent
 ```
 
-Gli exit code `already-running` e `already-stopped` sono `0` quando il risultato
-richiesto è già soddisfatto e l'identità del processo è stata verificata.
+`already-running` and `already-stopped` exit codes are `0` when the requested outcome is already satisfied and process identity is verified.
 
-## 7. Configurazione
+## 7. Configuration
 
-### 7.1 Registry globale
+### 7.1 Global Registry
 
-Percorso:
+Path:
 
 ```text
 $XDG_CONFIG_HOME/hum/config.yaml
 ~/.config/hum/config.yaml              # fallback
 ```
 
-Esempio:
+Example:
 
 ```yaml
 version: 1
@@ -282,10 +242,9 @@ projects:
     config: ~/code/demo/hum.yaml
 ```
 
-### 7.2 Configurazione progetto
+### 7.2 Project Configuration
 
-File condiviso `hum.yaml`, con override locale opzionale `hum.local.yaml`. La
-v3 aggiunge runtime, provider e task nominati:
+Shared file `hum.yaml`, with optional untracked override `hum.local.yaml`. Version 3 adds named runtimes, environment providers, tasks, and readiness controls:
 
 ```yaml
 version: 3
@@ -298,10 +257,14 @@ runtimes:
     type: compose
     project_name: demo-local
     files: [compose.yaml]
+    reconcile: true
 
 environment_providers:
   development:
     type: one-password
+  script:
+    type: exec
+    command: ["./scripts/get-env.sh"]
 
 repositories:
   applications:
@@ -316,6 +279,11 @@ services:
     command: pnpm dev
     port: 3000
     env_file: .env
+    env_from:
+      - provider: script
+        args: ["api"]
+        format: json
+        optional: true
     healthcheck:
       type: http
       url: http://localhost:3000/health
@@ -332,6 +300,7 @@ services:
     depends_on:
       - api
       - database
+    depends_on_ready: healthy
 
 templates:
   all-services:
@@ -340,10 +309,9 @@ templates:
       - frontend
 ```
 
-Tutti i percorsi relativi sono risolti rispetto al file che li dichiara, non
-alla working directory dalla quale viene eseguito `hum`.
+Relative paths resolve from the file declaring them, not from the working directory where `hum` is executed.
 
-Ordine di precedenza:
+Precedence order:
 
 ```text
 defaults
@@ -353,20 +321,24 @@ defaults
   < CLI arguments
 ```
 
-Lo schema deve rifiutare campi sconosciuti. `env_file` viene realmente caricato
-e i suoi valori hanno precedenza inferiore a `service.env`, ambiente del
-processo e override CLI. Gli errori includono file, campo, posizione e hint.
+Unknown schema fields are rejected. `env_file` values take lower precedence than `service.env`, process environment, and CLI overrides. Errors include file, field, position, and action hints.
 
-## 8. Stato persistente e locking
+Compose runtimes can declare `reconcile: true` to reapply `compose up` when provider environment variables or generated layers change.
 
-Directory predefinita:
+An `environment_provider` supports both `type: one-password` (with optional `account`) and `type: exec` (with executable `command: [...]`). `env_from` entries can specify `format: dotenv` (default) or `format: json` (for flat JSON string maps with keys containing `/` or `:`), per-source `args: [...]`, `schema`, `cache`, and `optional`.
+
+Services can define `depends_on_ready: started | listening | healthy` to control when dependent units in the graph are unblocked.
+
+## 8. Persistent State and Locking
+
+Default directory:
 
 ```text
 $XDG_STATE_HOME/hum/<project>/
 ~/.local/state/hum/<project>/          # fallback
 ```
 
-Layout indicativo:
+Layout:
 
 ```text
 ~/.local/state/hum/demo/
@@ -380,215 +352,177 @@ Layout indicativo:
 └── project.lock
 ```
 
-Le scritture del registry sono atomiche: file temporaneo nella stessa directory,
-flush e rename. Il lock serializza operazioni concorrenti sullo stesso progetto.
+Registry writes are atomic: temporary file in the same directory, flush, and rename. `project.lock` serializes concurrent operations on the same project.
 
-### 8.1 Riconciliazione stale
+### 8.1 Stale Reconciliation
 
-Un'entry è stale quando il processo non esiste o la sua identità non coincide.
-`status` la mostra esplicitamente; `doctor` spiega la causa. La pulizia può
-essere automatica solo dopo aver verificato che nessun processo corrispondente
-possa ricevere segnali per errore.
+An entry is stale when the process does not exist or its identity does not match. `status` displays it explicitly; `doctor` explains the root cause. Cleanup occurs automatically only after verifying that no process could receive signals by mistake.
 
-Un processo trovato sulla porta attesa ma non riconosciuto dal registry è
-`occupied-by-other`, non un servizio gestito.
+A process found on an expected port but unverified in the registry is reported as `occupied-by-other`, not a managed service.
 
-## 9. Gestione dei processi
+## 9. Process Management
 
-Ogni servizio usa un process group dedicato. Su macOS e Linux deve essere
-indipendente dal terminale e dalla sessione `hum`. stdin è collegato a null;
-stdout e stderr sono rediretti su file prima che `start` termini.
+Each service uses a dedicated process group. On macOS and Linux it is detached from terminal and `hum` session. stdin is connected to null; stdout and stderr are redirected to files before `start` returns.
 
-Comandi shell nella configurazione sono considerati codice fidato. La
-configurazione non viene scaricata automaticamente da sorgenti remote.
+Configured shell commands are treated as trusted code. Configurations are never downloaded from remote sources automatically.
 
-`start` è idempotente. Prima di avviare un servizio controlla registry, identità
-del PID e porta. Un conflitto non deve produrre un secondo processo.
+`start` is idempotent. Before spawning a process it checks registry, PID identity, and port. A conflict does not launch a duplicate process.
 
-Il crash di un servizio:
+Service crash behavior:
 
-- non avvia un nuovo processo automaticamente;
-- resta visibile tramite stato, exit code quando disponibile e log;
-- non causa il crash della CLI o TUI;
-- può essere recuperato con `restart`.
+- does not restart a process automatically;
+- remains visible via status, exit code when available, and logs;
+- does not crash CLI or TUI;
+- can be recovered with `restart`.
 
-## 10. Polling e health
+## 10. Polling and Health
 
-Polling indicativo:
+Target polling intervals:
 
-- esistenza/identità PID: 500–1000 ms nella TUI;
-- porta TCP: 1–2 s o intervallo configurato;
-- health HTTP/TCP: intervallo del servizio.
+- PID existence/identity: 500–1000 ms in TUI;
+- TCP port check: 1–2 s or configured interval;
+- HTTP/TCP health probe: service-configured interval.
 
-Il controllo PID deve essere mirato. Il controllo porta usa una connessione TCP
-breve e non bloccante. I client HTTP vengono riutilizzati.
+PID checks are targeted. Port checks use non-blocking short TCP connections. HTTP clients are pooled.
 
-`lsof` è usato solo per identificare l'occupante di una porta o come fallback
-diagnostico. Non deve essere eseguito per ogni servizio a ogni redraw: avviare
-processi esterni nel polling ordinario sarebbe più costoso e meno portabile.
+`lsof` is used only to identify port occupants during explicit diagnostics or conflicts. It is never executed in steady-state rendering loops.
 
-I probe sono cancellabili, non si sovrappongono e appartengono a una specifica
-generazione del processo. Il risultato di una generazione precedente non può
-modificare lo stato dopo un restart.
+Probes are cancellable, non-overlapping, and generation-bound. Previous generation results cannot overwrite state after a restart.
 
-## 11. Log
+## 11. Logs
 
-I log sono persistenti e separano stdout e stderr. Ogni record visualizzato
-include timestamp, servizio, stream e contenuto quando queste informazioni sono
-disponibili senza modificare l'output originale su disco.
+Logs are persistent and separate stdout and stderr. Every displayed line includes timestamp, service name, stream, and content.
 
-La retention è limitata per byte e numero di file, non soltanto per righe. Sono
-configurabili almeno:
+Retention is bounded by byte size and file count. Configurable options:
 
-- dimensione massima per file;
-- numero di file ruotati;
-- limite per singola riga/chunk;
-- pattern da mascherare nella visualizzazione.
+- maximum file size;
+- rotated file count;
+- maximum line/chunk bytes;
+- regex redaction patterns for display and export.
 
-La TUI legge incrementi dai file e non conserva l'intera cronologia in RAM.
-`logs --follow` continua a funzionare anche se la TUI non è aperta.
+The TUI reads disk files incrementally without loading full log history into memory. `logs --follow` continues streaming independently of the TUI.
+
+`logs.exporters` can forward process-runtime log copies as NDJSON over HTTP to local collectors (such as Vector), storing authentication headers in `hum.local.yaml` without blocking service execution.
 
 ## 12. TUI
 
-La TUI mostra il project e template selezionati e, per ogni servizio:
+The TUI displays the selected project and template for every service:
 
-- process state e PID/PGID;
+- process state and PID/PGID;
 - uptime;
-- porta e port state;
-- health state e ultimo risultato;
-- exit code o errore;
-- accesso ai log persistenti.
+- port and port state;
+- health state and last result;
+- exit code or error;
+- persistent log access.
 
-Shortcut iniziali:
+Initial shortcuts:
 
 ```text
-↑/k, ↓/j   navigazione
-space      start/stop esplicito
+↑/k, ↓/j   navigation
+space      explicit start/stop
 r          restart
-enter      dettagli
-l          log
+enter      details
+l          logs
 d          doctor
-o          apri URL
+o          open URL
 ?          help
-q          chiudi la TUI senza fermare i servizi
+q          close TUI without stopping services
 ```
 
-Le operazioni lente e `doctor` non bloccano l'event loop. Gli errori delle
-azioni vengono mostrati, non ignorati. Uno stop globale richiede una scelta
-esplicita; la semplice chiusura della TUI non è uno stop.
+Slow operations and `doctor` run off the main event loop. Action errors are reported explicitly. A full stack shutdown requires explicit confirmation; quitting the TUI leaves services running.
 
 ## 13. Doctor
 
-`doctor` controlla:
+`doctor` checks:
 
-- registry globale e configurazione progetto;
-- repository, working directory e comandi richiesti;
-- file ed env file richiesti;
-- variabili d'ambiente senza mostrarne il valore;
-- dipendenze e cicli;
-- runtime registry stale;
-- identità dei processi registrati;
-- porte chiuse, gestite o occupate da processi estranei;
-- directory di stato/log e permessi.
+- global registry and project configuration;
+- repositories, working directories, and required commands;
+- required files and env files;
+- environment variables without printing secret values;
+- dependencies and cycle detection;
+- stale runtime registry entries;
+- registered process identities;
+- closed, managed, or foreign port occupants;
+- state/log directory permissions.
 
-Una porta occupata dal servizio `hum` atteso non è un errore. Una porta occupata
-da un processo non riconosciuto è una diagnosi distinta.
+A port occupied by the expected `hum` service is valid. A port occupied by an unrecognized process is diagnosed distinctly.
 
-## 14. Requisiti non funzionali
+## 14. Non-Functional Requirements
 
-- Distribuzione come singolo binario.
-- TUI visibile entro circa 200 ms con configurazione locale valida.
-- Con dieci servizi, overhead CPU e RSS documentato e non significativo.
-- Nessuna crescita RAM proporzionale alla cronologia dei log.
-- Nessuna scansione completa dei processi nel polling ordinario.
-- Crash e output elevato di un servizio non devono compromettere `hum`.
-- Supporto iniziale macOS e Linux.
-- Errori con contesto e azione suggerita.
-- Configurazioni semplici, leggibili e versionabili.
+- Single binary distribution.
+- TUI visible within ~200 ms with valid local configuration.
+- Negligible CPU and RSS overhead with ten managed services.
+- RAM usage independent of log history length.
+- No full process table scanning during steady-state polling.
+- Service crash or high log volume does not crash `hum`.
+- Initial macOS and Linux support.
+- Error messages with actionable hints.
+- Simple, readable, versionable configuration files.
 
-## 15. Sicurezza
+## 15. Security
 
-- Verificare identità e start time prima di segnalare un PID registrato.
-- Usare permessi utente per stato e log.
-- Non stampare valori di variabili sensibili.
-- Non scrivere valori sensibili nei file Compose generati.
-- Scrivere cache provider solo se configurate, atomicamente e con modo `0600`.
-- Per una source richiesta, riusare solo una cache valida rispetto allo schema e
-  fallire prima del runtime se provider e cache valida non sono disponibili.
-- Non aprire login interattivi durante `start`; solo `secrets sync` può proporre
-  un singolo `op signin` quando è collegato a un terminale.
-- `doctor` verifica la disponibilità del provider senza leggere item.
-- Mascherare pattern configurati nella visualizzazione dei log.
-- Considerare i comandi locali configurati come codice fidato.
-- Non eseguire configurazioni remote automaticamente.
-- Non modificare file `.env` posseduti dal progetto; le cache provider hanno
-  percorsi distinti, espliciti e gitignored.
+- Verify identity and start time before signaling registered PIDs.
+- Use owner-only permissions (`0600`/`0700`) for state, logs, and caches.
+- Never print sensitive environment variable values.
+- Never write sensitive values into generated Compose files.
+- Write provider caches atomically with `0600` permissions.
+- Fail closed when required providers and schema-valid caches are missing.
+- Never launch interactive login prompts during `start`; `secrets sync` prompts only when attached to a terminal.
+- `doctor` verifies provider availability without reading vault secrets.
+- Redact configured sensitive regex patterns in display and export views.
+- Treat local configuration commands as trusted code.
+- Do not modify project `.env` files; provider caches use distinct, gitignored paths.
 
-## 16. Migrazione delle configurazioni
+## 16. Configuration Migration
 
-La v1 usava `profiles` e una CLI implicita basata sulla discovery del file. La
-v2 richiede:
+Version 1 used `profiles` and implicit discovery. Version 2 migration steps:
 
-1. registrare il project nel registry globale;
-2. aggiungere `project` al file di progetto;
-3. cambiare `version: 1` in `version: 2`;
-4. rinominare `profiles` in `templates`;
-5. sostituire `hum up <profile>` con
-   `hum <project> <template> start`.
+1. register project in global registry;
+2. add `project` key to project file;
+3. change `version: 1` to `version: 2`;
+4. rename `profiles` to `templates`;
+5. replace `hum up <profile>` with `hum <project> <template> start`.
 
-Una configurazione v1 deve produrre un errore di migrazione leggibile. Non viene
-avviata implicitamente in modalità legacy, perché ciò reintrodurrebbe ownership
-e semantiche incompatibili.
+Version 1 files produce an actionable migration error.
 
-La v3 mantiene v1/v2 process-only e richiede che ogni servizio v3 scelga un
-runtime nominato. La migrazione da un CLI di prodotto sposta Compose, immagini,
-vault reference e bootstrap in un repository/pack del prodotto. Il core `hum`
-non importa moduli né manifest specifici di quel pack.
+Version 3 retains v1/v2 process services while adding named runtimes, Compose integration, tasks, environment providers, and readiness controls.
 
-Un runtime Compose può elencare layer `generated_files` prodotti da task del
-pack. I file assenti non invalidano `doctor`; quando esistono vengono aggiunti
-alla CLI Compose senza interpretarne il contenuto nel core.
+## 17. Acceptance Criteria
 
-## 17. Criteri di accettazione
+### CLI and Configuration
 
-### CLI e configurazione
-
-- `hum demo all-services start` funziona da qualunque directory.
-- Project e template sconosciuti hanno errori distinti.
-- Due template sovrapposti non duplicano un servizio.
-- Campi sconosciuti e path errati sono diagnosticati.
-- Lo stesso grafo ordina processi, servizi Compose e task senza cicli.
-- `plan` non contatta Docker o provider e non mostra valori d'ambiente.
-- `plan --json` espone selezione, esclusioni, warning e ragioni in forma
-  machine-readable; `config compose` non mostra valori d'ambiente reali.
-- Le esclusioni di template segnalano le dipendenze reintrodotte; le esclusioni
-  di servizio bloccano dipendenze incompatibili prima di ogni side effect.
+- `hum demo all-services start` works from any directory.
+- Unknown project or template errors are distinct and actionable.
+- Overlapping templates do not duplicate services.
+- Graph orders processes, Compose services, and tasks without cycles.
+- `plan` does not contact Docker or providers and redacts secret values.
+- `plan --json` exposes selection, exclusions, warnings, and rationale in machine-readable format.
+- `--exclude` warns on reintroduced dependencies; `--exclude-service` blocks execution before side effects.
 
 ### Lifecycle
 
-- Dopo `start` non rimane un processo `hum` residente.
-- Una nuova invocazione vede, riavvia e ferma i servizi avviati prima.
-- Stop termina l'intero process group senza rischiare PID riutilizzati.
-- Entry stale e fallimenti parziali sono visibili e recuperabili.
+- No resident daemon process remains after `start`.
+- Subsequent CLI/TUI invocations discover and manage running services.
+- `stop` terminates the full process group safely without signaling reused PIDs.
+- Stale entries and partial failures are visible and recoverable.
 
-### Osservabilità
+### Observability
 
-- Process, port e health restano distinti.
-- La TUI osserva processi già attivi e non ne determina il lifetime.
-- Log e stato restano disponibili dopo l'uscita della TUI.
-- Il polling ordinario non esegue `lsof` o scansioni complete del sistema.
+- Process, port, and health signals remain distinct.
+- TUI observes active processes without owning their lifetime.
+- Logs and status remain available after TUI exits.
+- Steady-state polling avoids `lsof` or full process table scans.
 
-### Qualità
+### Quality
 
-- Test di integrazione coprono invocazioni separate e processi reali fixture.
-- `cargo fmt --check`, Clippy, test e build release sono gate CI.
-- Test e benchmark non lasciano processi o stato residuo.
-- Un test con Docker fake verifica project isolation, start/stop/status/logs,
-  reset, task idempotenti e assenza di segreti nell'override generato.
+- Integration tests cover multi-invocation lifecycle with real processes.
+- `cargo fmt --check`, Clippy, unit/integration tests, and release builds pass cleanly.
+- Tests leave no residue.
+- Docker fake test verifies project isolation, start/stop/status/logs, reset, and secret redaction.
 
-## 18. Release iniziale proposta
+## 18. Proposed Release Criteria
 
-La release è pronta quando uno sviluppatore può configurare Demo ed eseguire:
+The release is ready when a developer can configure Demo and run:
 
 ```bash
 hum demo all-services doctor
@@ -597,12 +531,11 @@ hum demo all-services status
 hum demo all-services tui
 ```
 
-Chiudere la TUI lascia i servizi attivi. In seguito:
+Closing the TUI leaves services running. Later:
 
 ```bash
 hum demo all-services logs api --follow
 hum demo all-services stop
 ```
 
-Lo stesso modello deve essere applicabile a un secondo progetto aggiungendo una
-sola entry al registry globale e un file `hum.yaml` versionabile.
+The same model applies to additional projects by adding a single entry to the global registry and a versioned `hum.yaml`.
