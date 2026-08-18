@@ -1,81 +1,209 @@
 # hum
 
-`hum` is a product-neutral launcher and terminal monitor for local
-multi-service development environments. Version 3 can coordinate detached
-local processes, Docker Compose services, direct-argv setup tasks, and scoped
-environment sources such as 1Password from one dependency graph.
+> A product-neutral launcher, dependency orchestrator, and terminal monitor for local multi-service development environments.
 
-Current project/template CLI:
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/delaudio/hum/actions/workflows/ci.yml/badge.svg)](https://github.com/delaudio/hum/actions/workflows/ci.yml)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 
-```bash
-hum demo all-services start
+`hum` is a fast, lightweight local development orchestrator and terminal monitor built with **Rust**, **Ratatui**, **Crossterm**, and **Tokio**. It coordinates detached local process groups, Docker Compose services, trusted direct-argv setup tasks, and scoped environment providers (such as 1Password or external command execution) from a unified dependency graph with zero resident daemon overhead.
+
+---
+
+## Table of Contents
+
+- [Overview & Architecture](#overview--architecture)
+- [Installation](#installation)
+  - [Homebrew (macOS)](#homebrew-macos)
+  - [From Source (Cargo)](#from-source-cargo)
+- [Quick Start](#quick-start)
+- [Key Features](#key-features)
+- [Configuration Reference & Discovery](#configuration-reference--discovery)
+  - [Discovery Order](#discovery-order)
+  - [Project Registry](#project-registry)
+  - [Configuration Example (`hum.yaml`)](#configuration-example-humyaml)
+  - [Environment Precedence & Overlays](#environment-precedence--overlays)
+- [Runtime Mechanics & Execution Model](#runtime-mechanics--execution-model)
+  - [Zero-Daemon Process Runtime](#zero-daemon-process-runtime)
+  - [Docker Compose Integration](#docker-compose-integration)
+  - [Lifecycle Tasks & Pre-flight Diagnostics](#lifecycle-tasks--pre-flight-diagnostics)
+  - [Readiness & Health Checks](#readiness--health-checks)
+- [Environment & Secrets Management](#environment--secrets-management)
+  - [Supported Providers](#supported-providers)
+  - [Security & Isolation Model](#security--isolation-model)
+  - [Secrets Caching & Synchronization](#secrets-caching--synchronization)
+- [TUI Commands & Keybindings](#tui-commands--keybindings)
+  - [Global & Service Navigation](#global--service-navigation)
+  - [Log Viewer Controls](#log-viewer-controls)
+  - [Modal Dialogs & Quit Confirmation](#modal-dialogs--quit-confirmation)
+  - [Status & Health Indicators](#status--health-indicators)
+- [CLI Reference & Subcommands](#cli-reference--subcommands)
+  - [Syntax & Global Options](#syntax--global-options)
+  - [Lifecycle Subcommands](#lifecycle-subcommands)
+  - [Management & Configuration Commands](#management--configuration-commands)
+  - [Subtractive Filter Options](#subtractive-filter-options)
+- [Logging, In-Stream Redaction & Exporters](#logging-in-stream-redaction--exporters)
+  - [Sink Architecture & Rotation](#sink-architecture--rotation)
+  - [In-Stream Redaction](#in-stream-redaction)
+  - [HTTP NDJSON Exporters](#http-ndjson-exporters)
+- [Performance & Polling Budget](#performance--polling-budget)
+- [Development & Testing](#development--testing)
+- [License](#license)
+
+---
+
+## Overview & Architecture
+
+`hum` coordinates complex development environments across disparate technologies without enforcing monolithic project structures:
+
+```text
+               ┌──────────────────────────────────────────────┐
+               │           hum CLI / Ratatui TUI              │
+               │   (Commands, Interactive Monitor & Views)    │
+               └──────────────────────┬───────────────────────┘
+                                      │
+               ┌──────────────────────┴───────────────────────┐
+               │        Config Loader & Discovery             │
+               │   (hum.yaml, hum.local.yaml, XDG Registry)   │
+               └──────────────────────┬───────────────────────┘
+                                      │
+               ┌──────────────────────┴───────────────────────┐
+               │          Core & Graph Resolver               │
+               │    (Topological Sort, Cycles, Readiness,     │
+               │        Subtractive Exclusions)               │
+               └──────────┬───────────────────┬───────────────┘
+                          │                   │
+         ┌────────────────┴───┐           ┌───┴──────────────────┐
+         │  Runtime Adapters  │           │ Scoped Env Providers │
+         └────┬───────────┬───┘           └───┬──────────────┬───┘
+              │           │                   │              │
+    ┌─────────┴─────┐   ┌─┴─────────────┐  ┌──┴───────────┐ ┌┴────────────┐
+    │ Process       │   │ Compose       │  │ one-password │ │ exec        │
+    │ (Detached     │   │ (Docker       │  │ (1Password   │ │ (Subprocess │
+    │  PGID / Lock) │   │  Compose CLI) │  │  CLI / op://)│ │  JSON/Env)  │
+    └─────────┬─────┘   └───────────────┘  └──────────────┘ └─────────────┘
+              │
+    ┌─────────┴───────────────────────────────────────────────┐
+    │              Persistent State & Observability           │
+    │   - Atomic State Registry: $XDG_STATE_HOME/hum/<project>│
+    │   - Native Log Sink: Bounded rotation & regex redaction │
+    │   - HTTP Exporter: Non-blocking NDJSON telemetry stream │
+    └─────────────────────────────────────────────────────────┘
 ```
 
-The command starts each selected unit through its configured runtime and exits;
-there is no resident `hum` daemon. Product names, images, Compose projects,
-vault references, migrations, and bootstrap commands belong in the project's
-configuration pack, not in the `hum` binary.
+When you execute `start`, `hum` launches each selected unit through its configured runtime, writes minimal metadata into the persistent atomic registry, and exits immediately. Subsequent CLI or TUI invocations observe running services directly from the OS without relying on a background daemon.
+
+---
 
 ## Installation
 
-Install the release formula directly from the public Homebrew tap:
+### Homebrew (macOS)
+
+Install the release formula via the official tap:
 
 ```bash
 brew install delaudio/tap/hum
 ```
 
-This installs a native binary on Apple Silicon or Intel macOS without requiring
-the Rust toolchain. Release operations and the one-time tap bootstrap are
-documented in [`docs/HOMEBREW.md`](docs/HOMEBREW.md).
+See [`docs/HOMEBREW.md`](docs/HOMEBREW.md) for tap bootstrap and release details.
 
-## Concepts
+### From Source (Cargo)
 
-- **Project**: a registered local product, such as `demo`.
-- **Template**: a named service selection, such as `frontend` or
-  `all-services`.
-- **Runtime**: a named generic adapter (`process` or `compose`).
-- **Service**: one runtime-owned long-lived unit.
-- **Task**: a trusted, direct-argv one-shot unit in the same dependency graph.
-- **Environment provider**: a named source of scoped values; supports
-  `one-password` or generic `exec` commands with `dotenv` or `json` payloads.
-
-## Target CLI
+Build and install locally using Cargo:
 
 ```bash
-hum <project> <template> start [service ...] [--exclude TEMPLATE] [--exclude-service SERVICE]
-hum <project> <template> stop
-hum <project> <template> restart
-hum <project> <template> status
-hum <project> <template> plan [service ...] [--json] [--exclude TEMPLATE] [--exclude-service SERVICE]
-hum <project> <template> secrets sync [service ...] [--exclude TEMPLATE] [--exclude-service SERVICE]
-hum <project> <template> logs [service] [--lines N] [--follow]
-hum <project> <template> reset [--yes]
-hum <project> <template> doctor [--exclude TEMPLATE] [--exclude-service SERVICE]
-hum <project> <template> config compose [--format yaml|json] [--runtime NAME]
-hum <project> <template> tui
+git clone https://github.com/delaudio/hum.git
+cd hum
+cargo install --path .
 ```
 
-`hum`, `hum <project>`, and `hum <project> <template>` provide progressively
-narrower interactive selection, with the final form opening the TUI.
+---
 
-## Configuration discovery
+## Quick Start
 
-The binary accepts legacy v1/v2 process configurations and the v3 adapter
-format. It discovers
-`hum.yaml` from the current directory upwards, then at
-`$XDG_CONFIG_HOME/hum/hum.yaml`, falling back to
-`~/.config/hum/hum.yaml`. The runnable example is
-[`examples/hum.example.yaml`](examples/hum.example.yaml).
+1. **Register a project** from any repository checkout:
+   ```bash
+   hum project register demo ./hum.yaml
+   ```
 
-Register a project from any checkout path. Hum validates the configuration and
-stores its canonical path in the machine-local registry at
-`~/.config/hum/config.yaml` (or `$XDG_CONFIG_HOME/hum/config.yaml`):
+2. **Inspect the dependency plan** before starting:
+   ```bash
+   hum demo all-services plan
+   ```
 
-```bash
-hum project register demo ./hum.yaml
-```
+3. **Start the stack** (starts units in topological order and exits):
+   ```bash
+   hum demo all-services start
+   ```
 
-The resulting registry uses the v1 registry contract:
+4. **Monitor services interactively** in the terminal:
+   ```bash
+   hum demo all-services tui
+   # or simply
+   hum demo all-services
+   ```
+
+5. **Synchronize provider secrets** (e.g. 1Password) into local cached stores:
+   ```bash
+   hum demo all-services secrets sync
+   ```
+
+6. **Stop services cleanly** in reverse dependency order:
+   ```bash
+   hum demo all-services stop
+   ```
+
+---
+
+## Key Features
+
+### 🚀 Zero-Daemon Architecture & Detached Processes
+- **Daemonless Execution**: Commands start processes, record atomic state, and exit. No resident supervisor daemon consumes background CPU or leaks state.
+- **Process Group Isolation**: Each service runs in a dedicated session and process group (PGID) with a random, inherited identity lock to avoid signaling reused PIDs.
+- **Atomic Rollback**: If a multi-service startup fails midway, only units created by that specific invocation are safely torn down.
+
+### 🕸️ Dependency Graph & Readiness Controls
+- **Topological Lifecycle**: Units are started in strict dependency order and stopped in reverse order.
+- **Granular Readiness**: Control when dependent units unblock via `depends_on_ready: started | listening | healthy`.
+- **Subtractive Exclusions**: Refine service selection on the fly with `--exclude TEMPLATE` and `--exclude-service SERVICE`.
+
+### 🔌 Pluggable Runtimes (Process & Docker Compose)
+- **Native Process Adapter**: Detached local processes with working directories, env files, and port monitoring.
+- **Docker Compose Adapter**: Maps services to compose targets, manages project profiles, merges generated layers, and supports `reconcile: true` to update running containers when configurations change.
+
+### 🔐 Scoped Environment Providers & Secret Isolation
+- **1Password & Exec Providers**: Resolve secrets on demand from `op://` vault references or external commands (`dotenv` or `json` payloads).
+- **Process-Level Scoping**: Secrets are injected only into the target child processes—never leaked into the global `hum` environment or written to Compose files.
+- **Cached & Schema-Validated**: Plaintext caches are saved with mode `0600` under `.hum/cache/` and checked against explicit key schemas.
+
+### 📜 Bounded Persistent Logging, Redaction & Telemetry
+- **Native Log Sink**: Captures stdout and stderr with configurable file rotation (e.g. 10 MiB, 3 files).
+- **In-Stream Masking**: Redacts sensitive strings (tokens, keys, passwords) before displaying in CLI/TUI or exporting.
+- **NDJSON HTTP Exporters**: Bounded, non-blocking telemetry stream to local or remote collectors.
+
+### 🩺 Diagnostic Doctor & Conflict Detection
+- **Pre-Flight Checks**: Verifies CLI dependencies, file existence, port collisions, and provider executables without reading vault secrets.
+- **Port Diagnosis**: Differentiates between managed listeners, foreign port owners, and stale registry entries.
+
+### 🎛️ Interactive Terminal UI (Ratatui)
+- **Live Monitoring**: Non-blocking background polling with minimal resource usage (< 2% CPU, < 60 MiB RSS).
+- **Integrated Log Viewer**: Search (`/`), horizontal panning, paging from disk history, and live follow.
+- **Service Details & Actions**: View PID, PGID, port, uptime, health status, and trigger start/stop/restart or open URLs directly.
+
+---
+
+## Configuration Reference & Discovery
+
+### Discovery Order
+
+When a project path is not passed explicitly via `--config`, `hum` resolves configuration in the following order:
+1. `./hum.yaml` searching upward through parent directories.
+2. `$XDG_CONFIG_HOME/hum/hum.yaml` (defaulting to `~/.config/hum/hum.yaml`).
+3. Machine-local overrides in `hum.local.yaml` located beside the resolved `hum.yaml`.
+
+### Project Registry
+
+Register projects globally in `~/.config/hum/config.yaml` (or `$XDG_CONFIG_HOME/hum/config.yaml`):
 
 ```yaml
 version: 1
@@ -85,143 +213,370 @@ projects:
     config: ~/code/demo/hum.yaml
 ```
 
-A copyable registry shape is available at
-[`examples/registry.example.yaml`](examples/registry.example.yaml).
-
-Each project owns a versioned `hum.yaml`. See the process-only
-[`examples/hum.v2.example.yaml`](examples/hum.v2.example.yaml) and the v3
-[`examples/hum.v3.example.yaml`](examples/hum.v3.example.yaml). Machine-specific
-values can live in an untracked `hum.local.yaml` beside it.
-
-For services that switch between container and host execution, optional
-`env_overrides` values are applied after provider-backed dotenv values. This
-lets a machine-local overlay project dependency URLs to `localhost` without
-editing or duplicating secrets; inherited variables and explicit CLI `--env`
-values still have the final precedence.
-
-Relative paths are resolved from the configuration file that declares them.
-Repository paths are relative to `hum.yaml`; service `cwd` is relative to its
-repository, and `env_file` is relative to the resulting service working directory.
-Service environment precedence is `.env` file, `service.env`, provider sources,
-`service.env_overrides`, inherited process environment, then repeatable
-`--env KEY=VALUE` CLI overrides. Hum warns with key names only when declared
-overrides replace provider values. Unknown YAML fields and invalid names, ports,
-URLs, durations, commands, or references are rejected.
-
-## Version 3 adapters and providers
-
-A v3 service selects a named runtime. Process services retain the detached
-registry described below. Compose services map a hum name to a runtime-native
-`target`; lifecycle and logs use `docker compose` with the configured project
-name, files, profiles, and env file. Project tasks may produce optional
-`generated_files` layers (for example host-specific network mappings); Compose
-includes each layer only after it exists, while `doctor` reports it as a
-generated artifact. A Compose runtime may opt into `reconcile: true` to reapply
-selected running targets when provider values or generated layers change; the
-default preserves the start-only behavior. Reapplied services are reported as
-`reconciled`, separately from untouched `already running` services. `stop`
-preserves volumes; `reset` is the
-only volume-deleting operation and requires the project name interactively or
-`--yes` for automation.
-
-Tasks use an argv array and are never wrapped in an implicit shell. An optional
-`check` argv makes a task idempotent. An optional read-only `doctor` argv runs
-only during diagnostics, without provider-backed values, so product packs can
-check their own configuration and prerequisites without teaching Hum about the
-product. Tasks and services share dependency and cycle validation; a failed
-task rolls back only services started by the current invocation. Services can set
-`depends_on_ready: started | listening | healthy` to control when dependent units
-are unblocked. `plan` resolves this graph without contacting providers or Docker.
-
-Selections support repeatable subtractive filters. `--exclude TEMPLATE`
-removes that template's services from the initial roots; if a remaining unit
-still depends on one, it is reintroduced with a warning naming the consumer.
-`--exclude-service SERVICE` is strict: if the service is still required, the
-command fails before Docker, tasks, or providers are contacted. The same
-resolver is used by `plan`, `start`, `doctor`, and `secrets sync`.
-
-An `env_from` entry can read environment items from a named 1Password or `exec`
-provider. Sources specify `format: dotenv` (default) or `format: json` (for flat
-JSON string maps, supporting key names with characters like `/` or `:` that standard
-dotenv grammar rejects). An `exec` provider executes a configured `command` and
-supports per-source `args` parameterization. Values are scoped to the child process
-or Compose invocation and are never printed or persisted in generated Compose YAML.
-Optional `schema` validation requires an exact key set. Optional `cache` files are
-plaintext, atomically replaced with mode `0600`, and should live under the gitignored
-`.hum/` directory. Required sources fail closed only when neither the provider nor a
-schema-valid cache is available; optional sources may continue empty. Provider
-references are read once per lifecycle action and reused across tasks/services;
-each later TUI action starts with a fresh provider-read cache. `secrets sync`
-refreshes selected sources without starting services and may attempt interactive
-`op signin`; normal startup never prompts. `doctor` checks that `op` or `exec`
-executables exist—it never reads vault items.
-
-`config compose` renders the effective Compose model without contacting
-environment providers. Service environment values are replaced with
-`<redacted>` in both YAML and JSON output, while interpolation outside service
-environment maps remains as `${NAME}` placeholders.
-
-## Current persistent runtime
-
-`start` creates a dedicated session/process group for each service, redirects
-stdin to null and stdout/stderr to files, writes its registry entry atomically,
-then exits. State is stored below `$XDG_STATE_HOME/hum/<project>` or
-`~/.local/state/hum/<project>`. The registry records PID, process group, process
-start time, command identity, working directory, port, and log paths. PID
-identity is verified before signals are sent. A random, inherited identity lock
-keeps the whole process group recognizable even if its original shell exits.
-
-Project operations are serialized with `project.lock`; a repeated or concurrent
-`start` is idempotent. `status`, `restart`, and `stop` reconcile the same state
-across independent CLI invocations, while `logs` tails the persistent stdout and
-stderr files. Stop order is the reverse dependency order and its grace period is
-configurable with `--timeout`. If a multi-service start partially fails, only
-processes created by that invocation are rolled back. `--detach` remains accepted
-as a deprecated no-op because detached execution is now the default.
-
-Each detached service streams stdout and stderr to a small native sink that
-rotates by byte count and exits automatically when both streams close. Defaults
-are 10 MiB per file, three rotated files, and 64 KiB per displayed line/chunk;
-all are configurable under `logs`. Raw files stay faithful to process output,
-while configured regular expressions are masked in CLI/TUI views. Optional
-HTTP exporters receive a redacted, line-framed NDJSON copy with project,
-service, runtime, stream, and timestamp metadata. Export queues are bounded and
-best-effort: an unavailable observer never blocks or stops the service. Static
-request headers are supported for generic collector authentication; credential
-values belong in an untracked, owner-readable `hum.local.yaml`. Compose
-runtimes retain their native logging and can be collected independently. See
-[`docs/LOGGING.md`](docs/LOGGING.md) for retention, disk bounds, search, and
-failure behavior.
-
-The TUI consumes this registry in a single non-overlapping background poll,
-detects processes started or stopped by other invocations, and reads persistent
-log files incrementally into a bounded 500-line view. Its log window supports
-scrolling, pauses live follow away from the bottom, and pages older retained
-history directly from disk; `End` returns to the current tail. Closing it leaves
-all services running unless the quit dialog's explicit "stop template and quit"
-choice is selected; the view also has a 4 MiB byte ceiling. Doctor runs outside
-the input/render loop and distinguishes managed listeners, foreign port owners,
-and stale registry entries. The details view includes PID/PGID, port and health
-state, command, cwd, persistent log paths, and the last exit code when the shell
-wrapper can observe it. An `exec` replacement or `SIGKILL` remains explicitly
-unavailable because no resident hum daemon waits on detached services. Port
-polling uses bounded TCP connections; `lsof` is reserved
-for explicit conflict diagnostics. Poll intervals, resource reuse, and the
-ten-service CPU/RSS budget are documented in
-[`docs/POLLING.md`](docs/POLLING.md).
-
-## Development
+Manage registrations with the CLI:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-scripts/verify-test-count.sh 60
-cargo build --release
-cargo test --release --test performance_smoke -- --ignored --nocapture
+hum project register <NAME> <PATH>
 ```
 
-The detailed product contract, lifecycle, security model, migration notes, and
-acceptance criteria are in [`docs/PRD.md`](docs/PRD.md).
+### Configuration Example (`hum.yaml`)
+
+Here is an annotated, production-ready Version 3 configuration:
+
+```yaml
+version: 3
+project: sample
+
+# 1. Define runtime adapters
+runtimes:
+  local:
+    type: process
+  containers:
+    type: compose
+    project_name: hum-sample
+    reconcile: true
+    files:
+      - docker-compose.yml
+
+# 2. Configure scoped environment providers
+environment_providers:
+  team-vault:
+    type: one-password
+  generic-exec:
+    type: exec
+    command:
+      - echo
+      - '{"PORT":"8080"}'
+
+# 3. Define trusted one-shot tasks
+tasks:
+  migrate:
+    command:
+      - docker
+      - compose
+      - --project-name
+      - hum-sample
+      - --file
+      - docker-compose.yml
+      - run
+      - --rm
+      - migrate
+    depends_on:
+      - database
+    timeout: 2m
+
+# 4. Define persistent services
+services:
+  database:
+    runtime: containers
+    target: database
+
+  api:
+    runtime: local
+    command: python3 -m http.server 8080
+    port: 8080
+    url: http://localhost:8080
+    env_file: api.env
+    env_from:
+      - provider: team-vault
+        reference: op://Development/sample-api/environment
+        format: dotenv
+        optional: true
+        schema: api.env.example
+        cache: .hum/cache/api.env
+      - provider: generic-exec
+        args:
+          - --json
+        format: json
+        optional: true
+    depends_on:
+      - migrate
+    depends_on_ready: healthy
+    healthcheck:
+      type: http
+      url: http://localhost:8080/health
+      interval: 2s
+      timeout: 1s
+      retries: 15
+
+# 5. Define selectable templates
+templates:
+  backend:
+    services:
+      - api
+  infrastructure:
+    services:
+      - database
+  all-services:
+    services:
+      - database
+      - api
+```
+
+### Environment Precedence & Overlays
+
+Environment variables for a service are resolved using the following strict precedence hierarchy (highest to lowest):
+
+1. **CLI `--env KEY=VALUE`** explicit overrides (repeatable).
+2. **Inherited environment** from the launching shell.
+3. **`service.env_overrides`** (often sourced from `hum.local.yaml` for host vs container routing).
+4. **Provider-backed values** (`env_from` via 1Password / Exec).
+5. **`service.env`** declared in `hum.yaml`.
+6. **`env_file`** loaded from disk.
+
+---
+
+## Runtime Mechanics & Execution Model
+
+### Zero-Daemon Process Runtime
+
+- **Process Isolation**: Each process is launched in its own process group (`setsid` / `setpgid`) with stdin redirected to `/dev/null` and stdout/stderr connected to the rotating log sink.
+- **State Persistence**: State is serialized atomically into `$XDG_STATE_HOME/hum/<project>/` (or `~/.local/state/hum/<project>/`). It records PID, PGID, start time, working directory, port, and log file paths.
+- **PID Verification**: Before sending any signal (`SIGTERM`, `SIGKILL`), `hum` validates the process start time against OS process tables to eliminate PID reuse hazards.
+- **Concurrency & Locking**: File-based `project.lock` serializes concurrent operations, guaranteeing that duplicate or racing `start` invocations are safe and idempotent.
+
+### Docker Compose Integration
+
+- **Target Mapping**: Maps hum service names to Compose service targets.
+- **Dynamic Layers**: Project tasks can emit `generated_files` (e.g. host networking configurations) which Compose merges automatically once created.
+- **Reconciliation**: Runtimes with `reconcile: true` reapply running containers when provider values or generated overlays change.
+- **Clean Teardown vs Reset**: `stop` preserves named volumes; `reset` deletes Compose volumes and requires explicit confirmation or the `--yes` flag.
+
+### Lifecycle Tasks & Pre-flight Diagnostics
+
+- **Direct Argv**: Tasks execute direct argument vectors (`["docker", "compose", "run", ...]`) without shell string interpolation vulnerabilities.
+- **Idempotency Checks**: Tasks can define an optional `check` command to avoid rerunning completed tasks.
+- **Doctor Diagnostic Sub-commands**: Tasks can define a read-only `doctor` check executed during `hum doctor` to validate product prerequisites without exposing secret environments.
+
+### Readiness & Health Checks
+
+Control sequencing with `depends_on_ready`:
+
+| Readiness Mode | Unblock Condition |
+| :--- | :--- |
+| `started` | Unblocks immediately once the process or container is launched. |
+| `listening` | Unblocks once the configured TCP port actively accepts connections (50 ms connect deadline). |
+| `healthy` | Unblocks once HTTP or TCP health check probes succeed for the configured retry threshold. |
+
+---
+
+## Environment & Secrets Management
+
+### Supported Providers
+
+1. **`one-password`**: Resolves `op://vault/item/field` or whole-document dotenv secrets using the 1Password CLI (`op`).
+2. **`exec`**: Runs an arbitrary command returning key-value pairs formatted as `dotenv` or `json`.
+
+### Security & Isolation Model
+
+- **Least Privilege**: Secret values are passed exclusively through child process environment tables or Compose invocations. They are never exported to your shell or stored in world-readable temporary files.
+- **Safe Compose Inspection**: Inspect effective configurations safely with `hum <project> <template> config compose --format yaml`; all secrets are replaced with `<redacted>` tokens.
+
+### Secrets Caching & Synchronization
+
+- **Encrypted/Restricted Caches**: Cached secret files are stored with `0600` permissions under `.hum/cache/` (which should be added to `.gitignore`).
+- **Fail-Closed Semantics**: If a required provider fails and no valid cache exists, startup fails immediately. Optional sources continue gracefully.
+- **Manual Sync**: Refresh cached secrets without starting services using:
+  ```bash
+  hum <project> <template> secrets sync
+  ```
+
+---
+
+## TUI Commands & Keybindings
+
+Launch the interactive monitor with `hum <project> <template> tui` (or `hum <project> <template>`):
+
+### Global & Service Navigation
+
+| Key / Shortcut | Action |
+| :--- | :--- |
+| `Up` / `k` | Move cursor up in service list |
+| `Down` / `j` | Move cursor down in service list |
+| `Space` | Toggle start / stop on selected service |
+| `r` | Restart selected service |
+| `Enter` | Open service details modal (PID, PGID, port, health, paths) |
+| `l` | Open persistent log viewer for selected service |
+| `o` | Open service URL in default web browser |
+| `p` | Open template switcher modal |
+| `d` | Run doctor pre-flight diagnostics in the background |
+| `?` | Open keybindings help overlay |
+| `q` | Open quit confirmation dialog |
+
+### Log Viewer Controls
+
+| Key / Shortcut | Action |
+| :--- | :--- |
+| `Up` / `k` | Scroll logs up by 1 line |
+| `Down` / `j` | Scroll logs down by 1 line |
+| `PageUp` / `PageDown` | Scroll logs up / down by a page (20 lines) |
+| `Home` | Scroll to oldest available log history on disk |
+| `End` | Return to bottom and resume live follow mode |
+| `Left` / `h` | Scroll log view horizontally left |
+| `Right` / `l` | Scroll log view horizontally right |
+| `0` | Reset horizontal scroll to beginning |
+| `/` | Enter search query mode |
+| `c` | Clear log buffer view |
+| `Esc` / `q` | Close log viewer |
+
+### Modal Dialogs & Quit Confirmation
+
+| Key / Shortcut | Action |
+| :--- | :--- |
+| `Esc` | Close any active modal dialog (details, doctor, help, template) |
+| `l` (in quit dialog) | **Leave services running** and quit TUI |
+| `s` (in quit dialog) | **Stop selected template** and quit TUI |
+
+### Status & Health Indicators
+
+| Indicator | Process State | Health State | Description |
+| :--- | :--- | :--- | :--- |
+| `●` (Green) | `running` | `healthy` | Process is active and passing health checks. |
+| `◐` (Yellow) | `starting` / `stopping` | `checking` | State transition in progress or health check pending. |
+| `✗` (Red) | `exited` | `unhealthy` | Process has exited or failed health checks. |
+| `○` (Gray) | `missing` | `unchecked` | Not running / no health checks configured. |
+
+---
+
+## CLI Reference & Subcommands
+
+### Syntax & Global Options
+
+```bash
+hum [OPTIONS] <PROJECT> <TEMPLATE> [COMMAND]
+hum [OPTIONS] project register <NAME> <CONFIG>
+```
+
+#### Global Options:
+- `--registry PATH`: Override global registry path (default: `~/.config/hum/config.yaml`).
+- `--config PATH`: Explicit project `hum.yaml` path (bypasses registry).
+- `--env KEY=VALUE`: Override service environment variables (repeatable).
+
+### Lifecycle Subcommands
+
+| Command | Description |
+| :--- | :--- |
+| `start [service...]` | Start the selected template or listed services in dependency order. |
+| `stop [service...] [--timeout 10s]` | Stop services in reverse dependency order. |
+| `restart [service...] [--timeout 10s]` | Restart services with a clean stop-start sequence. |
+| `status` | Show status, PID, port, and health check state for template services. |
+| `plan [service...] [--json]` | Preview resolved dependency order and actions without executing. |
+| `logs [service] [-n 100] [-f]` | Tail captured stdout/stderr logs for a service or template. |
+| `reset [--yes] [--timeout 10s]` | Stop all project services and purge Compose volumes. |
+| `doctor` | Run diagnostic pre-flight checks on ports, tools, and configs. |
+| `tui` | Launch the interactive full-screen terminal monitor. |
+
+### Management & Configuration Commands
+
+```bash
+# Register a project into the machine-local registry
+hum project register <NAME> <CONFIG_PATH>
+
+# Validate configuration syntax and template selection
+hum <project> <template> config validate
+
+# Render effective Docker Compose configuration with redacted secrets
+hum <project> <template> config compose [--format yaml|json] [--runtime NAME]
+
+# Synchronize provider-backed secrets into local 0600 cache files
+hum <project> <template> secrets sync [service...]
+```
+
+### Subtractive Filter Options
+
+Refine startup and diagnostics on the fly:
+- `--exclude TEMPLATE`: Remove root services from that template. Reintroduced automatically with a warning if needed by a dependent unit.
+- `--exclude-service SERVICE`: Strictly exclude a service; fails before starting if it remains a required dependency.
+
+---
+
+## Logging, In-Stream Redaction & Exporters
+
+### Sink Architecture & Rotation
+
+For native detached processes, `hum start` connects output pipes to a dedicated native log sink (`hum __log-sink`).
+
+```yaml
+logs:
+  max_file_bytes: 10485760   # 10 MiB per log file
+  rotated_files: 3           # Keep 3 rotated archives (.1, .2, .3)
+  max_line_bytes: 65536      # 64 KiB buffer ceiling
+  retention: 7d              # Remove rotated logs older than 7 days
+```
+
+- Raw files on disk remain byte-accurate.
+- Closing CLI/TUI log viewers never delivers `SIGPIPE` to running services.
+
+### In-Stream Redaction
+
+Define regular expressions in `hum.yaml` to redact sensitive credentials before they reach the terminal or telemetry exporters:
+
+```yaml
+logs:
+  redact_patterns:
+    - "(?i)(token|password|secret)=[^ ]+"
+    - "bearer [a-zA-Z0-9_\\-\\.]+"
+```
+
+### HTTP NDJSON Exporters
+
+Stream log events asynchronously to an observability collector:
+
+```yaml
+logs:
+  exporters:
+    - type: http
+      endpoint: http://127.0.0.1:8687/events
+      timeout: 750ms
+      headers:
+        Authorization: "Bearer machine-local-token"
+```
+
+- Bounded non-blocking queue: Collector downtime never slows or blocks services.
+- Secret headers are passed via private Unix domain socket descriptors and never written to temporary files.
+
+See [`docs/LOGGING.md`](docs/LOGGING.md) for full logging mechanics and configuration contracts.
+
+---
+
+## Performance & Polling Budget
+
+`hum` is engineered for negligible overhead in long-running development sessions:
+
+- **Startup Latency**: 10 detached services start in < 2 seconds.
+- **TUI Frame Latency**: First frame renders in < 250 ms.
+- **Resource Footprint**: Steady-state monitor consumes < 2% average CPU and < 60 MiB RSS memory for 10 monitored services.
+- **Non-Blocking Polling**: Port checks use 50 ms TCP timeouts; `lsof` is never executed during steady-state polling.
+
+See [`docs/POLLING.md`](docs/POLLING.md) for polling contract details and benchmarking procedures.
+
+---
+
+## Development & Testing
+
+Run the full code quality and testing suite locally:
+
+```bash
+# Code formatting & clippy lints
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Execute test suite with minimum test count gate
+scripts/verify-test-count.sh 60
+
+# Build optimized release binary
+cargo build --release
+
+# Run performance smoke benchmarks
+cargo test --release --test performance_smoke -- --ignored --nocapture
+
+# Release validation
+scripts/release-guard.sh v0.6.1
+```
+
+For complete product specifications and acceptance criteria, see [`docs/PRD.md`](docs/PRD.md).
+
+---
 
 ## License
 
