@@ -201,6 +201,52 @@ When a project path is not passed explicitly via `--config`, `hum` resolves conf
 2. `$XDG_CONFIG_HOME/hum/hum.yaml` (defaulting to `~/.config/hum/hum.yaml`).
 3. Machine-local overrides in `hum.local.yaml` located beside the resolved `hum.yaml`.
 
+### Versioned Configuration Imports
+
+Large version 3 projects can split committed configuration into explicit YAML
+fragments. Declare each fragment once in the main `hum.yaml`:
+
+```yaml
+version: 3
+project: demo
+
+imports:
+  - hum/core.yaml
+  - hum/services/api.yaml
+  - hum/templates.yaml
+```
+
+Imported files use the same top-level sections as `hum.yaml`, but must not
+declare `version`, `project`, or another `imports` list. Paths are relative to
+the directory containing the main configuration and must stay below it. Hum
+loads fragments in declaration order, rejects duplicate paths and duplicate
+named repositories, runtimes, providers, services, tasks, templates, or profiles, then
+applies the optional machine-local `hum.local.yaml` override and validates the
+complete configuration. All runtime paths remain relative to the main
+`hum.yaml`, regardless of which fragment declares them.
+
+For example, `hum/services/api.yaml` can colocate the service with its startup
+task and focused template:
+
+```yaml
+tasks:
+  prepare-api:
+    command: ["./scripts/prepare-api.sh"]
+
+services:
+  api:
+    runtime: local
+    command: npm run dev
+    depends_on: [prepare-api]
+
+templates:
+  api:
+    services: [api]
+```
+
+Keep secrets and machine-specific paths in `hum.local.yaml`; imports are for
+portable, versioned project configuration.
+
 ### Project Registry
 
 Register projects globally in `~/.config/hum/config.yaml` (or `$XDG_CONFIG_HOME/hum/config.yaml`):
@@ -571,7 +617,7 @@ cargo build --release
 cargo test --release --test performance_smoke -- --ignored --nocapture
 
 # Release validation
-scripts/release-guard.sh v0.6.1
+scripts/release-guard.sh v0.6.2
 ```
 
 For complete product specifications and acceptance criteria, see [`docs/PRD.md`](docs/PRD.md).

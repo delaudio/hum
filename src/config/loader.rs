@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::error::ConfigError;
 use super::model::Config;
@@ -87,10 +87,76 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded, ConfigError> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let (base_value, base_source) = read_yaml(&base_path)?;
-    yaml_serde::from_value::<Config>(base_value.clone()).map_err(|error| {
-        ConfigError::from_yaml_with_source(base_path.clone(), error, &base_source)
-    })?;
+    let (mut base_value, base_source) = read_yaml(&base_path)?;
+    let import_paths = take_imports(&mut base_value, &base_path, &base_source)?;
+    validate_partial_schema(&base_value, &base_path, &base_source)?;
+
+    let mut imported_fields = Vec::new();
+    let canonical_root = if import_paths.is_empty() {
+        None
+    } else {
+        Some(
+            fs::canonicalize(&root_dir).map_err(|source| ConfigError::Io {
+                file: root_dir.clone(),
+                source,
+            })?,
+        )
+    };
+    let canonical_base = if import_paths.is_empty() {
+        None
+    } else {
+        Some(
+            fs::canonicalize(&base_path).map_err(|source| ConfigError::Io {
+                file: base_path.clone(),
+                source,
+            })?,
+        )
+    };
+    let mut canonical_imports = HashSet::new();
+    for relative_path in import_paths {
+        let requested_path = root_dir.join(&relative_path);
+        let import_path = fs::canonicalize(&requested_path).map_err(|source| ConfigError::Io {
+            file: requested_path,
+            source,
+        })?;
+        if !import_path.starts_with(canonical_root.as_ref().expect("imports have a root")) {
+            return Err(ConfigError::validation(
+                &base_path,
+                "imports",
+                format!(
+                    "import path `{}` resolves outside the main configuration directory",
+                    relative_path.display()
+                ),
+                "replace escaping symlinks with files located below the main hum.yaml",
+            ));
+        }
+        if canonical_base.as_ref() == Some(&import_path) {
+            return Err(ConfigError::validation(
+                &base_path,
+                "imports",
+                format!(
+                    "import path `{}` resolves to the main hum.yaml itself",
+                    relative_path.display()
+                ),
+                "remove the self-import from the main configuration",
+            ));
+        }
+        if !canonical_imports.insert(import_path.clone()) {
+            return Err(ConfigError::validation(
+                &base_path,
+                "imports",
+                format!(
+                    "import path `{}` resolves to the same file as an earlier import",
+                    relative_path.display()
+                ),
+                "list every canonical imported fragment exactly once",
+            ));
+        }
+        let (import_value, import_source) = read_yaml(&import_path)?;
+        validate_import_fragment(&import_value, &import_path, &import_source)?;
+        imported_fields.push((import_path.clone(), collect_leaf_paths(&import_value)));
+        strict_merge_import(&mut base_value, import_value, &import_path, "")?;
+    }
 
     let local_path = root_dir.join(LOCAL_CONFIG_FILE);
     let (merged_value, local_path_opt, local_source, local_fields) = if local_path.is_file() {
@@ -127,6 +193,19 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded, ConfigError> {
                 (&local_path_opt, &mut error)
             {
                 *file = local_path.clone();
+            }
+        } else if let ConfigError::Validation {
+            file,
+            field,
+            description,
+            ..
+        } = &mut error
+        {
+            if let Some((import_path, _)) = imported_fields
+                .iter()
+                .find(|(_, fields)| validation_touches_local_field(field, description, fields))
+            {
+                *file = import_path.clone();
             }
         }
         return Err(error);
@@ -208,6 +287,134 @@ fn read_yaml(path: &Path) -> Result<(yaml_serde::Value, String), ConfigError> {
     let value = yaml_serde::from_str(&contents)
         .map_err(|e| ConfigError::from_yaml(path.to_path_buf(), e))?;
     Ok((value, contents))
+}
+
+fn take_imports(
+    value: &mut yaml_serde::Value,
+    file: &Path,
+    source: &str,
+) -> Result<Vec<PathBuf>, ConfigError> {
+    let root = value.as_mapping_mut().ok_or_else(|| {
+        ConfigError::validation(
+            file,
+            "root",
+            "configuration root must be a YAML mapping",
+            "use key/value sections such as `services:` and `templates:`",
+        )
+    })?;
+    let Some(imports) = root.remove("imports") else {
+        return Ok(Vec::new());
+    };
+    if root.get("version").and_then(yaml_serde::Value::as_u64) != Some(3) {
+        return Err(ConfigError::validation(
+            file,
+            "imports",
+            "versioned configuration imports require configuration version 3",
+            "set `version: 3` in the main hum.yaml",
+        ));
+    }
+    let paths = yaml_serde::from_value::<Vec<PathBuf>>(imports)
+        .map_err(|error| ConfigError::from_yaml_with_source(file.to_path_buf(), error, source))?;
+    let mut seen = HashSet::new();
+    for path in &paths {
+        let valid = !path.as_os_str().is_empty()
+            && !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)));
+        if !valid {
+            return Err(ConfigError::validation(
+                file,
+                "imports",
+                format!(
+                    "import path `{}` must stay below the main configuration directory",
+                    path.display()
+                ),
+                "use a non-empty relative path without `.` or `..` components",
+            ));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(ConfigError::validation(
+                file,
+                "imports",
+                format!("duplicate import path `{}`", path.display()),
+                "list every imported fragment exactly once",
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+fn validate_import_fragment(
+    value: &yaml_serde::Value,
+    file: &Path,
+    source: &str,
+) -> Result<(), ConfigError> {
+    let root = mapping(value, file)?;
+    for forbidden in ["version", "project", "imports"] {
+        if root.contains_key(forbidden) {
+            return Err(ConfigError::validation(
+                file,
+                forbidden,
+                format!("`{forbidden}` is only allowed in the main hum.yaml"),
+                "remove it from the imported fragment",
+            ));
+        }
+    }
+    validate_partial_schema(value, file, source)
+}
+
+fn strict_merge_import(
+    base: &mut yaml_serde::Value,
+    imported: yaml_serde::Value,
+    file: &Path,
+    prefix: &str,
+) -> Result<(), ConfigError> {
+    use yaml_serde::Value;
+    match (base, imported) {
+        (Value::Mapping(base_map), Value::Mapping(imported_map)) => {
+            for (key, imported_value) in imported_map {
+                let key_name = key
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "<non-string-key>".to_string());
+                let field = if prefix.is_empty() {
+                    key_name
+                } else {
+                    format!("{prefix}.{key_name}")
+                };
+                if let Some(base_value) = base_map.get_mut(&key) {
+                    if matches!(
+                        prefix,
+                        "repositories"
+                            | "runtimes"
+                            | "environment_providers"
+                            | "services"
+                            | "tasks"
+                            | "templates"
+                            | "profiles"
+                    ) {
+                        return Err(ConfigError::validation(
+                            file,
+                            &field,
+                            "import duplicates a named definition from hum.yaml or an earlier fragment",
+                            "define every repository, runtime, provider, service, task, template, and profile in exactly one committed file",
+                        ));
+                    }
+                    strict_merge_import(base_value, imported_value, file, &field)?;
+                } else {
+                    base_map.insert(key, imported_value);
+                }
+            }
+            Ok(())
+        }
+        _ => Err(ConfigError::validation(
+            file,
+            prefix,
+            "import duplicates a value defined by hum.yaml or an earlier fragment",
+            "define each imported field exactly once; use hum.local.yaml only for machine-local overrides",
+        )),
+    }
 }
 
 fn validate_partial_schema(
@@ -584,6 +791,255 @@ templates:
 
         assert_eq!(merged["service"]["command"], "local");
         assert_eq!(merged["service"]["port"], 3000);
+    }
+
+    #[test]
+    fn imports_versioned_fragments_before_applying_local_overrides() {
+        let root = std::env::temp_dir().join(format!("hum-imports-{}", std::process::id()));
+        let fragments = root.join("hum/services");
+        fs::create_dir_all(&fragments).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let local = root.join(LOCAL_CONFIG_FILE);
+        let imported = fragments.join("api.yaml");
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports:\n  - hum/services/api.yaml\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+        fs::write(
+            &imported,
+            "tasks:\n  prepare-api:\n    command: [\"true\"]\nservices:\n  api:\n    runtime: local\n    command: run-api\n    port: 3000\n    depends_on: [prepare-api]\ntemplates:\n  api:\n    services: [api]\n",
+        )
+        .unwrap();
+        fs::write(&local, "services:\n  api:\n    port: 4100\n").unwrap();
+
+        let loaded = load(Some(&base)).unwrap();
+        assert_eq!(loaded.config.services["api"].port, Some(4100));
+        assert!(loaded.config.tasks.contains_key("prepare-api"));
+        assert_eq!(loaded.config.templates["api"].services, vec!["api"]);
+        assert_eq!(loaded.root_dir, root);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_overrides_can_complete_imported_definitions_before_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "hum-import-local-completion-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let local = root.join(LOCAL_CONFIG_FILE);
+        let imported = root.join("task.yaml");
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports: [task.yaml]\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+        fs::write(&imported, "tasks:\n  prepare:\n    timeout: 30s\n").unwrap();
+        fs::write(&local, "tasks:\n  prepare:\n    command: [\"true\"]\n").unwrap();
+
+        let loaded = load(Some(&base)).unwrap();
+        assert_eq!(loaded.config.tasks["prepare"].command, vec!["true"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_named_definitions_across_imports() {
+        let root =
+            std::env::temp_dir().join(format!("hum-import-collision-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let first = root.join("first.yaml");
+        let second = root.join("second.yaml");
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports: [first.yaml, second.yaml]\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+        fs::write(
+            &first,
+            "services:\n  api:\n    runtime: local\n    command: first\n",
+        )
+        .unwrap();
+        fs::write(&second, "services:\n  api:\n    port: 3000\n").unwrap();
+
+        let error = load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains(&second.display().to_string()), "{error}");
+        assert!(error.contains("services.api"), "{error}");
+        assert!(error.contains("duplicates a named definition"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imported_fragment_errors_are_attributed_to_the_fragment() {
+        let root = std::env::temp_dir().join(format!("hum-import-error-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let imported = root.join("service.yaml");
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports: [service.yaml]\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+        fs::write(
+            &imported,
+            "services:\n  api:\n    runtime: local\n    command: run\n    comand: typo\n",
+        )
+        .unwrap();
+
+        let error = load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains(&imported.display().to_string()), "{error}");
+        assert!(error.contains("line 5, column 5"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imported_semantic_validation_errors_are_attributed_to_the_fragment() {
+        let root =
+            std::env::temp_dir().join(format!("hum-import-validation-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let imported = root.join("service.yaml");
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports: [service.yaml]\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+        fs::write(
+            &imported,
+            "services:\n  api:\n    runtime: local\n    command: run\n    port: 0\ntemplates:\n  api:\n    services: [api]\n",
+        )
+        .unwrap();
+
+        let error = load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains(&imported.display().to_string()), "{error}");
+        assert!(error.contains("services.api.port"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imports_must_be_unique_relative_paths_and_fragments_cannot_redeclare_identity() {
+        for (name, imports, expected) in [
+            ("absolute", "[/tmp/service.yaml]", "must stay below"),
+            ("parent", "[../service.yaml]", "must stay below"),
+            (
+                "duplicate",
+                "[service.yaml, service.yaml]",
+                "duplicate import path",
+            ),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("hum-import-path-{name}-{}", std::process::id()));
+            fs::create_dir_all(&root).unwrap();
+            let base = root.join(CONFIG_FILE);
+            fs::write(
+                &base,
+                format!("version: 3\nproject: demo\nimports: {imports}\n"),
+            )
+            .unwrap();
+            let error = load(Some(&base)).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!("hum-import-identity-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let imported = root.join("service.yaml");
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports: [service.yaml]\n",
+        )
+        .unwrap();
+        fs::write(&imported, "project: nested\nservices: {}\n").unwrap();
+        let error = load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains(&imported.display().to_string()), "{error}");
+        assert!(
+            error.contains("only allowed in the main hum.yaml"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        let root = std::env::temp_dir().join(format!("hum-import-version-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        fs::write(&base, "version: 2\nproject: demo\nimports: not-a-list\n").unwrap();
+        let error = load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains("require configuration version 3"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imports_cannot_escape_the_configuration_directory_through_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let parent =
+            std::env::temp_dir().join(format!("hum-import-symlink-{}", std::process::id()));
+        let root = parent.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let outside = parent.join("outside.yaml");
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports: [service.yaml]\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+        fs::write(&outside, "services: {}\n").unwrap();
+        symlink(&outside, root.join("service.yaml")).unwrap();
+
+        let error = load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains("resolves outside"), "{error}");
+        assert!(error.contains("service.yaml"), "{error}");
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn imports_cannot_reference_the_main_configuration_itself() {
+        let root = std::env::temp_dir().join(format!("hum-import-self-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports: [hum.yaml]\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+
+        let error = load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains("main hum.yaml itself"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imports_cannot_alias_the_same_canonical_fragment() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("hum-import-alias-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join(CONFIG_FILE);
+        let fragment = root.join("service.yaml");
+        fs::write(
+            &base,
+            "version: 3\nproject: demo\nimports: [service.yaml, alias.yaml]\nruntimes:\n  local:\n    type: process\n",
+        )
+        .unwrap();
+        fs::write(&fragment, "services: {}\n").unwrap();
+        symlink(&fragment, root.join("alias.yaml")).unwrap();
+
+        let error = load(Some(&base)).unwrap_err().to_string();
+        assert!(error.contains("same file as an earlier import"), "{error}");
+        assert!(error.contains("alias.yaml"), "{error}");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

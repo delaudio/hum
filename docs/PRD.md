@@ -244,11 +244,17 @@ projects:
 
 ### 7.2 Project Configuration
 
-Shared file `hum.yaml`, with optional untracked override `hum.local.yaml`. Version 3 adds named runtimes, environment providers, tasks, and readiness controls:
+Shared file `hum.yaml`, with optional committed YAML fragments declared by an
+explicit `imports` list and an optional untracked override `hum.local.yaml`.
+Version 3 adds named runtimes, environment providers, tasks, and readiness
+controls:
 
 ```yaml
 version: 3
 project: demo
+
+imports:
+  - hum/additional-services.yaml
 
 runtimes:
   local:
@@ -309,13 +315,21 @@ templates:
       - frontend
 ```
 
-Relative paths resolve from the file declaring them, not from the working directory where `hum` is executed.
+Import paths must be unique, relative, and remain below the directory containing
+the main `hum.yaml`. Fragments may use the normal configuration sections but do
+not redeclare `version`, `project`, or `imports`. Named definitions may appear
+in exactly one committed file. Hum merges the fragments in declaration order,
+applies `hum.local.yaml` last, and validates the complete configuration.
+
+All relative runtime paths resolve from the directory containing the main
+`hum.yaml`, not from the fragment or the working directory where `hum` is
+executed.
 
 Precedence order:
 
 ```text
 defaults
-  < hum.yaml
+  < composed versioned config (hum.yaml + imports)
   < hum.local.yaml
   < environment
   < CLI arguments
