@@ -456,6 +456,7 @@ fn validate_v3_contract(config: &Config, file: &Path) -> Result<(), ConfigError>
     if config.version <= 2 {
         if !config.runtimes.is_empty()
             || !config.environment_providers.is_empty()
+            || config.switch_provider.is_some()
             || !config.tasks.is_empty()
         {
             return Err(ConfigError::validation(
@@ -557,6 +558,9 @@ fn validate_v3_contract(config: &Config, file: &Path) -> Result<(), ConfigError>
     }
 
     validate_environment_providers(config, file)?;
+    if let Some(provider) = &config.switch_provider {
+        validate_argv(file, "switch_provider.command", &provider.command)?;
+    }
 
     let mut compose_targets = HashSet::new();
     for (name, service) in &config.services {
@@ -974,7 +978,7 @@ mod tests {
     use super::*;
     use crate::config::{
         EnvironmentProviderConfig, EnvironmentSourceConfig, EnvironmentSourceFormat, RuntimeConfig,
-        ServiceConfig, TemplateConfig,
+        ServiceConfig, SwitchProviderConfig, TemplateConfig,
     };
 
     fn valid_config() -> Config {
@@ -1302,6 +1306,33 @@ mod tests {
             error.contains("argv must contain a non-empty executable"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn accepts_switch_provider_and_rejects_empty_command() {
+        let mut config = valid_v3_config();
+        config.switch_provider = Some(SwitchProviderConfig {
+            command: vec!["./scripts/runtime-switch".to_string()],
+        });
+        validate(&config, Path::new("hum.yaml")).unwrap();
+
+        config.switch_provider = Some(SwitchProviderConfig { command: vec![] });
+        let error = validate(&config, Path::new("hum.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("argv must contain a non-empty executable"),
+            "{error}"
+        );
+
+        let mut config = valid_config();
+        config.switch_provider = Some(SwitchProviderConfig {
+            command: vec!["runtime-switch".to_string()],
+        });
+        let error = validate(&config, Path::new("hum.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("require configuration version 3"), "{error}");
     }
 
     #[test]

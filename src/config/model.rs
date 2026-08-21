@@ -21,6 +21,10 @@ pub struct Config {
     /// obtained; service declarations only refer to a provider by name.
     #[serde(default)]
     pub environment_providers: HashMap<String, EnvironmentProviderConfig>,
+    /// Optional direct-argv adapter for product-owned runtime mode changes.
+    /// Hum owns the stable CLI while the project pack owns source checkout,
+    /// routing, and transition policy.
+    pub switch_provider: Option<SwitchProviderConfig>,
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
     #[serde(default)]
@@ -185,6 +189,14 @@ pub enum RuntimeConfig {
 pub enum EnvironmentProviderConfig {
     OnePassword { account: Option<String> },
     Exec { command: Vec<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchProviderConfig {
+    /// Direct argv. Hum appends MODE, service names, `--all`,
+    /// `--template NAME`, and `--no-start` as requested by the CLI.
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

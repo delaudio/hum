@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
@@ -20,6 +21,7 @@ pub const EXIT_HEALTHCHECK_FAILED: i32 = 8;
 pub const EXIT_DOCTOR_FAILED: i32 = 9;
 pub const EXIT_RUNTIME_INCOHERENT: i32 = 10;
 pub const EXIT_REGISTRY_IO: i32 = 11;
+pub const EXIT_SWITCH_FAILED: i32 = 12;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -86,6 +88,19 @@ pub enum Command {
         /// Grace period before SIGKILL during the stop phase
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         timeout: std::time::Duration,
+    },
+    /// Switch selected services between project-defined runtime modes
+    Switch {
+        /// Product-defined mode, for example `source`, `image`, or `status`
+        mode: String,
+        /// Services whose mode should change
+        services: Vec<String>,
+        /// Apply the mode to every service supported by the project adapter
+        #[arg(long, conflicts_with = "services")]
+        all: bool,
+        /// Persist the new mode without starting the selected template
+        #[arg(long)]
+        no_start: bool,
     },
     /// Stop the whole project and delete Compose-owned volumes
     Reset {
@@ -218,6 +233,62 @@ pub async fn run(cli: Cli) -> i32 {
     let command = cli.command.unwrap_or(Command::Tui);
 
     match command {
+        Command::Switch {
+            mode,
+            services,
+            all,
+            no_start,
+        } => {
+            let template_services =
+                match crate::core::graph::services_for_template(&loaded.config, &template) {
+                    Ok(services) => services,
+                    Err(error) => {
+                        eprintln!("✗ failed to resolve template '{template}': {error:#}");
+                        return EXIT_INVALID_CONFIG;
+                    }
+                };
+            for service in &services {
+                if !loaded.config.services.contains_key(service) {
+                    eprintln!("✗ unknown service '{service}' in project '{project}'");
+                    return EXIT_SERVICE_NOT_FOUND;
+                }
+                if !template_services.contains(service) {
+                    eprintln!(
+                        "✗ service '{service}' is not part of template '{template}' in project '{project}'"
+                    );
+                    return EXIT_SERVICE_NOT_FOUND;
+                }
+            }
+            let provider = match &loaded.config.switch_provider {
+                Some(provider) => provider,
+                None => {
+                    eprintln!("✗ project '{project}' does not declare a switch_provider");
+                    return EXIT_INVALID_CONFIG;
+                }
+            };
+            let mut argv = provider.command.clone();
+            argv.push(mode);
+            argv.extend(services);
+            if all {
+                argv.push("--all".to_string());
+            }
+            argv.extend(["--template".to_string(), template.clone()]);
+            if no_start {
+                argv.push("--no-start".to_string());
+            }
+            match run_switch_provider(&argv, &loaded.root_dir).await {
+                Ok(status) if status.success() => EXIT_OK,
+                Ok(status) => {
+                    eprintln!("✗ project '{project}' runtime switch failed with status {status}");
+                    EXIT_SWITCH_FAILED
+                }
+                Err(error) => {
+                    eprintln!("✗ project '{project}' runtime switch failed: {error:#}");
+                    EXIT_SWITCH_FAILED
+                }
+            }
+        }
+
         Command::Config {
             action: ConfigAction::Validate,
         } => {
@@ -704,6 +775,48 @@ pub async fn run(cli: Cli) -> i32 {
         }
         Command::Project { .. } => unreachable!("project actions return before project resolution"),
     }
+}
+
+async fn run_switch_provider(
+    argv: &[String],
+    root: &Path,
+) -> anyhow::Result<std::process::ExitStatus> {
+    use anyhow::{anyhow, Context};
+
+    let configured_root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read current directory")?
+            .join(root)
+    };
+    let working_dir =
+        std::fs::canonicalize(&configured_root).context("failed to resolve project root")?;
+    let executable = argv
+        .first()
+        .ok_or_else(|| anyhow!("switch provider command is empty"))?;
+    let executable_path = Path::new(executable);
+    let executable = if executable_path.components().count() > 1 {
+        let configured_executable = configured_root.join(executable_path);
+        std::fs::canonicalize(&configured_executable).with_context(|| {
+            format!(
+                "failed to resolve switch provider executable '{}'",
+                configured_executable.display()
+            )
+        })?
+    } else {
+        executable_path.to_path_buf()
+    };
+    tokio::process::Command::new(executable)
+        .args(&argv[1..])
+        .current_dir(working_dir)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .context("failed to execute switch provider")
 }
 
 fn run_project_action(action: &ProjectAction, registry: Option<&Path>) -> i32 {
@@ -1360,6 +1473,65 @@ mod tests {
     }
 
     #[test]
+    fn parses_additive_runtime_switches() {
+        let selected = Cli::try_parse_from([
+            "hum",
+            "demo",
+            "all-services",
+            "switch",
+            "source",
+            "api",
+            "worker",
+            "--no-start",
+        ])
+        .unwrap();
+        assert!(matches!(
+            selected.command,
+            Some(Command::Switch {
+                mode,
+                services,
+                all: false,
+                no_start: true,
+            }) if mode == "source" && services == ["api", "worker"]
+        ));
+
+        let all = Cli::try_parse_from(["hum", "demo", "all-services", "switch", "image", "--all"])
+            .unwrap();
+        assert!(matches!(
+            all.command,
+            Some(Command::Switch {
+                mode,
+                services,
+                all: true,
+                no_start: false,
+            }) if mode == "image" && services.is_empty()
+        ));
+
+        assert!(Cli::try_parse_from([
+            "hum",
+            "demo",
+            "all-services",
+            "switch",
+            "source",
+            "api",
+            "--all",
+        ])
+        .is_err());
+
+        let mode_only =
+            Cli::try_parse_from(["hum", "demo", "all-services", "switch", "status"]).unwrap();
+        assert!(matches!(
+            mode_only.command,
+            Some(Command::Switch {
+                mode,
+                services,
+                all: false,
+                no_start: false,
+            }) if mode == "status" && services.is_empty()
+        ));
+    }
+
+    #[test]
     fn parses_project_registration_without_stack_selection() {
         let cli = Cli::try_parse_from([
             "hum",
@@ -1520,6 +1692,7 @@ mod tests {
         assert!(help.contains("<PROJECT> <TEMPLATE> [COMMAND]"));
         assert!(help.contains("start"));
         assert!(help.contains("status"));
+        assert!(help.contains("switch"));
     }
 
     #[test]

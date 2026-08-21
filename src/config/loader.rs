@@ -428,6 +428,7 @@ fn validate_partial_schema(
         "repositories",
         "runtimes",
         "environment_providers",
+        "switch_provider",
         "services",
         "tasks",
         "templates",
@@ -445,6 +446,7 @@ fn validate_partial_schema(
         "env_file",
     ];
     const ENVIRONMENT_PROVIDER: &[&str] = &["type", "account", "command"];
+    const SWITCH_PROVIDER: &[&str] = &["command"];
     const ENVIRONMENT_SOURCE: &[&str] = &[
         "provider",
         "reference",
@@ -528,6 +530,12 @@ fn validate_partial_schema(
         for provider in providers.values().filter_map(yaml_serde::Value::as_mapping) {
             check_keys(provider, ENVIRONMENT_PROVIDER, file, source)?;
         }
+    }
+    if let Some(provider) = root
+        .get("switch_provider")
+        .and_then(yaml_serde::Value::as_mapping)
+    {
+        check_keys(provider, SWITCH_PROVIDER, file, source)?;
     }
     if let Some(services) = root.get("services").and_then(yaml_serde::Value::as_mapping) {
         for service in services.values().filter_map(yaml_serde::Value::as_mapping) {

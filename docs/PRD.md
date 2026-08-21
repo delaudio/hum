@@ -272,6 +272,9 @@ environment_providers:
     type: exec
     command: ["./scripts/get-env.sh"]
 
+switch_provider:
+  command: ["./scripts/runtime-switch"]
+
 repositories:
   applications:
     path: ./demo-applications
@@ -340,6 +343,22 @@ Unknown schema fields are rejected. `env_file` values take lower precedence than
 Compose runtimes can declare `reconcile: true` to reapply `compose up` when provider environment variables or generated layers change.
 
 An `environment_provider` supports both `type: one-password` (with optional `account`) and `type: exec` (with executable `command: [...]`). `env_from` entries can specify `format: dotenv` (default) or `format: json` (for flat JSON string maps with keys containing `/` or `:`), per-source `args: [...]`, `schema`, `cache`, and `optional`.
+
+An optional `switch_provider` exposes product-defined runtime modes through
+`hum PROJECT TEMPLATE switch MODE [SERVICE...]`. Hum executes its direct argv
+from the project root, appending the selected mode, service names, `--all`,
+`--template NAME`, and `--no-start` when requested. The provider owns checkout,
+routing, persistence, and transition policy; Hum validates named services and
+requires them to belong to the selected template's resolved dependency set,
+then propagates provider failure through a stable non-zero exit code. Provider argv
+is trusted project configuration: multi-component executable paths resolve from
+the project root, while absolute paths and parent traversal remain supported for
+adapters shared by multiple adjacent projects.
+
+A mode may intentionally receive no service names, for example to render
+adapter-owned status. Hum forwards that empty selection without assigning
+product-specific meaning; mutating modes define whether names or `--all` are
+required.
 
 Services can define `depends_on_ready: started | listening | healthy` to control when dependent units in the graph are unblocked.
 
@@ -512,6 +531,7 @@ Version 3 retains v1/v2 process services while adding named runtimes, Compose in
 - `plan` does not contact Docker or providers and redacts secret values.
 - `plan --json` exposes selection, exclusions, warnings, and rationale in machine-readable format.
 - `--exclude` warns on reintroduced dependencies; `--exclude-service` blocks execution before side effects.
+- `switch` forwards additive named selections or `--all` to the configured project adapter without shell parsing.
 
 ### Lifecycle
 

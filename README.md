@@ -294,6 +294,13 @@ environment_providers:
       - echo
       - '{"PORT":"8080"}'
 
+# Optional adapter for product-owned source/image runtime switching.
+# Hum appends MODE, service names, --all, --template NAME, and --no-start.
+# This argv is trusted configuration. Multi-component executable paths resolve
+# from the project root; absolute paths and parent traversal are supported.
+switch_provider:
+  command: [./scripts/runtime-switch]
+
 # 3. Define trusted one-shot tasks
 tasks:
   migrate:
@@ -505,12 +512,17 @@ hum [OPTIONS] project register <NAME> <CONFIG>
 | `start [service...]` | Start the selected template or listed services in dependency order. |
 | `stop [service...] [--timeout 10s]` | Stop services in reverse dependency order. |
 | `restart [service...] [--timeout 10s]` | Restart services with a clean stop-start sequence. |
+| `switch MODE [service...] [--all] [--no-start]` | Ask the project adapter to switch selected services to a product-defined runtime mode. |
 | `status` | Show status, PID, port, and health check state for template services. |
 | `plan [service...] [--json]` | Preview resolved dependency order and actions without executing. |
 | `logs [service] [-n 100] [-f]` | Tail captured stdout/stderr logs for a service or template. |
 | `reset [--yes] [--timeout 10s]` | Stop all project services and purge Compose volumes. |
 | `doctor` | Run diagnostic pre-flight checks on ports, tools, and configs. |
 | `tui` | Launch the interactive full-screen terminal monitor. |
+
+`MODE` is project-defined and may be invoked without service names for
+operations such as adapter status. Target-changing modes should use explicit
+service names or `--all` according to the adapter contract.
 
 ### Management & Configuration Commands
 
@@ -617,7 +629,7 @@ cargo build --release
 cargo test --release --test performance_smoke -- --ignored --nocapture
 
 # Release validation
-scripts/release-guard.sh v0.6.2
+scripts/release-guard.sh v0.6.3
 ```
 
 For complete product specifications and acceptance criteria, see [`docs/PRD.md`](docs/PRD.md).
