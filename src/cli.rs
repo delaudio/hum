@@ -75,6 +75,11 @@ pub enum Command {
         #[arg(long)]
         detach: bool,
     },
+    /// Run one declared one-shot task with its dependencies
+    Run {
+        /// Task name declared by the selected project
+        task: String,
+    },
     /// Stop the selected template or listed services
     Stop {
         services: Vec<String>,
@@ -455,6 +460,42 @@ pub async fn run(cli: Cli) -> i32 {
                 }
                 Err(error) => {
                     eprintln!("✗ {error}");
+                    EXIT_START_FAILED
+                }
+            }
+        }
+
+        Command::Run { task } => {
+            if !loaded.config.tasks.contains_key(&task) {
+                eprintln!("✗ unknown task '{task}' in project '{project}'");
+                return EXIT_SERVICE_NOT_FOUND;
+            }
+            let runtime = match ProjectRuntime::new(project, loaded, env_overrides) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("✗ failed to initialize runtime: {error}");
+                    return EXIT_START_FAILED;
+                }
+            };
+            match runtime.run_task(&task).await {
+                Ok(report) => {
+                    if !report.started.is_empty() {
+                        println!(
+                            "✓ started dependency services: {}",
+                            report.started.join(", ")
+                        );
+                    }
+                    if !report.already_running.is_empty() {
+                        println!("✓ already running: {}", report.already_running.join(", "));
+                    }
+                    if !report.reconciled.is_empty() {
+                        println!("✓ reconciled: {}", report.reconciled.join(", "));
+                    }
+                    println!("✓ task completed: {task}");
+                    EXIT_OK
+                }
+                Err(error) => {
+                    eprintln!("✗ task '{task}' failed: {error:#}");
                     EXIT_START_FAILED
                 }
             }
@@ -1470,6 +1511,13 @@ mod tests {
                 ..
             }) if services.is_empty()
         ));
+    }
+
+    #[test]
+    fn parses_one_shot_task_execution() {
+        let cli = Cli::try_parse_from(["hum", "demo", "all-services", "run", "deploy-lambda"])
+            .expect("CLI should parse a task command");
+        assert!(matches!(cli.command, Some(Command::Run { task }) if task == "deploy-lambda"));
     }
 
     #[test]

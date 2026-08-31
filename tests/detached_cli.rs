@@ -502,6 +502,54 @@ templates:
     assert!(!output.contains("setup"), "status was: {output}");
 }
 
+#[test]
+fn one_shot_task_waits_for_exit_and_propagates_failure() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("hum-cli-run-task-{}-{unique}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        process_groups: Vec::new(),
+    };
+    let config = root.join("hum.yaml");
+    let state = root.join("state");
+    fs::write(
+        &config,
+        r#"version: 3
+project: e2e
+runtimes:
+  local:
+    type: process
+tasks:
+  deploy:
+    command: ["sh", "-c", "exit 23"]
+templates:
+  all:
+    services: []
+"#,
+    )
+    .unwrap();
+
+    let result = hum_command(&config, &state, &["run", "deploy"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(6));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("task 'deploy' failed"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("status exit status: 23"),
+        "stderr was: {stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("task completed"));
+}
+
 fn hum_command(config: &Path, state: &Path, action: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hum"));
     command

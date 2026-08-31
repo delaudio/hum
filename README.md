@@ -510,6 +510,7 @@ hum [OPTIONS] project register <NAME> <CONFIG>
 | Command | Description |
 | :--- | :--- |
 | `start [service...]` | Start the selected template or listed services in dependency order. |
+| `run TASK` | Execute a declared one-shot task and its dependency graph without creating a detached service. |
 | `stop [service...] [--timeout 10s]` | Stop services in reverse dependency order. |
 | `restart [service...] [--timeout 10s]` | Restart services with a clean stop-start sequence. |
 | `switch MODE [service...] [--all] [--no-start]` | Ask the project adapter to switch selected services to a product-defined runtime mode. |

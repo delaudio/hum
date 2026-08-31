@@ -120,6 +120,15 @@ impl ProjectRuntime {
         self.start_ordered(order).await
     }
 
+    /// Execute a named one-shot task with its declared service and task
+    /// dependencies. This gives packs an explicit, non-detached entry point
+    /// for operations such as a local Serverless deployment.
+    pub async fn run_task(&self, name: &str) -> Result<StartReport> {
+        crate::config::environment::clear_provider_read_cache();
+        let order = graph::resolve_start_order(self.config(), &[name.to_string()])?;
+        self.start_ordered(&order).await
+    }
+
     pub async fn sync_selection_environment(
         &self,
         order: &[String],
